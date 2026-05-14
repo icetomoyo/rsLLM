@@ -28,6 +28,14 @@ use crate::{MAGIC, SUPPORTED_VERSION};
 /// Default tensor alignment when `general.alignment` is not present.
 const DEFAULT_ALIGNMENT: u64 = 32;
 
+/// Upper bound on the tensor alignment we will accept from a file.
+///
+/// Real GGUF files use 32 or 64. The cap exists purely to make hostile inputs
+/// (e.g. `alignment = u64::MAX - 1`) reject cleanly instead of overflowing
+/// `align_up`. 64 KiB is plenty of headroom for any plausible hardware
+/// alignment requirement.
+const MAX_ALIGNMENT: u64 = 65_536;
+
 /// Backing storage for a `GgufFile`. Hidden behind the public API so the
 /// distinction between mmap-backed and in-memory files is irrelevant to
 /// callers (other than for cleanup semantics).
@@ -203,14 +211,16 @@ fn hex32(bytes: &[u8; 32]) -> String {
 }
 
 /// Round `value` up to the next multiple of `alignment`. `alignment` must
-/// be non-zero (callers default it to 32 when unset).
-fn align_up(value: u64, alignment: u64) -> u64 {
+/// be non-zero (callers default it to 32 when unset). Returns `None` if the
+/// rounding would overflow `u64` — callers should treat this as an
+/// [`Error::InvalidAlignment`].
+fn align_up(value: u64, alignment: u64) -> Option<u64> {
     debug_assert!(alignment > 0);
     let rem = value % alignment;
     if rem == 0 {
-        value
+        Some(value)
     } else {
-        value + alignment - rem
+        value.checked_add(alignment - rem)
     }
 }
 
@@ -257,16 +267,12 @@ fn parse_all(bytes: &[u8], file_size: u64) -> Result<Parsed, Error> {
         .map(u64::from)
         .or_else(|| metadata.get_u64("general.alignment"))
         .unwrap_or(DEFAULT_ALIGNMENT);
-    if alignment == 0 {
-        // Hostile or corrupt input. Reject explicitly.
-        return Err(Error::Truncated {
-            pos: reader.pos(),
-            need: 1,
-            have: 0,
-        });
+    if alignment == 0 || alignment > MAX_ALIGNMENT {
+        return Err(Error::InvalidAlignment(alignment));
     }
 
-    let tensor_data_offset = align_up(reader.pos(), alignment);
+    let tensor_data_offset =
+        align_up(reader.pos(), alignment).ok_or(Error::InvalidAlignment(alignment))?;
 
     // Validate that every recognized tensor fits inside the file.
     for t in &tensors {
@@ -570,10 +576,38 @@ mod tests {
 
     #[test]
     fn align_up_helper() {
-        assert_eq!(align_up(0, 32), 0);
-        assert_eq!(align_up(1, 32), 32);
-        assert_eq!(align_up(32, 32), 32);
-        assert_eq!(align_up(33, 32), 64);
-        assert_eq!(align_up(100, 64), 128);
+        assert_eq!(align_up(0, 32), Some(0));
+        assert_eq!(align_up(1, 32), Some(32));
+        assert_eq!(align_up(32, 32), Some(32));
+        assert_eq!(align_up(33, 32), Some(64));
+        assert_eq!(align_up(100, 64), Some(128));
+    }
+
+    #[test]
+    fn align_up_overflow_returns_none() {
+        // u64::MAX - 1 rounded up to a 32-aligned boundary overflows.
+        assert_eq!(align_up(u64::MAX - 1, 32), None);
+    }
+
+    #[test]
+    fn pathological_alignment_rejected() {
+        // alignment > MAX_ALIGNMENT must be rejected. The builder embeds
+        // general.alignment in metadata.
+        let bytes = GgufBuilder::new()
+            .kv_u32("general.alignment", 131_072) // 128 KiB > MAX_ALIGNMENT 64 KiB
+            .build();
+        match GgufFile::from_bytes(bytes) {
+            Err(Error::InvalidAlignment(131_072)) => {}
+            other => panic!("expected InvalidAlignment(131072), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_alignment_rejected() {
+        let bytes = GgufBuilder::new().kv_u32("general.alignment", 0).build();
+        match GgufFile::from_bytes(bytes) {
+            Err(Error::InvalidAlignment(0)) => {}
+            other => panic!("expected InvalidAlignment(0), got {other:?}"),
+        }
     }
 }

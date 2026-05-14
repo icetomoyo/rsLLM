@@ -78,4 +78,23 @@ pub enum Error {
     /// implement. See `GgmlType::is_decodable_v0_1_0` for the supported set.
     #[error("dtype `{0}` is not yet supported for dequantization in this build")]
     UnsupportedDequant(&'static str),
+
+    /// A tensor directory entry declared a dimension count outside the legal
+    /// range (`1..=MAX_DIMS`). Either the file is corrupt or it uses a GGUF
+    /// extension this build does not handle.
+    #[error("tensor `{name}` has invalid dimension count {ndim} (must be 1..={max})")]
+    InvalidTensorDims {
+        /// Tensor name from the directory entry.
+        name: String,
+        /// Declared `ndim`.
+        ndim: u32,
+        /// Maximum supported dimensions ([`crate::tensor::MAX_DIMS`]).
+        max: u32,
+    },
+
+    /// The `general.alignment` metadata key, or the default alignment, is
+    /// outside the safe range (1..=`MAX_ALIGNMENT`). Protects against hostile
+    /// inputs that would otherwise overflow `align_up`.
+    #[error("invalid tensor data alignment {0} (must be 1..=65536, power of two recommended)")]
+    InvalidAlignment(u64),
 }

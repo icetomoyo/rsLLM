@@ -195,6 +195,29 @@ mod tests {
     }
 
     #[test]
+    fn distinct_per_sub_block_scales_and_mins() {
+        // d = 1, dmin = 1; sc[j] = j+1, m[j] = j+1; q5 = 0 everywhere.
+        // → dst = d * sc[j] * 0 - dmin * m[j] = -(j+1) for every element of
+        // sub-block j. A sub-block-ordering bug would show up as elements of
+        // sub-block 5 reading sub-block 3's `-4`, etc.
+        let sc: [u8; 8] = std::array::from_fn(|j| (j + 1) as u8);
+        let m: [u8; 8] = std::array::from_fn(|j| (j + 1) as u8);
+        let block = pack_block(1.0, 1.0, sc, m, [0u8; 256]);
+        let mut dst = vec![0.0f32; 256];
+        dequant_q5_k(&block, &mut dst).unwrap();
+        for sub in 0..8 {
+            let want = -(f32::from(sc[sub]));
+            for l in 0..32 {
+                let got = dst[sub * 32 + l];
+                assert!(
+                    (got - want).abs() < 1e-2,
+                    "sub={sub} l={l} got {got} want {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn wrong_src_size_errors() {
         let src = vec![0u8; 175];
         let mut dst = vec![0.0f32; 256];

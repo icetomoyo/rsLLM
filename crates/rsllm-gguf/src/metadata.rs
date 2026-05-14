@@ -117,26 +117,45 @@ impl Value {
         }
     }
 
-    /// Read this value as `u32`, widening narrower unsigned types.
+    /// Read this value as `u32`, widening narrower numeric types.
     ///
-    /// Returns `None` if the value is signed, float, string, array, or out of range.
+    /// Accepts:
+    /// - all unsigned integer variants (U8/U16/U32/U64) within `u32` range
+    /// - signed integer variants (I8/I16/I32/I64) when the value is non-negative
+    ///   and fits in `u32`
+    ///
+    /// Real GGUF files in the wild sometimes encode counts (e.g.
+    /// `llama.context_length`) as signed integers; rejecting those would force
+    /// every caller to special-case the signed path.
+    ///
+    /// Returns `None` for float, string, array, negative, or out-of-range
+    /// values.
     pub fn as_u32(&self) -> Option<u32> {
         match self {
             Self::U8(v) => Some(u32::from(*v)),
             Self::U16(v) => Some(u32::from(*v)),
             Self::U32(v) => Some(*v),
             Self::U64(v) => u32::try_from(*v).ok(),
+            Self::I8(v) => u32::try_from(*v).ok(),
+            Self::I16(v) => u32::try_from(*v).ok(),
+            Self::I32(v) => u32::try_from(*v).ok(),
+            Self::I64(v) => u32::try_from(*v).ok(),
             _ => None,
         }
     }
 
-    /// Read this value as `u64`, widening narrower unsigned types.
+    /// Read this value as `u64`, widening narrower numeric types. Accepts
+    /// non-negative signed integers for the same reason as [`Self::as_u32`].
     pub fn as_u64(&self) -> Option<u64> {
         match self {
             Self::U8(v) => Some(u64::from(*v)),
             Self::U16(v) => Some(u64::from(*v)),
             Self::U32(v) => Some(u64::from(*v)),
             Self::U64(v) => Some(*v),
+            Self::I8(v) => u64::try_from(*v).ok(),
+            Self::I16(v) => u64::try_from(*v).ok(),
+            Self::I32(v) => u64::try_from(*v).ok(),
+            Self::I64(v) => u64::try_from(*v).ok(),
             _ => None,
         }
     }

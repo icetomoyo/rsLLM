@@ -203,6 +203,57 @@ mod tests {
     }
 
     #[test]
+    fn distinct_per_sub_block_scales() {
+        // Q6_K has 16 sub-blocks of 16 elements each. Use distinct scale
+        // per sub-block to detect any sub-block-ordering bug: scale[i] = i+1.
+        // d = 1, quants all = 33 (one above zero = +1 after centering).
+        // → for element e in sub-block i: dst[e] = 1 * (i+1) * 1 = i+1.
+        let mut scales = [0i8; 16];
+        for (i, s) in scales.iter_mut().enumerate() {
+            *s = (i + 1) as i8;
+        }
+        let block = pack_block([33u8; 256], scales, 1.0);
+        let mut dst = vec![0.0f32; 256];
+        dequant_q6_k(&block, &mut dst).unwrap();
+        for sub in 0..16 {
+            let want = (sub + 1) as f32;
+            for l in 0..16 {
+                let got = dst[sub * 16 + l];
+                assert!(
+                    (got - want).abs() < 1e-3,
+                    "sub={sub} l={l} got {got} want {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn distinct_per_sub_block_quants() {
+        // Inverse coverage: hold scales uniform (=1), but vary the quant
+        // value per sub-block. quant[sub_i, l] = sub_i * 2 (still in 0..64).
+        // After centering: q - 32 → 2*sub_i - 32. So dst = d * 1 * (2*sub_i - 32).
+        let mut q6 = [0u8; 256];
+        for sub in 0..16 {
+            for l in 0..16 {
+                q6[sub * 16 + l] = (sub * 2) as u8;
+            }
+        }
+        let block = pack_block(q6, [1i8; 16], 1.0);
+        let mut dst = vec![0.0f32; 256];
+        dequant_q6_k(&block, &mut dst).unwrap();
+        for sub in 0..16 {
+            let want = (2 * sub as i32 - 32) as f32;
+            for l in 0..16 {
+                let got = dst[sub * 16 + l];
+                assert!(
+                    (got - want).abs() < 1e-3,
+                    "sub={sub} l={l} got {got} want {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn wrong_src_size_errors() {
         let src = vec![0u8; 209];
         let mut dst = vec![0.0f32; 256];

@@ -288,12 +288,10 @@ impl TensorInfo {
         let name = reader.read_str()?.to_owned();
         let ndim = reader.read_u32_le()?;
         if ndim == 0 || ndim as usize > MAX_DIMS {
-            // Use a generic Truncated as a stand-in; a dedicated error variant
-            // can be added if real-world GGUF files trip this.
-            return Err(Error::Truncated {
-                pos: reader.pos(),
-                need: 0,
-                have: ndim as u64,
+            return Err(Error::InvalidTensorDims {
+                name,
+                ndim,
+                max: MAX_DIMS as u32,
             });
         }
 
