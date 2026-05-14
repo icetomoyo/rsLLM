@@ -1,0 +1,18 @@
+[package]
+name = "rsllm-backend-cpu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "CPU backend for rsLLM. Native Rust + SIMD intrinsics (AVX2/AVX-512 on x86_64, NEON/SVE on aarch64). Does not link against ggml — algorithms borrowed under MIT with attribution."
+
+[lints]
+workspace = true
+
+[dependencies]
+rsllm-cal = { workspace = true }
+thiserror = { workspace = true }
+half = { workspace = true }
+bytemuck = { workspace = true }

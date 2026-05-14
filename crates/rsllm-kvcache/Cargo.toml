@@ -1,0 +1,16 @@
+[package]
+name = "rsllm-kvcache"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "KV cache for rsLLM. Dense / Paged / MLA / Sliding-Window layouts, plus disk persistence (KVC v2 format, borrowed from ds4 under MIT)."
+
+[lints]
+workspace = true
+
+[dependencies]
+rsllm-cal = { workspace = true }
+thiserror = { workspace = true }

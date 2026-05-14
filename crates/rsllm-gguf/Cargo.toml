@@ -1,0 +1,18 @@
+[package]
+name = "rsllm-gguf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "GGUF file format parser and quantized tensor decoder for rsLLM. Borrows format definitions from ggml (MIT) and Rust expression from candle (Apache-2.0)."
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+memmap2 = { workspace = true }
+bytemuck = { workspace = true }
+half = { workspace = true }

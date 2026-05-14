@@ -1,0 +1,15 @@
+[package]
+name = "rsllm-cal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Compute Abstraction Layer trait for rsLLM. Defines Backend / Buffer / Stream traits implemented by each compute backend."
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }

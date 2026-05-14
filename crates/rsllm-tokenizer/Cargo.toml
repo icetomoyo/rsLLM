@@ -1,0 +1,16 @@
+[package]
+name = "rsllm-tokenizer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Tokenizer integration for rsLLM. Wraps HuggingFace tokenizers crate and adds chat template rendering."
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }

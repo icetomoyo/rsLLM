@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rsllm-core",
+    "crates/rsllm-gguf",
+    "crates/rsllm-tokenizer",
+    "crates/rsllm-cal",
+    "crates/rsllm-backend-cpu",
+    "crates/rsllm-kvcache",
+    "crates/rsllm-models",
+    "crates/rsllm-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+authors = ["The rsLLM Authors"]
+repository = "https://github.com/icetomoyo/rsLLM"
+description = "Rust-native LLM inference engine. Cross-hardware, cross-platform, cross-model."
+
+[workspace.dependencies]
+# External crates (shared versions)
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+memmap2 = "0.9"
+bytemuck = { version = "1", features = ["derive"] }
+half = "2"
+
+# Internal crates
+rsllm-core = { version = "0.0.1", path = "crates/rsllm-core" }
+rsllm-gguf = { version = "0.0.1", path = "crates/rsllm-gguf" }
+rsllm-tokenizer = { version = "0.0.1", path = "crates/rsllm-tokenizer" }
+rsllm-cal = { version = "0.0.1", path = "crates/rsllm-cal" }
+rsllm-backend-cpu = { version = "0.0.1", path = "crates/rsllm-backend-cpu" }
+rsllm-kvcache = { version = "0.0.1", path = "crates/rsllm-kvcache" }
+rsllm-models = { version = "0.0.1", path = "crates/rsllm-models" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+opt-level = 3
+
+[profile.dev]
+opt-level = 1

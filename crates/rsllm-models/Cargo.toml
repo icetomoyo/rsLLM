@@ -1,0 +1,18 @@
+[package]
+name = "rsllm-models"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Model architecture implementations for rsLLM (Llama, Qwen, Mistral, DeepSeek, ...). Backend-agnostic; consumes rsllm-cal traits."
+
+[lints]
+workspace = true
+
+[dependencies]
+rsllm-cal = { workspace = true }
+rsllm-gguf = { workspace = true }
+rsllm-kvcache = { workspace = true }
+thiserror = { workspace = true }
