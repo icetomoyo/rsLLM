@@ -1,6 +1,6 @@
 # Feature List
 
-> Last Updated: 2026-05-11
+> Last Updated: 2026-05-14
 > 版本策略：v1.0.0 之前最多走到 0.2.x，每个 patch 版本聚焦小迭代，每个 minor 版本是重大分水岭。
 >
 > **2026-05-11 review 调整**：F014 Mixtral→Phi-3.5-MoE；F015/F016 对调；Metal 基础版（F025）从 v0.2.0 提前到 v0.1.6；磁盘 KV 简化版（F022）从 v0.2.0 提前到 v0.1.8；F031/F032 新增为 v0.2.0 完整版占位。
@@ -28,7 +28,7 @@
 | ID | Title | Category | Priority | Version | Status | Design |
 |----|-------|----------|----------|---------|--------|--------|
 | 001 | Cargo workspace 骨架 + 构建基线 | Internal | Critical | v0.1.0 | Completed | [v0.1.0.md#001](features/v0.1.0.md#feature_001-cargo-workspace-骨架--构建基线) |
-| 002 | GGUF 文件解析器（自实现，借鉴 ggml/candle） | New | Critical | v0.1.0 | Planned | [v0.1.0.md#002](features/v0.1.0.md#feature_002-gguf-文件解析器) |
+| 002 | GGUF 文件解析器（自实现，借鉴 ggml/candle） | New | Critical | v0.1.0 | Completed | [v0.1.0.md#002](features/v0.1.0.md#feature_002-gguf-文件解析器) |
 | 003 | Tokenizer 集成（HuggingFace tokenizers + chat template） | New | Critical | v0.1.0 | Planned | [v0.1.0.md#003](features/v0.1.0.md#feature_003-tokenizer-集成) |
 | 004 | CPU 后端基础算子（matmul/rmsnorm/rope/softmax） | New | Critical | v0.1.0 | Planned | [v0.1.0.md#004](features/v0.1.0.md#feature_004-cpu-后端基础算子) |
 | 005 | Llama 模型架构（dense, GQA, RoPE） | New | Critical | v0.1.0 | Planned | [v0.1.0.md#005](features/v0.1.0.md#feature_005-llama-模型架构) |
