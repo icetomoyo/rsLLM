@@ -14,7 +14,7 @@ members = [
 [workspace.package]
 version = "0.0.1"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 license = "Apache-2.0"
 authors = ["The rsLLM Authors"]
 repository = "https://github.com/icetomoyo/rsLLM"
@@ -32,6 +32,7 @@ clap = { version = "4", features = ["derive"] }
 memmap2 = "0.9"
 bytemuck = { version = "1", features = ["derive"] }
 half = "2"
+sha2 = "0.10"
 
 # Internal crates
 rsllm-core = { version = "0.0.1", path = "crates/rsllm-core" }
