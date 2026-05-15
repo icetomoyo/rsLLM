@@ -232,6 +232,36 @@ mod tests {
     }
 
     #[test]
+    fn distinct_sc_and_m_combined() {
+        // The two existing distinct-* tests each fix one of sc/m to zero so
+        // they cannot catch a bug that mixes up the scale-nibble and the
+        // min-nibble (e.g. swapping the `& 0x0F` and `>> 4` masks). This test
+        // varies both simultaneously across all 16 sub-blocks.
+        //
+        // d = 1, dmin = 1; q2 = 2 everywhere.
+        // sc[j] = (j % 4) + 1 -> values cycle through {1,2,3,4}
+        // m[j]  = ((15 - j) % 4) + 1 -> values cycle inverse
+        // dst[sub j] = 1 * sc[j] * 2 - 1 * m[j] = 2*sc[j] - m[j]
+        let sc: [u8; 16] = std::array::from_fn(|j| ((j % 4) + 1) as u8);
+        let m: [u8; 16] = std::array::from_fn(|j| (((15 - j) % 4) + 1) as u8);
+        let block = pack_block(1.0, 1.0, sc, m, [2u8; 256]);
+        let mut dst = vec![0.0f32; 256];
+        dequant_q2_k(&block, &mut dst).unwrap();
+        for sub in 0..16 {
+            let want = 2.0 * f32::from(sc[sub]) - f32::from(m[sub]);
+            for l in 0..16 {
+                let got = dst[sub * 16 + l];
+                assert!(
+                    (got - want).abs() < 1e-3,
+                    "sub={sub} l={l} sc={} m={}: got {got}, want {want}",
+                    sc[sub],
+                    m[sub]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn wrong_src_size_errors() {
         let src = vec![0u8; 83];
         let mut dst = vec![0.0f32; 256];

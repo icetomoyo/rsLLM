@@ -19,13 +19,15 @@
 //! ```
 //!
 //! Each block decodes **8 sub-groups of 32 elements**. Per sub-group `ib32`
-//! the parser reads `qs[ib32*4 .. ib32*4+4]` as two `u32`s (`aux32[0]`,
-//! `aux32[1]`):
+//! the parser reads `qs[ib32*4 .. ib32*4+4]` (4 little-endian `u16`s) as two
+//! `u32`s `aux32[0]` and `aux32[1]`:
 //!
-//! - `aux32[0]` low byte 0..3 = 4 grid indices into `IQ2XXS_GRID` (4 × 8
-//!   element patterns = 32 elements per sub-group)
-//! - `aux32[1]` low 28 bits = 4 × 7-bit sign indices into `KSIGNS_IQ2XS`
-//! - `aux32[1]` top 4 bits = per-sub-group extra exponent
+//! - **`aux32[0]`** — the 4 little-endian bytes are 4 grid indices into
+//!   `IQ2XXS_GRID`. Each grid entry decodes to 8 elements, so 4 × 8 = 32
+//!   elements per sub-group.
+//! - **`aux32[1]` bits 0-27** — packed as 4 × 7-bit sign indices into
+//!   `KSIGNS_IQ2XS` (sign index `l` lives in bits `7*l .. 7*l+6`).
+//! - **`aux32[1]` bits 28-31** — per-sub-group extra exponent.
 //!
 //! Decoded value: `dst[i] = d × (0.5 + extra) × 0.25 × grid[i] × sign[i]`.
 
@@ -239,6 +241,149 @@ mod tests {
         dequant_iq2_xxs(&block, &mut dst).unwrap();
         for v in &dst {
             assert!((v - (-1.0)).abs() < 1e-3, "got {v}, want -1.0");
+        }
+    }
+
+    #[test]
+    fn distinct_l_slots_within_one_subgroup() {
+        // Probe the 4 inner `l` loads inside a single sub-group with 4
+        // distinct grid indices + 4 distinct sign indices, so an off-by-one
+        // between aux8[l] indexing and the `>> (7*l)` sign extraction would
+        // produce visible cross-talk.
+        //
+        // ib32 = 0 specifically:
+        //   grids[0]  = [0, 1, 2, 3]   (4 distinct grid indices)
+        //   signs[0]  = [0, 1, 2, 3]   (4 distinct sign indices)
+        //
+        // From ds4.c:222 KSIGNS_IQ2XS:
+        //   ksigns[0] = 0   -> all 8 positions positive
+        //   ksigns[1] = 129 = 0b10000001 -> bits 0 and 7 set
+        //                                    (positions 0 and 7 negated)
+        //   ksigns[2] = 130 = 0b10000010 -> bits 1 and 7 set
+        //                                    (positions 1 and 7 negated)
+        //   ksigns[3] = 3   = 0b00000011 -> bits 0 and 1 set
+        //                                    (positions 0 and 1 negated)
+        //
+        // IQ2XXS_GRID[0..4] from ds4.c:233, decoded as little-endian bytes
+        // (byte 0 = lowest byte of the u64):
+        //   [0] = 0x0808080808080808 -> [+8, +8, +8, +8, +8, +8, +8, +8]
+        //   [1] = 0x080808080808082b -> [+43, +8, +8, +8, +8, +8, +8, +8]
+        //   [2] = 0x0808080808081919 -> [+25, +25, +8, +8, +8, +8, +8, +8]
+        //   [3] = 0x0808080808082b08 -> [+8, +43, +8, +8, +8, +8, +8, +8]
+        //
+        // d = 1, extra = 0 -> db = 0.125. Other sub-groups (ib32=1..8) get
+        // grids=0/signs=0 so they emit +1.0 uniformly.
+
+        let mut grids = [[0u8; 4]; 8];
+        let mut signs = [[0u8; 4]; 8];
+        grids[0] = [0, 1, 2, 3];
+        signs[0] = [0, 1, 2, 3];
+        let block = pack_block(1.0, grids, signs, [0u8; 8]);
+        let mut dst = vec![0.0f32; 256];
+        dequant_iq2_xxs(&block, &mut dst).unwrap();
+
+        // l=0: grid 0, signs 0  -> 8 × (+8 × +1 × 0.125) = 8 × 1.0
+        for v in &dst[0..8] {
+            assert!((v - 1.0).abs() < 1e-3, "l=0: got {v}");
+        }
+        // l=1: grid 1 = [+43, +8, +8, +8, +8, +8, +8, +8], signs 1 negates
+        // positions 0 and 7.
+        //   pos 0: -43 × 0.125 = -5.375
+        //   pos 1..7: +8 × 0.125 = +1.0
+        //   pos 7: -8 × 0.125 = -1.0
+        let l1 = &dst[8..16];
+        assert!((l1[0] - (-5.375)).abs() < 1e-3, "l=1 pos 0: got {}", l1[0]);
+        for (j, v) in l1.iter().enumerate().skip(1).take(6) {
+            assert!((v - 1.0).abs() < 1e-3, "l=1 pos {j}: got {v}");
+        }
+        assert!((l1[7] - (-1.0)).abs() < 1e-3, "l=1 pos 7: got {}", l1[7]);
+        // l=2: grid 2 = [+25, +25, +8, +8, +8, +8, +8, +8], signs 2 negates
+        // positions 1 and 7.
+        //   pos 0: +25 × 0.125 = +3.125
+        //   pos 1: -25 × 0.125 = -3.125
+        //   pos 2..6: +1.0
+        //   pos 7: -1.0
+        let l2 = &dst[16..24];
+        assert!((l2[0] - 3.125).abs() < 1e-3, "l=2 pos 0: got {}", l2[0]);
+        assert!((l2[1] - (-3.125)).abs() < 1e-3, "l=2 pos 1: got {}", l2[1]);
+        for (j, v) in l2.iter().enumerate().skip(2).take(5) {
+            assert!((v - 1.0).abs() < 1e-3, "l=2 pos {j}: got {v}");
+        }
+        assert!((l2[7] - (-1.0)).abs() < 1e-3, "l=2 pos 7: got {}", l2[7]);
+        // l=3: grid 3 = [+8, +43, +8, +8, +8, +8, +8, +8], signs 3 negates
+        // positions 0 and 1.
+        //   pos 0: -8 × 0.125 = -1.0
+        //   pos 1: -43 × 0.125 = -5.375
+        //   pos 2..7: +1.0
+        let l3 = &dst[24..32];
+        assert!((l3[0] - (-1.0)).abs() < 1e-3, "l=3 pos 0: got {}", l3[0]);
+        assert!((l3[1] - (-5.375)).abs() < 1e-3, "l=3 pos 1: got {}", l3[1]);
+        for (j, v) in l3.iter().enumerate().skip(2) {
+            assert!((v - 1.0).abs() < 1e-3, "l=3 pos {j}: got {v}");
+        }
+        // Other 7 sub-groups should be untouched: +1.0 uniform.
+        for v in &dst[32..] {
+            assert!((v - 1.0).abs() < 1e-3, "ib32>0 leak: got {v}");
+        }
+    }
+
+    #[test]
+    fn distinct_subgroups_with_distinct_grids_and_extras() {
+        // Combine extras + grid variation across all 8 sub-groups to catch
+        // any out_off / aux32 read alignment bug.
+        // - sub-group ib32 uses grid index = ib32 (all 4 l-slots), signs = 0,
+        //   extra = ib32.
+        // db(ib32) = 1 × (0.5 + ib32) × 0.25
+        // Within a sub-group, all 32 outputs share the same db × grid_byte.
+        //
+        // IQ2XXS_GRID[0] = 0x0808080808080808 → all 8 bytes are +8
+        //   db=0.125 → all outputs = 1.0
+        //
+        // IQ2XXS_GRID[1] = 0x080808080808082b → bytes (LE) [43, 8, 8, 8, 8, 8, 8, 8]
+        //   db = 1 × 1.5 × 0.25 = 0.375
+        //   per l-slot: position 0 = 43 × 0.375 = 16.125, positions 1-7 = 3.0
+        //
+        // IQ2XXS_GRID[4] = 0x0808080808082b2b → bytes (LE) [43, 43, 8, 8, 8, 8, 8, 8]
+        //   db = 1 × 4.5 × 0.25 = 1.125
+        //   per l-slot: positions 0,1 = 43 × 1.125 = 48.375, positions 2-7 = 9.0
+        let grids = std::array::from_fn(|ib32| [ib32 as u8; 4]);
+        let signs = [[0u8; 4]; 8];
+        let extras = std::array::from_fn(|i| i as u8);
+        let block = pack_block(1.0, grids, signs, extras);
+        let mut dst = vec![0.0f32; 256];
+        dequant_iq2_xxs(&block, &mut dst).unwrap();
+
+        // ib32=0: all 32 outputs = 1.0
+        for v in &dst[0..32] {
+            assert!((v - 1.0).abs() < 1e-3, "ib32=0: got {v}");
+        }
+        // ib32=1: 4 l-slots, each: [16.125, 3, 3, 3, 3, 3, 3, 3]
+        for l in 0..4 {
+            let base = 32 + l * 8;
+            assert!(
+                (dst[base] - 16.125).abs() < 1e-3,
+                "ib32=1 l={l} pos 0: got {}, want 16.125",
+                dst[base]
+            );
+            for j in 1..8 {
+                let v = dst[base + j];
+                assert!((v - 3.0).abs() < 1e-3, "ib32=1 l={l} j={j}: got {v}");
+            }
+        }
+        // ib32=4: 4 l-slots, each: [48.375, 48.375, 9, 9, 9, 9, 9, 9]
+        for l in 0..4 {
+            let base = 4 * 32 + l * 8;
+            for j in 0..2 {
+                let v = dst[base + j];
+                assert!(
+                    (v - 48.375).abs() < 1e-3,
+                    "ib32=4 l={l} j={j}: got {v}, want 48.375"
+                );
+            }
+            for j in 2..8 {
+                let v = dst[base + j];
+                assert!((v - 9.0).abs() < 1e-3, "ib32=4 l={l} j={j}: got {v}");
+            }
         }
     }
 
