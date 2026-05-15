@@ -33,7 +33,7 @@
 | ID | Title | Category | Priority | Version | Status | Design |
 |----|-------|----------|----------|---------|--------|--------|
 | 001 | Cargo workspace 骨架 + 构建基线 | Internal | Critical | v0.1.0 | Completed | [v0.1.0.md#001](features/v0.1.0.md#feature_001-cargo-workspace-骨架--构建基线) |
-| 002 | GGUF 文件解析器（9 种 dequant 已完成，4 种 待 F002.1 补） | New | Critical | v0.1.0 | Phase 4 ✅ + F002.1 待 | [v0.1.0.md#002](features/v0.1.0.md#feature_002-gguf-文件解析器) |
+| 002 | GGUF 文件解析器（12 种 dequant + FP8 元素级转换） | New | Critical | v0.1.0 | **Phase 4 + F002.1 ✅ Completed** | [v0.1.0.md#002](features/v0.1.0.md#feature_002-gguf-文件解析器) |
 | 003 | **JoyAI 状态机分词器（DS V4 vocab，复刻 ds4）** | New | Critical | v0.1.0 | Planned | [v0.1.0.md#003](features/v0.1.0.md#feature_003-joyai-状态机分词器ds4-复刻) |
 | 004 | **CPU 算子（DS V4 特化 + NEON + AVX-512 双 SIMD）** | New | Critical | v0.1.0 | Planned | [v0.1.0.md#004](features/v0.1.0.md#feature_004-cpu-算子ds-v4-flash-特化--双-simd) |
 | 005 | **DeepSeek V4 Flash 模型架构（MLA + HC + MoE）** | New | Critical | v0.1.0 | Planned | [v0.1.0.md#005](features/v0.1.0.md#feature_005-deepseek-v4-flash-模型架构) |
@@ -93,11 +93,13 @@
 - **Category**: New
 - **Priority**: Critical
 - **Version**: v0.1.0
-- **Status**: **Phase 4 ✅ Completed**（2026-05-14）；F002.1（Q2_K + IQ2_XXS + Q8_K + FP8 E4M3）待补
-- **Description**: 自实现 GGUF 解析器，借鉴 ggml/candle，按 MIT/Apache 致谢
+- **Status**: ✅ **Phase 4 + F002.1 Completed**（2026-05-14）
+- **Description**: 自实现 GGUF 解析器，借鉴 ggml/candle/ds4，按 MIT/Apache 致谢
 - **Design**: [v0.1.0.md#feature_002](features/v0.1.0.md#feature_002-gguf-文件解析器)
-- **已实现**：F32 / F16 / BF16 / Q4_0 / Q4_1 / Q4_K / Q5_K / Q6_K / Q8_0（9 种），97 单元 + 2 集成测试
-- **待补（F002.1，F005 启动前完成）**：Q2_K（MoE down）/ IQ2_XXS（MoE gate-up，含 320 行查找表）/ Q8_K（临时激活）/ FP8 E4M3（KV 量化）
+- **已实现**：
+  - Phase 4（9 种通用 dequant）：F32 / F16 / BF16 / Q4_0 / Q4_1 / Q4_K / Q5_K / Q6_K / Q8_0
+  - F002.1（DS V4 Flash 必需的 3 种 + FP8）：Q2_K（MoE down）/ IQ2_XXS（MoE gate-up，含 ds4 port 320 行查找表）/ Q8_K（临时激活）/ FP8 E4M3 元素级转换器（KV cache 用）
+  - **127 单元 + 2 集成测试全绿，clippy + fmt clean**
 
 ### FEATURE_003: JoyAI 状态机分词器（DS V4 vocab，复刻 ds4）
 
@@ -198,8 +200,8 @@
 - Medium: 5
 - Low: 3
 
-**Next Release (v0.1.0)**: 9 features（F001 ✅, F002 Phase4 ✅, F003-F008 Planned, F025 Planned）
-**Next to Start**: **F002.1（Q2_K / IQ2_XXS / Q8_K / FP8 E4M3 补充 dequant）** —— F005 启动前置依赖
+**Next Release (v0.1.0)**: 9 features（F001 ✅, F002 ✅, F003-F008 Planned, F025 Planned）
+**Next to Start**: **F003**（JoyAI 状态机分词器 + DS V4 vocab + 3 种 think 模式 chat 拼装）
 
 ## 2026-05-14 重定位调整记录
 
