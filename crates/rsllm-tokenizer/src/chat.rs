@@ -69,8 +69,11 @@ Explicitly write out your entire deliberation process, documenting every interme
 /// Role of a [`Message`] in a chat transcript.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
-    /// System / developer prompt — emitted verbatim before the user turn.
+    /// System prompt — emitted verbatim before the user turn.
     System,
+    /// Developer prompt — same handling as [`Role::System`] in ds4
+    /// (`ds4.c:14051`). Kept as a distinct variant for API clarity.
+    Developer,
     /// User message — wrapped with `<｜User｜>`.
     User,
     /// Assistant message — wrapped with `<｜Assistant｜></think>`.
@@ -137,7 +140,7 @@ pub(crate) fn encode_prompt(
 ///     encode content.
 pub(crate) fn append_message(vocab: &Vocab, msg: &Message<'_>, tokens: &mut Vec<u32>) {
     match msg.role {
-        Role::System => {
+        Role::System | Role::Developer => {
             encode_text(vocab, msg.content, tokens);
         }
         Role::User => {
@@ -326,6 +329,31 @@ mod tests {
             &mut out,
         );
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn developer_role_behaves_like_system() {
+        // ds4.c:14051 — `"developer"` and `"system"` share the same branch.
+        let v = fake_vocab();
+        let mut sys = Vec::new();
+        let mut dev = Vec::new();
+        append_message(
+            &v,
+            &Message {
+                role: Role::System,
+                content: "x",
+            },
+            &mut sys,
+        );
+        append_message(
+            &v,
+            &Message {
+                role: Role::Developer,
+                content: "x",
+            },
+            &mut dev,
+        );
+        assert_eq!(sys, dev);
     }
 
     #[test]

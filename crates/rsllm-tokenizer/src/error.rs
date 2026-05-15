@@ -41,4 +41,14 @@ pub enum Error {
     /// been emitted; callers should buffer until the next decode call.
     #[error("decoded byte stream is not valid UTF-8 yet (partial codepoint?)")]
     DecodePartialUtf8,
+
+    /// The vocab or merge table declares more entries than fit in `u32`,
+    /// which is the token-id type. v0.1.0 caps both at `u32::MAX`.
+    #[error("`{key}` has {len} entries; maximum supported is u32::MAX")]
+    TableTooLarge {
+        /// The metadata key whose table is too large.
+        key: &'static str,
+        /// The declared length.
+        len: usize,
+    },
 }

@@ -118,9 +118,31 @@ fn joyai_letter_like_at(bytes: &[u8], pos: usize) -> bool {
     true
 }
 
-fn joyai_consume_letters(bytes: &[u8], mut pos: usize) -> usize {
+/// Hard cap on the byte length of any single pre-tokenized piece.
+///
+/// The downstream BPE merge loop is O(n²) in the number of symbols per
+/// piece, so an unbounded letter-like run (rule 4/5) on adversarial
+/// input would otherwise be a DoS vector. 4 KB is well above any real
+/// JoyAI piece — even a paragraph-long word in a language without
+/// spaces (Thai, CJK fragments that escape rule 2) fits comfortably.
+///
+/// When the cap fires the piece is closed and the next iteration of
+/// `pre_tokenize` starts a fresh piece at the next codepoint boundary,
+/// so token output is still well-formed (just split at a non-natural
+/// boundary, which mirrors ds4's behavior on these out-of-domain inputs
+/// only in the upper bound it imposes via available memory).
+const MAX_PIECE_BYTES: usize = 4096;
+
+fn joyai_consume_letters(bytes: &[u8], start: usize, mut pos: usize) -> usize {
     while pos < bytes.len() && joyai_letter_like_at(bytes, pos) {
-        pos = next_utf8_char(bytes, pos);
+        let next = next_utf8_char(bytes, pos);
+        // Predictive cap: only advance if the *next* boundary would still
+        // sit within MAX_PIECE_BYTES of `start`. Guarantees piece length
+        // ≤ MAX_PIECE_BYTES exactly.
+        if next - start > MAX_PIECE_BYTES {
+            break;
+        }
+        pos = next;
     }
     pos
 }
@@ -159,8 +181,16 @@ pub(crate) fn pre_tokenize(text: &str) -> Vec<&str> {
             }
         } else if joyai_cjk_at(bytes, pos) {
             // Rule 2: CJK / Hira / Kata run.
+            //
+            // Predictive cap: only advance if the *next* boundary would
+            // still sit within MAX_PIECE_BYTES of `start`. Guarantees
+            // piece length ≤ MAX_PIECE_BYTES.
             loop {
-                pos = next_utf8_char(bytes, pos);
+                let next = next_utf8_char(bytes, pos);
+                if next - start > MAX_PIECE_BYTES {
+                    break;
+                }
+                pos = next;
                 if pos >= len || !joyai_cjk_at(bytes, pos) {
                     break;
                 }
@@ -168,12 +198,12 @@ pub(crate) fn pre_tokenize(text: &str) -> Vec<&str> {
         } else if joyai_ascii_punct_symbol(c) && pos + 1 < len && ascii_alpha(bytes[pos + 1]) {
             // Rule 3: ASCII punct followed by ASCII alpha run.
             pos += 1;
-            while pos < len && ascii_alpha(bytes[pos]) {
+            while pos < len && (pos - start) < MAX_PIECE_BYTES && ascii_alpha(bytes[pos]) {
                 pos += 1;
             }
         } else if joyai_letter_like_at(bytes, pos) {
             // Rule 4: letter-like run (ASCII alpha or non-ASCII).
-            pos = joyai_consume_letters(bytes, pos);
+            pos = joyai_consume_letters(bytes, start, pos);
         } else if !ascii_newline(c)
             && !joyai_ascii_punct_symbol(c)
             && pos + 1 < len
@@ -181,22 +211,28 @@ pub(crate) fn pre_tokenize(text: &str) -> Vec<&str> {
         {
             // Rule 5: one-byte prefix + letter-like run.
             pos += 1;
-            pos = joyai_consume_letters(bytes, pos);
+            pos = joyai_consume_letters(bytes, start, pos);
         } else if c == b' ' && pos + 1 < len && joyai_ascii_punct_symbol(bytes[pos + 1]) {
             // Rule 6: single space + punct run + trailing newlines.
             pos += 1;
-            while pos < len && joyai_ascii_punct_symbol(bytes[pos]) {
+            while pos < len
+                && (pos - start) < MAX_PIECE_BYTES
+                && joyai_ascii_punct_symbol(bytes[pos])
+            {
                 pos += 1;
             }
-            while pos < len && ascii_newline(bytes[pos]) {
+            while pos < len && (pos - start) < MAX_PIECE_BYTES && ascii_newline(bytes[pos]) {
                 pos += 1;
             }
         } else if joyai_ascii_punct_symbol(c) {
             // Rule 7: punct run + trailing newlines (keep newlines!).
-            while pos < len && joyai_ascii_punct_symbol(bytes[pos]) {
+            while pos < len
+                && (pos - start) < MAX_PIECE_BYTES
+                && joyai_ascii_punct_symbol(bytes[pos])
+            {
                 pos += 1;
             }
-            while pos < len && ascii_newline(bytes[pos]) {
+            while pos < len && (pos - start) < MAX_PIECE_BYTES && ascii_newline(bytes[pos]) {
                 pos += 1;
             }
         } else if ascii_space(c) {
@@ -209,7 +245,7 @@ pub(crate) fn pre_tokenize(text: &str) -> Vec<&str> {
             //   * Else consume the whole whitespace run.
             let mut p = pos;
             let mut last_newline_end: Option<usize> = None;
-            while p < len && ascii_space(bytes[p]) {
+            while p < len && (p - start) < MAX_PIECE_BYTES && ascii_space(bytes[p]) {
                 let sc = bytes[p];
                 p += 1;
                 if ascii_newline(sc) {
@@ -391,5 +427,39 @@ mod tests {
         // Italian accents (ds4.c:13770-13772 explicitly motivates this).
         let p = pieces("Café");
         assert_eq!(p, vec!["Café"]);
+    }
+
+    #[test]
+    fn very_long_letter_like_run_is_capped() {
+        // 10 KB of letter-like bytes (rule 4) must not produce a single
+        // 10 KB piece — the BPE merge loop is O(n²) and would otherwise
+        // be a DoS surface. Each piece must be ≤ MAX_PIECE_BYTES.
+        let long: String = "é".repeat(8_000);
+        let p = pieces(&long);
+        assert!(
+            p.len() >= 2,
+            "expected piece split, got {} piece(s)",
+            p.len()
+        );
+        for piece in &p {
+            assert!(
+                piece.len() <= MAX_PIECE_BYTES,
+                "piece exceeds cap: {} bytes",
+                piece.len()
+            );
+        }
+        // Tile invariant still holds.
+        let joined: String = p.concat();
+        assert_eq!(joined, long);
+    }
+
+    #[test]
+    fn very_long_cjk_run_is_capped() {
+        let long: String = "汉".repeat(2_000); // 6 KB of CJK
+        let p = pieces(&long);
+        assert!(p.len() >= 2);
+        for piece in &p {
+            assert!(piece.len() <= MAX_PIECE_BYTES);
+        }
     }
 }

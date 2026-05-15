@@ -87,11 +87,18 @@ impl Vocab {
         };
 
         let n_vocab = tokens_arr.len();
+        if n_vocab > u32::MAX as usize {
+            return Err(Error::TableTooLarge {
+                key: "tokenizer.ggml.tokens",
+                len: n_vocab,
+            });
+        }
         let id_to_token = tokens_arr.clone();
         let mut token_to_id = HashMap::with_capacity(n_vocab);
         for (i, t) in id_to_token.iter().enumerate() {
             // Last-write-wins on duplicates; spec doesn't forbid them but
-            // they shouldn't occur in real DS V4 GGUFs.
+            // they shouldn't occur in real DS V4 GGUFs. Bound-checked
+            // above, so `i as u32` cannot wrap.
             token_to_id.insert(t.clone(), i as u32);
         }
 
@@ -107,12 +114,25 @@ impl Vocab {
             None => return Err(Error::MissingKey("tokenizer.ggml.merges")),
         };
 
+        if merges_arr.len() > u32::MAX as usize {
+            return Err(Error::TableTooLarge {
+                key: "tokenizer.ggml.merges",
+                len: merges_arr.len(),
+            });
+        }
         let mut merge_rank = HashMap::with_capacity(merges_arr.len());
         for (i, m) in merges_arr.iter().enumerate() {
-            // Validate format: must contain exactly one space.
-            if m.split(' ').count() != 2 {
+            // Validate format: must be `lhs SP rhs` with both sides
+            // non-empty and exactly one space. `split_once(' ')`
+            // guarantees we partition at the first space; we then
+            // require the right half to be space-free and non-empty.
+            let Some((lhs, rhs)) = m.split_once(' ') else {
+                return Err(Error::MalformedMerge(m.clone()));
+            };
+            if lhs.is_empty() || rhs.is_empty() || rhs.contains(' ') {
                 return Err(Error::MalformedMerge(m.clone()));
             }
+            // Bound-checked above, so `i as u32` cannot wrap.
             merge_rank.insert(m.clone(), i as u32);
         }
 

@@ -383,6 +383,21 @@ fn parse_array(reader: &mut Reader<'_>, depth: u32) -> Result<Array, Error> {
         item_size: item_ty.scalar_size().unwrap_or(0),
     })?;
 
+    // Defensive bound for variable-size element types (`String`, `Array`):
+    // every element occupies at least an 8-byte length / type-tag prefix,
+    // so a declared `len` larger than `remaining / 8` is impossible. Cap
+    // the pre-allocation capacity so a malicious GGUF claiming
+    // `len = usize::MAX` cannot trigger an `OOM` on `Vec::with_capacity`.
+    // The element read loop will then fail with `Error::Truncated` on
+    // the first short read.
+    let cap_hint: usize = {
+        let max_possible = (reader.remaining() / 8) as usize;
+        match item_ty {
+            ValueType::String | ValueType::Array => len_usize.min(max_possible),
+            _ => len_usize, // numeric types already guarded by scalar_size check above
+        }
+    };
+
     Ok(match item_ty {
         ValueType::U8 => {
             let mut out = Vec::with_capacity(len_usize);
@@ -441,7 +456,7 @@ fn parse_array(reader: &mut Reader<'_>, depth: u32) -> Result<Array, Error> {
             Array::Bool(out)
         }
         ValueType::String => {
-            let mut out = Vec::with_capacity(len_usize);
+            let mut out = Vec::with_capacity(cap_hint);
             for _ in 0..len_usize {
                 out.push(reader.read_str()?.to_owned());
             }
@@ -469,7 +484,7 @@ fn parse_array(reader: &mut Reader<'_>, depth: u32) -> Result<Array, Error> {
             Array::F64(out)
         }
         ValueType::Array => {
-            let mut out = Vec::with_capacity(len_usize);
+            let mut out = Vec::with_capacity(cap_hint);
             for _ in 0..len_usize {
                 out.push(parse_array(reader, depth + 1)?);
             }
