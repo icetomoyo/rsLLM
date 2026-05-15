@@ -33,6 +33,7 @@ memmap2 = "0.9"
 bytemuck = { version = "1", features = ["derive"] }
 half = "2"
 sha2 = "0.10"
+rayon = "1"
 
 # Internal crates
 rsllm-core = { version = "0.0.1", path = "crates/rsllm-core" }

@@ -13,6 +13,8 @@ workspace = true
 
 [dependencies]
 rsllm-cal = { workspace = true }
+rsllm-gguf = { workspace = true }
 thiserror = { workspace = true }
 half = { workspace = true }
 bytemuck = { workspace = true }
+rayon = { workspace = true }
