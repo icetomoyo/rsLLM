@@ -279,6 +279,13 @@ impl Metadata {
         self.entries.get(key)
     }
 
+    /// Insert a key-value pair, overwriting any existing entry. Useful
+    /// for building synthetic metadata in tests and for non-mmap GGUF
+    /// readers that decode metadata through their own pipeline.
+    pub fn insert(&mut self, key: impl Into<String>, value: Value) -> Option<Value> {
+        self.entries.insert(key.into(), value)
+    }
+
     /// Iterate over all `(key, value)` pairs in lexicographic order.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Value)> {
         self.entries.iter().map(|(k, v)| (k.as_str(), v))

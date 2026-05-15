@@ -6,11 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Tokenizer integration for rsLLM. Wraps HuggingFace tokenizers crate and adds chat template rendering."
+description = "Tokenizer for rsLLM. v0.1.0 ports the JoyAI state-machine pre-tokenizer + byte-level BPE from ds4.c (MIT) — no HuggingFace tokenizers crate dependency."
 
 [lints]
 workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
-serde = { workspace = true }
+rsllm-gguf = { workspace = true }
