@@ -230,7 +230,12 @@ impl GgmlType {
 
     /// Whether v0.1.0 of rsLLM can dequantize this type to `f32`.
     ///
-    /// Phase 4 of FEATURE_002 will flip more of these to `true`.
+    /// As of FEATURE_002.1 (2026-05-14) all DeepSeek V4 Flash-relevant
+    /// quantization formats are supported: F16 (most non-MoE weights),
+    /// Q4_K (routed MoE expert), Q2_K (MoE down), IQ2_XXS (MoE gate/up),
+    /// Q8_K (temporary activation). The legacy `Q*_0` / `Q*_1` / `Q5_K` /
+    /// `Q6_K` paths are not used by DS V4 Flash but remain decodable as
+    /// general GGUF compatibility infrastructure for v1.0.
     pub fn is_decodable_v0_1_0(self) -> bool {
         matches!(
             self,
@@ -243,6 +248,9 @@ impl GgmlType {
                 | Self::Q5_K
                 | Self::Q6_K
                 | Self::Q8_0
+                | Self::Q2_K
+                | Self::Q8_K
+                | Self::IQ2_XXS
         )
     }
 }
@@ -399,25 +407,37 @@ mod tests {
     #[test]
     fn decodable_v010_set() {
         for t in [
-            GgmlType::F32,
+            // ds4 / DS V4 Flash core formats:
             GgmlType::F16,
+            GgmlType::Q4_K,
+            GgmlType::Q2_K,
+            GgmlType::IQ2_XXS,
+            GgmlType::Q8_K,
+            // General GGUF compat (not used by ds4 but kept for v1.0):
+            GgmlType::F32,
             GgmlType::BF16,
             GgmlType::Q4_0,
             GgmlType::Q4_1,
-            GgmlType::Q4_K,
             GgmlType::Q5_K,
             GgmlType::Q6_K,
             GgmlType::Q8_0,
         ] {
             assert!(t.is_decodable_v0_1_0(), "{} should be decodable", t.name());
         }
+        // Not yet decodable — DS V4 Flash does not need these.
         for t in [
-            GgmlType::Q2_K,
             GgmlType::Q3_K,
-            GgmlType::IQ2_XXS,
             GgmlType::IQ3_XXS,
+            GgmlType::IQ2_XS,
+            GgmlType::IQ2_S,
+            GgmlType::IQ4_NL,
+            GgmlType::IQ4_XS,
+            GgmlType::IQ3_S,
+            GgmlType::IQ1_S,
+            GgmlType::IQ1_M,
             GgmlType::Q5_0,
             GgmlType::Q5_1,
+            GgmlType::Q8_1,
         ] {
             assert!(
                 !t.is_decodable_v0_1_0(),

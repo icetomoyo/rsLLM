@@ -5,31 +5,40 @@
 //!
 //! ## v0.1.0 supported types
 //!
-//! | Type   | Module       | Reference        |
-//! |--------|--------------|------------------|
-//! | F32    | `float`      | trivial          |
-//! | F16    | `float`      | `half::f16`      |
-//! | BF16   | `float`      | `half::bf16`     |
-//! | Q8_0   | `q8_0`       | ggml `ggml-quants.c` (MIT, ggml authors) |
-//! | Q4_0   | `q4_0`       | same             |
-//! | Q4_1   | `q4_0`       | same             |
-//! | Q4_K   | `q4_k`       | same             |
-//! | Q5_K   | `q5_k`       | same             |
-//! | Q6_K   | `q6_k`       | same             |
+//! | Type     | Module      | Reference                                 |
+//! |----------|-------------|-------------------------------------------|
+//! | F32      | `float`     | trivial                                   |
+//! | F16      | `float`     | `half::f16`                               |
+//! | BF16     | `float`     | `half::bf16`                              |
+//! | Q8_0     | `q8_0`      | ggml `ggml-quants.c` (MIT, ggml authors)  |
+//! | Q4_0     | `q4_0`      | same                                      |
+//! | Q4_1     | `q4_0`      | same                                      |
+//! | Q4_K     | `q4_k`      | same                                      |
+//! | Q5_K     | `q5_k`      | same                                      |
+//! | Q6_K     | `q6_k`      | same                                      |
+//! | Q2_K     | `q2_k`      | same — **DS V4 Flash MoE down expert**    |
+//! | Q8_K     | `q8_k`      | same — DS V4 Flash temporary activation   |
+//! | IQ2_XXS  | `iq2_xxs`   | `ds4.c:217-297` (MIT, The ds4.c authors) — **DS V4 Flash MoE gate/up expert** |
 //!
-//! Phase 4 of FEATURE_002 lands these one module at a time. Modules that
-//! have not yet been implemented are listed in [`GgmlType::is_decodable_v0_1_0`]
-//! as `false`.
+//! ## v0.1.0 element-level helpers (not dispatched via [`dequant_to_f32`])
+//!
+//! - [`fp8_e4m3::fp8_e4m3_to_f32`] / [`fp8_e4m3::f32_to_fp8_e4m3`] — FP8 E4M3
+//!   per-element conversion, used by the KV cache module (FEATURE_006) for
+//!   Metal-side KV row quantization. Not a GGUF on-disk weight type.
 
 use crate::error::Error;
 use crate::tensor::GgmlType;
 
 mod float;
+pub mod fp8_e4m3;
+mod iq2_xxs;
+mod q2_k;
 mod q4_0;
 mod q4_k;
 mod q5_k;
 mod q6_k;
 mod q8_0;
+mod q8_k;
 
 /// Extract the 6-bit scale and 6-bit min for sub-block `j` (0..8) from a
 /// K-quant style packed `scales` array (12 bytes).
@@ -68,6 +77,9 @@ pub fn dequant_to_f32(dtype: GgmlType, src: &[u8], dst: &mut [f32]) -> Result<()
         GgmlType::Q5_K => q5_k::dequant_q5_k(src, dst),
         GgmlType::Q6_K => q6_k::dequant_q6_k(src, dst),
         GgmlType::Q8_0 => q8_0::dequant_q8_0(src, dst),
+        GgmlType::Q2_K => q2_k::dequant_q2_k(src, dst),
+        GgmlType::Q8_K => q8_k::dequant_q8_k(src, dst),
+        GgmlType::IQ2_XXS => iq2_xxs::dequant_iq2_xxs(src, dst),
         _ => Err(Error::UnsupportedDequant(dtype.name())),
     }
 }
@@ -85,11 +97,12 @@ mod tests {
 
     #[test]
     fn unsupported_dtype_reports_error() {
-        // Q2_K is recognized but not decodable in v0.1.0.
-        let src = vec![0u8; 84]; // 1 block of Q2_K
+        // Q3_K is recognized but not decodable in v0.1.0 (DS V4 Flash does
+        // not use it; we can implement it later if a target model needs it).
+        let src = vec![0u8; 110]; // 1 block of Q3_K
         let mut dst = vec![0.0f32; 256];
-        match dequant_to_f32(GgmlType::Q2_K, &src, &mut dst) {
-            Err(Error::UnsupportedDequant(name)) => assert_eq!(name, "q2_k"),
+        match dequant_to_f32(GgmlType::Q3_K, &src, &mut dst) {
+            Err(Error::UnsupportedDequant(name)) => assert_eq!(name, "q3_k"),
             other => panic!("expected UnsupportedDequant, got {other:?}"),
         }
     }
@@ -253,6 +266,53 @@ mod tests {
         dequant_to_f32(GgmlType::Q6_K, &block, &mut dst).unwrap();
         for v in &dst {
             assert!((v - (-32.0)).abs() < 1e-2, "Q6_K arm: got {v}, want -32");
+        }
+    }
+
+    #[test]
+    fn q2_k_dispatch_routes_to_q2_k_arm() {
+        // Q2_K block = 84 bytes: scales[16] + qs[64] + d(f16) + dmin(f16).
+        // Set scales/mins so each sub-block decodes a fixed value.
+        // sc = 3, m = 0 packed: (m<<4) | (sc&0xF) = 0x03
+        // d = 1, dmin = 0; q2 = 1 everywhere → dst = 1*3*1 - 0*0 = 3.
+        let mut block = vec![0x03u8; 16]; // 16 sub-block scales (low nib = sc=3, high nib = m=0)
+        // qs[64]: all bytes = 0b01_01_01_01 = 0x55 → every 2-bit value = 1.
+        block.extend(std::iter::repeat_n(0x55u8, 64));
+        block.extend_from_slice(&f16::from_f32(1.0).to_le_bytes()); // d
+        block.extend_from_slice(&f16::from_f32(0.0).to_le_bytes()); // dmin
+        assert_eq!(block.len(), 84);
+        let mut dst = vec![0.0f32; 256];
+        dequant_to_f32(GgmlType::Q2_K, &block, &mut dst).unwrap();
+        for v in &dst {
+            assert!((v - 3.0).abs() < 1e-2, "Q2_K arm: got {v}, want 3");
+        }
+    }
+
+    #[test]
+    fn q8_k_dispatch_routes_to_q8_k_arm() {
+        // Q8_K block = 292 bytes: d(f32) + qs[256] + bsums[16](i16 = 32 bytes).
+        let mut block = 2.0f32.to_le_bytes().to_vec(); // d=2
+        block.extend(std::iter::repeat_n(3i8 as u8, 256)); // qs all = 3
+        block.extend(std::iter::repeat_n(0u8, 32)); // bsums
+        let mut dst = vec![0.0f32; 256];
+        dequant_to_f32(GgmlType::Q8_K, &block, &mut dst).unwrap();
+        for v in &dst {
+            assert!((v - 6.0).abs() < 1e-3, "Q8_K arm: got {v}, want 6");
+        }
+    }
+
+    #[test]
+    fn iq2_xxs_dispatch_routes_to_iq2_xxs_arm() {
+        // IQ2_XXS block = 66 bytes: d(f16) + qs[32]×u16 = 64 bytes.
+        // Use d=1, all sub-groups grid=0 (pattern 0x08x8 = +8 per byte),
+        // signs=0 (no flips), extras=0 → db = 0.5×0.25 = 0.125, dst = 1.0.
+        let mut block = f16::from_f32(1.0).to_le_bytes().to_vec();
+        block.extend(std::iter::repeat_n(0u8, 64));
+        assert_eq!(block.len(), 66);
+        let mut dst = vec![0.0f32; 256];
+        dequant_to_f32(GgmlType::IQ2_XXS, &block, &mut dst).unwrap();
+        for v in &dst {
+            assert!((v - 1.0).abs() < 1e-3, "IQ2_XXS arm: got {v}, want 1.0");
         }
     }
 }
