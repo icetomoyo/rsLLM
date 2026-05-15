@@ -59,18 +59,19 @@ rsllm/
 ├── crates/
 │   ├── rsllm-core/           # Engine / Session / SamplingParams + 公共 trait
 │   ├── rsllm-gguf/           # GGUF 解析与量化解码（无 GPU 依赖）
-│   ├── rsllm-tokenizer/      # Tokenizer 封装（封装 HF tokenizers crate）
+│   ├── rsllm-tokenizer/      # JoyAI 状态机分词器（v0.1.0）→ 多家族 PreTokenizer trait（v0.1.7+）
 │   ├── rsllm-cal/            # Compute Abstraction Layer trait
-│   ├── rsllm-backend-cpu/    # CPU 后端（AVX2/AVX512/NEON SIMD）
-│   ├── rsllm-backend-cpu-amx/# 可选 AMX 内核（cfg feature, Linux only）
-│   ├── rsllm-backend-cuda/   # CUDA 后端（cudarc + 内核 .cu/.ptx）
-│   ├── rsllm-backend-metal/  # Metal 后端（objc2 + .metal kernels）
-│   ├── rsllm-backend-wgpu/   # 可选 wgpu/Vulkan 后端
-│   ├── rsllm-models/         # 模型架构实现（llama, qwen, deepseek, mixtral…）
-│   ├── rsllm-kvcache/        # Paged KV cache + 磁盘 KV (KVC v2)
-│   ├── rsllm-scheduler/      # 调度器（SingleSession / ContinuousBatch / Hybrid）
-│   ├── rsllm-server/         # axum HTTP server + OpenAI/Anthropic API 适配
-│   ├── rsllm-cli/            # 命令行入口（编译为 `rsllm` 二进制）
+│   ├── rsllm-backend-cpu/    # CPU 后端：NEON dotprod (Mac) + AVX-512 VNNI (AMD Strix Halo+)
+│   ├── rsllm-backend-metal/  # Metal 后端（objc2 + .metal kernels）—— v0.1.0 主 Mac 加速
+│   ├── rsllm-backend-vulkan/ # Vulkan compute 后端 —— v0.1.1 主 AMD iGPU 加速（Strix Halo Radeon 8060S）
+│   ├── rsllm-backend-cuda/   # CUDA 后端（cudarc）—— v0.1.6 接入
+│   ├── rsllm-backend-cpu-amx/# 可选 AMX 内核（cfg feature, Intel SPR+ only）—— v0.2.0
+│   ├── rsllm-backend-wgpu/   # 可选 wgpu 后端（跨平台兜底）—— v0.2.1
+│   ├── rsllm-models/         # 模型架构（v0.1.0: deepseek_v4_flash；v0.1.7+: qwen/glm/kimi/gemma）
+│   ├── rsllm-kvcache/        # 三级 KV（v0.1.0 DS V4）+ Paged KV（v0.1.6 CUDA 路径）+ 磁盘 KV (KVC, v0.1.3)
+│   ├── rsllm-scheduler/      # 调度器（v0.1.4 单 session 服务化；v0.2.x continuous batching）
+│   ├── rsllm-server/         # axum HTTP server + OpenAI/Anthropic API 适配（v0.1.4）
+│   ├── rsllm-cli/            # 命令行入口（linenoise REPL 风格，编译为 `rsllm` 二进制）
 │   └── rsllm-bench/          # 性能基准
 ├── tests/                    # 跨 crate 集成测试
 ├── benches/                  # criterion 基准
@@ -80,9 +81,20 @@ rsllm/
 └── rust-toolchain.toml
 ```
 
-**每个 backend 都是独立 crate**，通过 `rsllm-core` 的 `Backend` trait 集成。`rsllm-cli` 默认 feature 集成 CPU + 平台对应 GPU 后端，可裁剪。
+**v0.1.0 实际包含的 crate**：`core / gguf / tokenizer / cal / backend-cpu / backend-metal / kvcache / models / cli`（9 个）。其余 backend / scheduler / server / bench 是 v0.1.x+ 增量。
 
-**所有后端都是 rsLLM 自研的纯 Rust + CUDA/Metal/SIMD 内核**——没有 `rsllm-backend-llama` 这样的 FFI crate。详见 [`adr/0001-engine-architecture.md`](adr/0001-engine-architecture.md)。
+**每个 backend 都是独立 crate**，通过 `rsllm-core` 的 `Backend` trait 集成。`rsllm-cli` 默认 feature 集成 CPU + 平台对应 GPU 后端（macOS → metal，Linux x86_64 → vulkan/cuda，其他 → cpu only），可裁剪。
+
+**所有后端都是 rsLLM 自研的纯 Rust + CUDA/Metal/Vulkan/SIMD 内核**——没有 `rsllm-backend-llama` 这样的 FFI crate。详见 [`adr/0001-engine-architecture.md`](adr/0001-engine-architecture.md)。
+
+### 2.1 关于 AMD AI Max+ 统一内存（v0.1.0 + v0.1.1 关键）
+
+Strix Halo 是 **统一内存架构**（CPU 与 iGPU 共享 LPDDR5X-8000，256-bit，~256 GB/s）。这跟 Apple Silicon UMA 同类型，导致一个工程上的好处：
+- `rsllm-gguf` mmap 的权重，CPU 和 iGPU 都能零拷贝访问
+- v0.1.0 的 CPU 路径与 v0.1.1 的 Vulkan iGPU 路径**共享同一份权重 buffer**，切换不需要 upload/download
+- 128GB 内存 + 2TB SSD 配合下，DS V4 Flash 的 140-160GB 量化权重可走 mmap 流式访问冷专家（每 token 只激活 6/256 ≈ 2.3% expert）
+
+这跟传统 x86+离散 CUDA GPU 完全不同。`rsllm-backend-vulkan` 在 Strix Halo 上要利用这个特性，buffer 分配走 `VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT` 组合。
 
 ## 3. 核心抽象（伪码）
 
@@ -238,24 +250,36 @@ Token i → ... → router selects top-K experts
        否 → 正常 prefill → 离开 session 时 dump 到 KVC
 ```
 
-KVC 文件格式（v2，参考 ds4 KVC，加扩展字段）：
+KVC 文件格式分两版：
+
+**v0.1.3 简化版（F022，直接复刻 ds4 KVC v1）**：
 
 ```
-Header (64 bytes):
-  magic "rsKV"  4
-  version u16   2   (=2)
-  flags  u16    2
-  model_id sha256[16]    模型指纹前16字节
-  token_count u32  4
-  layer_count u32  4
-  kv_dtype u8     1
-  reserved 31
+Header (48 bytes):
+  magic "KVC"        3
+  version u8         1   (=1)
+  quant_bits u32     4   防止换量化方案误用
+  reason u32         4   COLD / CONTINUED / EVICT / SHUTDOWN
+  token_count u64    8
+  ctx_size u64       8
+  created_at u64     8   unix timestamp
+  payload_bytes u64  8   后续 payload 长度
 Body:
-  token_ids: [u32; token_count]
-  per_layer KV rows: [KvBlock]
-Footer:
-  crc32 of body
+  rendered_text: 人类可读的渲染文本（调试用）
+  engine_payload: 由 ds4_session_save_payload 等价的 Rust 函数写入
+    - magic "DSV4" u32 = 0x34565344
+    - version u32
+    - vocab_size u32
+    - n_layers u32
+    - head_dim u32
+    - token_ids [u32; token_count]
+    - per_layer KV tensor bytes（三级 KV：raw_kv + compressed_kv + indexer_kv）
+  [可选] tool_id_map: magic "KTM" + entries (v0.1.4 server 用)
 ```
+
+文件名为 `SHA1(token_ids).kvc`（不是 SHA1(text)，避免 BPE 重新分词产生不同 hash）。
+
+**v0.2.0 完整版（F031）**：在简化版基础上加 continued checkpoint（会话进行中阶段性保存）+ tool call replay map（DSML 块的 byte-exact 回放索引），格式向后兼容。
 
 ## 5. 关键技术选型
 
@@ -431,16 +455,16 @@ Footer:
 - 严格 `clippy -- -D warnings`
 - 公开 API 必须 rustdoc + 例子
 
-## 13. 关键里程碑的技术决策时间线
+## 13. 关键里程碑的技术决策时间线（2026-05-14 重定位后）
 
 | 里程碑 | 决策点 |
 |---|---|
-| M0 | GGUF parser 实现细节、tokenizer 集成方式、CPU SIMD 内核风格（intrinsics vs `wide` crate） |
-| M1 | cudarc API 边界、Paged KV block size、SSE 流式协议细节 |
-| M2 | TP 实现（按 head 切 vs 按 hidden 切）、NCCL FFI 引入 |
-| M3 | AMX 内核实现策略（内嵌 C 还是纯 Rust intrinsics）、NUMA 抽象 |
-| M4 | KVC 文件格式 v2、radix tree 实现选 `radix_trie` crate vs 自实现 |
-| M5 | Metal 内核组织、wgpu 是否引入、推测解码算法选型 |
+| **M0 (v0.1.0) ds4 复刻** | **Metal kernel 风格**（直接 port ds4_metal.m vs 借鉴 MLX）、**JoyAI tokenizer 状态机 Rust port 边界**（Unicode 字符分类用 `unicode_categories` crate vs 自查表）、**MLA+HC+MoE 实现策略**（一份代码同时跑 CPU 和 Metal vs 各自特化）、**AVX-512 VNNI 与 NEON dotprod 抽象层**（`is_x86_feature_detected!` runtime 分发 vs cfg 编译期分发） |
+| M1 (v0.1.1) AMD Vulkan | `ash` vs `vulkano`、subgroup operations 兼容性矩阵（RDNA 3.5 / RDNA 4 / NVIDIA Ampere+）、shared memory 布局 |
+| M2 (v0.1.4) HTTP server | axum tower middleware 链、SSE backpressure、DSML ↔ OpenAI ↔ Anthropic 三向 schema 翻译边界 |
+| M3 (v0.1.6) NVIDIA CUDA | cudarc API 边界、Paged KV block size、SSE 流式协议细节 |
+| M4 (v0.1.9) TP | TP 实现（按 head 切 vs 按 hidden 切）、NCCL FFI 引入 |
+| M5 (v0.2.0) 超越 ds4 | AMX 内核实现策略（内嵌 C 还是纯 Rust intrinsics）、NUMA 抽象、推测解码算法选型、KVC continued checkpoint 触发策略 |
 
 ## 14. 与现有引擎的协同 / 互操作
 

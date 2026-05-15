@@ -18,7 +18,7 @@
 | **解决的问题** | 让用户在自己的硬件上，用 OpenAI / Anthropic 兼容 API 跑主流开源 LLM，不用容忍 Python 生态部署复杂度，也不用接受 ollama 的黑盒 |
 | **北极星** | "同一二进制、同一 API，在 8GB 笔记本和 8×H100 上都跑得动 / 跑得好" |
 | **核心差异化** | 单二进制 / 内存安全 / 异构 CPU+GPU / 磁盘 KV / Agent 友好 |
-| **当前阶段** | pre-M0（v0.0.1），workspace 骨架已就位，正在启动 F002 GGUF 解析器 |
+| **当前阶段** | v0.0.1，workspace 骨架 + GGUF parser Phase 4 已完成；正在按"ds4 复刻"重定位 v0.1.0 设计（首发硬件 Mac + AMD Ryzen AI Max+ 395 Linux；首发模型 DeepSeek V4 Flash） |
 | **v1.0 时间窗口** | 12-18 个月 |
 
 ---
@@ -36,6 +36,12 @@
 愿景的核心不是"做更快的推理引擎"，而是「**让硬件不再是用户使用开源 LLM 的门槛**」。
 
 完整愿景见 [`00-overview.md`](00-overview.md)。
+
+> **2026-05-14 重定位说明**：v1.0 终点（≥10 个家族 / 跨硬件 / OpenAI+Anthropic）保持不变，但路径分两阶段——
+> - **v0.1.0-v0.1.3**：**严格复刻 ds4**——首发硬件 **Mac (Apple Silicon M3+)** + **AMD Ryzen AI Max+ 395 (Strix Halo) Linux**；首发模型 **DeepSeek V4 Flash 单模型**
+> - **v0.1.4+**：开始通用化扩展——多模型家族、NVIDIA CUDA、Continuous Batching、Tensor Parallel 等
+>
+> 选择"ds4 复刻"作为 v0.1.0 路径，是因为它能让我们用最小的不确定性把工程 idiom 立起来（ds4 已经把 Apple Silicon 路径走通过，AMD AI Max+ 是 idiom 等价硬件——统一内存 + 集成 GPU）。
 
 ---
 
@@ -145,6 +151,8 @@ rsLLM     │  ✓   │   ✓   │     ✓       │    ✓    │    ✓    �
 
 ### 4.5 跨平台体验
 
+#### v1.0 终点（不变）
+
 | 平台 | 体验承诺 |
 |---|---|
 | Linux x86_64 | **Tier 1**：CPU + CUDA 全功能，CI 全绿，主战场 |
@@ -155,6 +163,17 @@ rsLLM     │  ✓   │   ✓   │     ✓       │    ✓    │    ✓    �
 | FreeBSD / 其他 | Tier 3：社区维护 |
 
 **用户在 Tier 1 平台上的体验是商业级的**，Tier 2 是"能用、好用"，Tier 3 是"社区能跑得起来"。
+
+#### v0.1.0 首发硬件（重定位后）
+
+v0.1.0 阶段不追求覆盖所有 Tier 1 平台，而是**聚焦两台特定机器**（这是 ds4 复刻的实施载体）：
+
+| 平台 | v0.1.0 体验承诺 | 后端 |
+|---|---|---|
+| **Mac M3+（Apple Silicon）** | DS V4 Flash decode ≥15 tok/s，Metal 主路径 | F025 Metal + NEON CPU 验证 |
+| **AMD Ryzen AI Max+ 395 (Strix Halo) Linux** | DS V4 Flash decode ≥3 tok/s（CPU only），128GB + 2TB SSD 装下 140GB 量化模型 | F004 AVX-512 CPU + VNNI |
+
+AMD AI Max+ 在 v0.1.1 加 iGPU(Vulkan) 后提升到 ≥10 tok/s，v0.1.2 调优后 ≥15 tok/s。NVIDIA CUDA、Windows、Linux aarch64 等覆盖延后到 v0.1.6+。
 
 ### 4.6 Agent 工作流
 
@@ -256,21 +275,38 @@ rsLLM 是少数几个**把 agent 工作流作为一等公民**的开源推理引
 
 ---
 
-## 7. 路线图（用户价值视角）
+## 7. 路线图（用户价值视角，2026-05-14 重定位后）
 
 每个版本告诉用户**这个版本之后能多用到什么**。详细 feature 列表见 [`FEATURE_LIST.md`](FEATURE_LIST.md)。
 
+### 7.1 v0.1.0-v0.1.3：ds4 复刻路径
+
 | 版本 | 用户能多用到什么 |
 |---|---|
-| **v0.1.0**（M0） | 第一次能用 rsLLM：CPU 上跑通 Llama 7B Q4_K_M，验证产品形态 |
-| **v0.1.1-v0.1.2** | NVIDIA GPU 加速 + OpenAI API 兼容服务器，进入"实际可用"阶段 |
-| **v0.1.3-v0.1.4** | 主流模型家族覆盖 + 第一次 MoE（Phi-3.5-MoE） |
-| **v0.1.5-v0.1.6** | 服务化场景：并发不掉链子 + Mac 用户终于有 GPU 加速 |
-| **v0.1.7-v0.1.8** | Agent 工作流体验：prefix cache + 磁盘 KV cache 简化版 |
-| **v0.1.9** | 多 GPU 上 70B 模型 + 生产级 metrics |
-| **v0.2.0** | 大模型自由：DeepSeek-V3 671B 跑通 + Anthropic API + Tool calling + 完整 Mac 体验 |
-| **v0.2.x** | 长尾覆盖：跨平台 GPU 兜底（wgpu）+ JSON mode + 多模型控制面 |
-| **v1.0.0** | 商业级稳定性 + 全平台 CI + 性能达标 |
+| **v0.1.0**（M0：ds4 复刻第一阶段） | 第一次能用 rsLLM：**在 Mac M3+ 或 AMD Ryzen AI Max+ 395 Linux 上单二进制跑通 DeepSeek V4 Flash chat**（Mac 经 Metal 加速 ≥15 tok/s，AMD CPU only 时 ≥3 tok/s） |
+| **v0.1.1** | AMD AI Max+ 上 iGPU(Vulkan) 加速接入，decode 提升到 ≥10 tok/s，进入"日常可用" |
+| **v0.1.2** | 双平台 kernel 性能调优 + 全 kernel 数值回归，Mac ≥25 tok/s / AMD ≥15 tok/s |
+| **v0.1.3** | **磁盘 KV cache** 命中：25k token 系统提示重复使用秒回——agent 工作流痛点的核心解药 |
+
+### 7.2 v0.1.4-v0.1.9：通用化扩展
+
+| 版本 | 用户能多用到什么 |
+|---|---|
+| **v0.1.4** | **HTTP server 双协议**（OpenAI + Anthropic + tool calling）：Open WebUI / Claude Code 等客户端切换 base URL 直接接入 rsLLM |
+| **v0.1.5** | **logprob 回归测试体系** 上线，rsLLM 与 DeepSeek 官方 API token bytes 级一致，"可证明正确" |
+| **v0.1.6** | NVIDIA CUDA 后端，4090/H100 用户开始受益 |
+| **v0.1.7-v0.1.8** | 第二、第三个模型家族（Qwen 3.6 / GLM-5.1 / Kimi K2.6 / Gemma 4 中选 2 个），开始通用引擎拼图 |
+| **v0.1.9** | 多 GPU TP：双 4090 跑 DS V4 Flash 或同规模模型 ≥12 tok/s |
+
+### 7.3 v0.2.0+：超越 ds4
+
+| 版本 | 用户能多用到什么 |
+|---|---|
+| **v0.2.0** | **超越 ds4**：异构 CPU+GPU MoE 卸载 + AMX/AVX-512 算子统一 + 推测解码 + 历史 DS V2/V3 模型 + Metal 完整版 + KVC 完整版（continued + tool replay） |
+| **v0.2.x** | 长尾覆盖：Continuous Batching + Prefix cache + wgpu 兜底 + JSON mode + 多模型控制面 + ROCm 独立 dGPU |
+| **v1.0.0** | 商业级稳定性 + 全平台 CI + 性能达标（vs ds4 同硬件 ≥ 85%） |
+
+> 路线图相比 2026-05-11 初稿做了**重大重定位**：v0.1.0 不再是"CPU 跑 Llama 7B"通用引擎 MVP，而是"双硬件 ds4 复刻"。详见 [`features/v0.1.0.md#修订记录`](features/v0.1.0.md#修订记录)。
 
 ---
 

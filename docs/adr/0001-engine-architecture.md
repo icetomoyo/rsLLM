@@ -1,7 +1,7 @@
 # ADR-0001：引擎架构——自研内核 + GGUF 格式兼容（ds4 风格）
 
-- **状态**：Accepted
-- **日期**：2026-05-11
+- **状态**：Accepted（2026-05-14 amended：v0.1.0 双首发硬件确认为 Mac + AMD Ryzen AI Max+ 395）
+- **日期**：2026-05-11（原始）/ 2026-05-14（amendment）
 - **决策者**：项目发起人
 
 ---
@@ -47,7 +47,7 @@ rsLLM 是从零启动的 Rust LLM 推理引擎。在确定整体架构之前，�
 2. **GGUF 兼容**：自己实现 GGUF 解析器（几百到一千行 Rust），用户任意 llama.cpp GGUF 文件可直接加载
 3. **算法借鉴 + 法律致谢**：必要的量化 block 布局、查找表常量等可以借鉴并复用，源码顶部按 MIT 规则双重署名（`The rsLLM authors` + `The ggml authors`）
 4. **致谢 ds4**：ds4 启发了形态 G 这条路线本身（"格式兼容但代码不依赖"的工程姿势）以及多个具体设计（磁盘 KV cache、非对称量化、FP8 KV、Engine/Session 分离），在 `README.md` / `NOTICE.md` / 关键文件 header 中明确致谢
-5. **后端列表**：Tier 1 = CPU、CUDA；Tier 2 = Metal；Tier 3 = wgpu / ROCm。**llama.cpp 不在后端列表中**
+5. **后端列表**：Tier 1 = CPU（NEON dotprod + AVX-512 VNNI）、Metal、Vulkan compute、CUDA；Tier 2 = AMX、ROCm；Tier 3 = wgpu。**llama.cpp 不在后端列表中**
 6. **内核实现策略：借鉴而非从零**
    - rsLLM 的 CUDA / Metal / CPU SIMD 内核**显式借鉴**以下开源参考实现：
      - **llama.cpp / ggml**（MIT）：CUDA kernels、Metal kernels、量化解码、GGUF 格式
@@ -128,6 +128,38 @@ rsLLM 是从零启动的 Rust LLM 推理引擎。在确定整体架构之前，�
 - **核心团队失去 CUDA / Metal 内核工程能力**：考虑形态 C 退路
 - **GGUF 生态被显著替代**（例如 HF 推出新事实标准）：调整格式兼容策略
 - **某主流模型架构 6 个月内无人在 rsLLM 实现**：考虑临时借助外部引擎
+
+---
+
+## 2026-05-14 修订：v0.1.0 双首发硬件确认
+
+本次修订**不改变 ADR-0001 的本体决策**（形态 G），只把 v0.1.0 的硬件落地目标具体化：
+
+### v0.1.0 双首发硬件
+
+| 平台 | 主加速路径 | 验证路径 | 选择理由 |
+|---|---|---|---|
+| **Mac (Apple Silicon M3+)** | Metal kernel（F025） | NEON CPU reference | ds4 已经在此平台跑通 DS V4 Flash，移植阻力最小 |
+| **AMD Ryzen AI Max+ 395 (Strix Halo) Linux** | AVX-512 + VNNI CPU（F004）→ v0.1.1 加 Vulkan iGPU（F033） | 标量 fallback | 用户实际持有硬件；统一内存架构（与 Apple Silicon 同 idiom）；128GB + 2TB SSD 可装 DS V4 Flash 量化 |
+
+### 为什么不在 v0.1.0 做 NVIDIA CUDA
+
+- ds4 没有 CUDA 实现，没有"工程姿势"参考
+- 已选定的两台首发硬件覆盖了 Apple Silicon UMA + AMD Strix Halo UMA 两个"统一内存"案例，已足以验证 idiom
+- NVIDIA CUDA 留到 v0.1.6——届时 v0.1.0-v0.1.5 已验证 CAL trait 在 4 个 backend（NEON CPU / AVX-512 CPU / Metal / Vulkan）上的可移植性
+
+### AMD AI Max+ 选 Vulkan compute 而非 ROCm
+
+- **Vulkan 跨平台**：一份 compute shader 在 Linux/Windows 都能跑，NVIDIA dGPU 和 Intel Arc iGPU 也能复用
+- **ROCm 在 Strix Halo 上不稳**：HSA runtime 对 Strix Halo 的支持还在演进
+- **借鉴 llama.cpp `ggml-vulkan` 已有 kernel**（MIT 致谢）
+- ROCm 留给独立 Radeon dGPU 用户（v0.2.x F030 best-effort）
+
+### 致谢更新
+
+NOTICE.md / README.md 致谢部分**新增**：
+- **AMD Strix Halo 文档**：用于统一内存特性理解
+- **llama.cpp ggml-vulkan**（MIT）：v0.1.1 Vulkan compute shader 参考
 
 ## 参考资料
 
