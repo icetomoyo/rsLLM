@@ -23,4 +23,12 @@ pub enum Error {
         /// Required block size.
         block: usize,
     },
+
+    /// A kernel input contained a non-finite value (NaN or ±∞) where a
+    /// finite value was required. Most kernels accept any `f32`, but the
+    /// Q8_0 quantizer would silently emit zero quants for NaN inputs;
+    /// callers see this error so data corruption is signalled rather
+    /// than masked.
+    #[error("`{0}` contains a non-finite value (NaN or Inf)")]
+    NonFiniteInput(&'static str),
 }

@@ -11,19 +11,22 @@
 /// Scalar RMSNorm reference. See [`crate::ops::rmsnorm`].
 ///
 /// Computes `out[i] = x[i] * weight[i] * (1 / sqrt(mean(x^2) + eps))`.
-/// Sum is accumulated in `f32`; for the DS V4 Flash hidden_size of
-/// 7168 the precision is sufficient (see ds4.c which uses `float`
-/// throughout the rmsnorm).
+///
+/// Sum-of-squares is accumulated in `f64` to match `ds4.c`'s
+/// `rms_norm_weight` (which uses `double ss` to avoid f32 overflow /
+/// precision loss at DS V4 Flash's `hidden_size = 7168`). Final result
+/// is cast back to `f32`.
 pub fn rmsnorm(out: &mut [f32], x: &[f32], weight: &[f32], eps: f32) {
     debug_assert_eq!(out.len(), x.len());
     debug_assert_eq!(out.len(), weight.len());
 
-    let n = x.len() as f32;
-    let mut sumsq = 0.0_f32;
+    let n = x.len() as f64;
+    let mut sumsq = 0.0_f64;
     for &v in x {
-        sumsq += v * v;
+        let vd = v as f64;
+        sumsq += vd * vd;
     }
-    let rms_recip = 1.0 / (sumsq / n + eps).sqrt();
+    let rms_recip = (1.0_f64 / (sumsq / n + eps as f64).sqrt()) as f32;
     for i in 0..x.len() {
         out[i] = x[i] * weight[i] * rms_recip;
     }
@@ -112,6 +115,13 @@ pub fn softmax(x: &mut [f32]) {
 /// down-weight all their attention targets uniformly. Returns the
 /// implied sink weight `exp(sink - max) / sum`, which callers can use
 /// to detect when the row mostly attends to the sink.
+///
+/// Degenerate input: if every score and the sink are non-finite (e.g.
+/// a fully-masked row), `max_v` would be non-finite and
+/// `score - max_v = NaN`. We detect this and collapse the row to
+/// "sink takes everything" — sink_weight = 1, all scores = 0 — so
+/// downstream layers receive a well-defined zero contribution instead
+/// of poisoning the hidden state with NaNs.
 pub fn softmax_attn(scores: &mut [f32], sink: f32) -> f32 {
     if scores.is_empty() {
         return 1.0;
@@ -121,6 +131,12 @@ pub fn softmax_attn(scores: &mut [f32], sink: f32) -> f32 {
         if v > max_v {
             max_v = v;
         }
+    }
+    if !max_v.is_finite() {
+        for v in scores.iter_mut() {
+            *v = 0.0;
+        }
+        return 1.0;
     }
     let sink_weight = (sink - max_v).exp();
     let mut sum = sink_weight;
@@ -281,6 +297,36 @@ mod tests {
         assert!(sink_w > 0.999);
         for v in &scores {
             assert!(*v < 1e-30);
+        }
+    }
+
+    #[test]
+    fn softmax_attn_all_neg_inf_does_not_poison() {
+        // HIGH-3 fix: a fully-masked row (all scores + sink = -inf) must
+        // not produce NaN; the row collapses to sink-takes-all.
+        let mut scores = vec![f32::NEG_INFINITY; 4];
+        let sink_w = softmax_attn(&mut scores, f32::NEG_INFINITY);
+        assert!(sink_w.is_finite());
+        for v in &scores {
+            assert!(v.is_finite(), "score must not be NaN");
+            assert_eq!(*v, 0.0);
+        }
+    }
+
+    #[test]
+    fn rmsnorm_large_hidden_size_accumulates_in_f64() {
+        // Regression test for the ds4 parity fix: at hidden_size = 7168
+        // with x[i] = 100.0, a single-pass f32 sumsq accumulator drifts
+        // by enough that the rms_recip is detectably wrong. The f64
+        // path must match `100.0 / sqrt(10000)` = 1.0 exactly.
+        let n = 7168;
+        let x = vec![100.0_f32; n];
+        let w = vec![1.0_f32; n];
+        let mut out = vec![0.0_f32; n];
+        rmsnorm(&mut out, &x, &w, 0.0);
+        // rms = 100, so out[i] = x[i] / 100 = 1.0 exactly.
+        for &v in &out {
+            assert!((v - 1.0).abs() < 1e-5, "got {v}");
         }
     }
 }

@@ -18,6 +18,7 @@
 //! land alongside as `cfg(target_arch = ...)` modules; the public
 //! `matmul_q8_0_batch` selects via [`crate::SimdTier`] at call time.
 
+use bytemuck::cast_slice;
 use half::f16;
 
 use crate::SimdTier;
@@ -58,7 +59,15 @@ pub fn quantize_q8_0_activation(x: &[f32], xq: &mut [i8], scale: &mut [f32]) -> 
         let bn = (n - i0).min(Q8_0_BLOCK);
         let mut amax = 0.0_f32;
         for i in 0..bn {
-            let ax = x[i0 + i].abs();
+            let v = x[i0 + i];
+            // NaN poisoning guard: `NaN.abs() = NaN`, and `NaN > amax`
+            // is always `false`, so a naive max-fold would silently
+            // skip NaN inputs and produce zero quants — a corrupt
+            // model output with no error signal. Fail fast instead.
+            if !v.is_finite() {
+                return Err(Error::NonFiniteInput("quantize_q8_0: activation"));
+            }
+            let ax = v.abs();
             if ax > amax {
                 amax = ax;
             }
@@ -132,6 +141,16 @@ fn block_scale(block: &[u8]) -> f32 {
 ///
 /// Scalar fallback path used by every tier; SIMD modules override at
 /// the public entry-point level.
+///
+/// `row` is the raw GGUF block bytes (length `blocks * 34`). Each
+/// block is `[f16 scale (2 bytes) | i8 quants × 32 (32 bytes)]`. We
+/// reinterpret the 32-byte quant region as `&[i8]` via `bytemuck` so
+/// the dot-product loop sees the spec's signed semantics directly
+/// instead of relying on a `u8 as i8` bit-reinterpret cast.
+///
+/// Non-finite f16 block scales (which can occur in a corrupted GGUF)
+/// are coerced to `0.0` so they contribute nothing rather than
+/// poisoning the accumulator with NaN / Inf.
 pub fn dot_q8_0_row_scalar(
     row: &[u8],     // packed Q8_0 row, length blocks * 34
     xq: &[i8],      // pre-quantized activations, length blocks * 32
@@ -146,16 +165,23 @@ pub fn dot_q8_0_row_scalar(
     let mut acc = 0.0_f32;
     for b in 0..blocks {
         let block = &row[b * Q8_0_BLOCK_BYTES..(b + 1) * Q8_0_BLOCK_BYTES];
-        let wscale = block_scale(block);
-        let wq = &block[2..]; // 32 × i8 quants
+        let mut wscale = block_scale(block);
+        // Sanitize corrupted f16 scales — Inf / NaN would poison the
+        // accumulator. Zero contribution is the safe fallback.
+        if !wscale.is_finite() {
+            wscale = 0.0;
+        }
+        let wq: &[i8] = cast_slice(&block[2..]);
         let xqb = &xq[b * Q8_0_BLOCK..(b + 1) * Q8_0_BLOCK];
 
         let i0 = b * Q8_0_BLOCK;
         let bn = (in_dim - i0).min(Q8_0_BLOCK);
 
+        // `dot` max magnitude: 32 × 127 × 127 = 516_128, exactly
+        // representable in f32 (well under 2^24). `as f32` is safe.
         let mut dot: i32 = 0;
         for i in 0..bn {
-            dot += i32::from(wq[i] as i8) * i32::from(xqb[i]);
+            dot += i32::from(wq[i]) * i32::from(xqb[i]);
         }
         acc += wscale * xscale[b] * dot as f32;
     }
@@ -170,6 +196,15 @@ pub fn dot_q8_0_row_scalar(
 ///   * `xq`     : `[n_tok × blocks × 32]` row-major activations.
 ///   * `xscale` : `[n_tok × blocks]`.
 ///   * `out`    : `[n_tok × out_dim]`.
+///
+/// **Weight packing contract**: when `in_dim` is not a multiple of 32,
+/// the tail bytes of each weight row's last block must be zero-padded
+/// (i.e. the unused i8 quant slots set to `0`). The dot-product loop
+/// only iterates `bn = in_dim - i0` lanes per block, so garbage in the
+/// tail is skipped by the index bound — but if `bn` is ever widened
+/// (e.g. by a future SIMD specialization that processes 32 lanes at
+/// once), unpadded tails would silently corrupt the result. Activation
+/// quantization already zero-pads its tails.
 ///
 /// `tier` is currently unused — phase C ships the scalar reference;
 /// NEON / AVX-512 paths land in phase D after benchmarking validates
@@ -375,5 +410,43 @@ mod tests {
         let mut out = vec![0.0; 4];
         let err = matmul_q8_0_batch(&mut out, &[], &[], &[], 1, 32, 4, SimdTier::Scalar);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn quantize_rejects_nan_input() {
+        // CRITICAL-1 fix: NaN must not silently quantize to zero.
+        let x = vec![1.0, 2.0, f32::NAN, 3.0];
+        let mut xq = vec![0i8; 32];
+        let mut scale = vec![0.0_f32; 1];
+        let err = quantize_q8_0_activation(&x, &mut xq, &mut scale).unwrap_err();
+        assert!(matches!(err, Error::NonFiniteInput(_)));
+    }
+
+    #[test]
+    fn quantize_rejects_inf_input() {
+        let x = vec![1.0, f32::INFINITY, 2.0];
+        let mut xq = vec![0i8; 32];
+        let mut scale = vec![0.0_f32; 1];
+        let err = quantize_q8_0_activation(&x, &mut xq, &mut scale).unwrap_err();
+        assert!(matches!(err, Error::NonFiniteInput(_)));
+    }
+
+    #[test]
+    fn dot_q8_0_row_ignores_nonfinite_scale() {
+        // Build a row whose block scale bits decode to f16 NaN
+        // (0x7E00 is a quiet NaN in f16 representation).
+        let mut row = vec![0u8; Q8_0_BLOCK_BYTES];
+        row[0] = 0x00;
+        row[1] = 0x7E; // f16 NaN scale (LE)
+        // Quants are arbitrary; the NaN scale must zero them out.
+        for i in 0..Q8_0_BLOCK {
+            row[2 + i] = 127;
+        }
+        let xq = vec![1i8; Q8_0_BLOCK];
+        let xscale = vec![1.0_f32; 1];
+        let got = dot_q8_0_row_scalar(&row, &xq, &xscale, Q8_0_BLOCK);
+        // With NaN scale forced to 0.0, the block contributes nothing.
+        assert!(got.is_finite());
+        assert_eq!(got, 0.0);
     }
 }

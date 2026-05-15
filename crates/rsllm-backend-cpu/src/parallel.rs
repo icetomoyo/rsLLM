@@ -38,6 +38,10 @@ pub fn for_each_row_mut<F>(out: &mut [f32], row_len: usize, f: F)
 where
     F: Fn(usize, &mut [f32]) + Send + Sync,
 {
+    // Reject zero row length first — otherwise `is_multiple_of(0)` below
+    // would itself panic with "divide by zero" inside the standard
+    // library, eating the more useful diagnostic.
+    assert!(row_len > 0, "for_each_row_mut: row_len must be non-zero");
     assert!(
         out.len().is_multiple_of(row_len),
         "for_each_row_mut: out len {} not divisible by row_len {}",
@@ -83,5 +87,12 @@ mod tests {
     fn for_each_row_mut_rejects_misaligned() {
         let mut out = vec![0.0_f32; 7];
         for_each_row_mut(&mut out, 3, |_, _| {});
+    }
+
+    #[test]
+    #[should_panic(expected = "row_len must be non-zero")]
+    fn for_each_row_mut_rejects_zero_row_len() {
+        let mut out: Vec<f32> = Vec::new();
+        for_each_row_mut(&mut out, 0, |_, _| {});
     }
 }
