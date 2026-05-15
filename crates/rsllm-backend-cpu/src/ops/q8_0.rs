@@ -220,7 +220,6 @@ pub fn matmul_q8_0_batch(
     out_dim: usize,
     tier: SimdTier,
 ) -> Result<(), Error> {
-    let _ = tier;
     let blocks = in_dim.div_ceil(Q8_0_BLOCK);
 
     if weights.len() != out_dim * blocks * Q8_0_BLOCK_BYTES {
@@ -252,11 +251,46 @@ pub fn matmul_q8_0_batch(
         let xscale_row = &xscale[t * blocks..(t + 1) * blocks];
         for o in 0..out_dim {
             let w_row = &weights[o * row_stride_bytes..(o + 1) * row_stride_bytes];
-            out_row[o] = dot_q8_0_row_scalar(w_row, xq_row, xscale_row, in_dim);
+            out_row[o] = dot_q8_0_row_dispatch(w_row, xq_row, xscale_row, in_dim, tier);
         }
     });
 
     Ok(())
+}
+
+/// Pick the best dot-product implementation for the current
+/// [`SimdTier`]. Each SIMD branch is `#[cfg]`-gated so it's only
+/// compiled into the binary on the matching target arch — but the
+/// runtime tier may still be `Scalar` even on a SIMD-capable arch if
+/// the host CPU lacks the required extension.
+#[inline]
+fn dot_q8_0_row_dispatch(
+    row: &[u8],
+    xq: &[i8],
+    xscale: &[f32],
+    in_dim: usize,
+    tier: SimdTier,
+) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if matches!(tier, SimdTier::Neon) {
+            // SAFETY: `tier == Neon` is only set when `dotprod` is
+            // confirmed present by [`crate::detect`]. The slice length
+            // contracts are checked once at the top of
+            // [`matmul_q8_0_batch`] and inherited here.
+            return unsafe { super::neon::dot_q8_0_row_neon(row, xq, xscale, in_dim) };
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if matches!(tier, SimdTier::Avx512) {
+            // SAFETY: `tier == Avx512` is only set when both `avx512f`
+            // and `avx512bw` are confirmed present at construction.
+            return unsafe { super::avx512::dot_q8_0_row_avx512(row, xq, xscale, in_dim) };
+        }
+    }
+    let _ = tier; // unused on non-aarch64, non-x86_64 builds
+    dot_q8_0_row_scalar(row, xq, xscale, in_dim)
 }
 
 #[cfg(test)]
@@ -429,6 +463,70 @@ mod tests {
         let mut scale = vec![0.0_f32; 1];
         let err = quantize_q8_0_activation(&x, &mut xq, &mut scale).unwrap_err();
         assert!(matches!(err, Error::NonFiniteInput(_)));
+    }
+
+    #[test]
+    fn matmul_dispatch_runs_on_detected_tier() {
+        // Dispatch test: build a real-sized matmul and run it through
+        // the dispatcher with `SimdTier::detect()` — whatever the host
+        // supports. The result must match the explicit scalar path
+        // within 1e-4 relative tolerance.
+        use crate::detect;
+
+        let in_dim: usize = 128;
+        let out_dim: usize = 2;
+        let n_tok: usize = 1;
+        let blocks = in_dim / Q8_0_BLOCK;
+
+        let weights_f32: Vec<f32> = (0..out_dim * in_dim)
+            .map(|i| ((i as f32) * 0.05).sin())
+            .collect();
+        let x: Vec<f32> = (0..n_tok * in_dim)
+            .map(|i| ((i as f32) * 0.07).cos())
+            .collect();
+
+        let mut weights = Vec::with_capacity(out_dim * blocks * Q8_0_BLOCK_BYTES);
+        for o in 0..out_dim {
+            weights.extend_from_slice(&pack_q8_0_row(&weights_f32[o * in_dim..(o + 1) * in_dim]));
+        }
+        let mut xq = vec![0i8; n_tok * blocks * Q8_0_BLOCK];
+        let mut xscale = vec![0.0_f32; n_tok * blocks];
+        quantize_q8_0_batch(&x, &mut xq, &mut xscale, n_tok, in_dim).unwrap();
+
+        let detected_tier = detect();
+        let mut out_detected = vec![0.0_f32; n_tok * out_dim];
+        matmul_q8_0_batch(
+            &mut out_detected,
+            &weights,
+            &xq,
+            &xscale,
+            n_tok,
+            in_dim,
+            out_dim,
+            detected_tier,
+        )
+        .unwrap();
+
+        let mut out_scalar = vec![0.0_f32; n_tok * out_dim];
+        matmul_q8_0_batch(
+            &mut out_scalar,
+            &weights,
+            &xq,
+            &xscale,
+            n_tok,
+            in_dim,
+            out_dim,
+            SimdTier::Scalar,
+        )
+        .unwrap();
+
+        for (a, b) in out_detected.iter().zip(out_scalar.iter()) {
+            let denom = b.abs().max(1.0);
+            assert!(
+                (a - b).abs() / denom < 1e-4,
+                "tier={detected_tier:?}: got {a}, scalar {b}"
+            );
+        }
     }
 
     #[test]

@@ -11,6 +11,7 @@
 //! crate-level docs for the schedule.
 
 pub mod q8_0;
+pub mod rope;
 pub mod scalar;
 
 #[cfg(target_arch = "aarch64")]
@@ -99,6 +100,11 @@ pub fn softmax_attn(scores: &mut [f32], sink: f32, tier: SimdTier) -> Result<f32
     let _ = tier;
     Ok(scalar::softmax_attn(scores, sink))
 }
+
+pub use q8_0::{
+    Q8_0_BLOCK, Q8_0_BLOCK_BYTES, matmul_q8_0_batch, quantize_q8_0_activation, quantize_q8_0_batch,
+};
+pub use rope::{RoPEParams, rope_yarn_tail};
 
 #[cfg(test)]
 mod tests {

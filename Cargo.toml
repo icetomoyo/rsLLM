@@ -14,7 +14,7 @@ members = [
 [workspace.package]
 version = "0.0.1"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.89"
 license = "Apache-2.0"
 authors = ["The rsLLM Authors"]
 repository = "https://github.com/icetomoyo/rsLLM"

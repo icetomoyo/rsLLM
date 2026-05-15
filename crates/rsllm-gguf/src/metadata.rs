@@ -372,10 +372,11 @@ fn parse_array(reader: &mut Reader<'_>, depth: u32) -> Result<Array, Error> {
     let len = reader.read_u64_le()?;
 
     // Defensive: detect impossibly large arrays before we try to allocate.
-    if let Some(item_size) = item_ty.scalar_size() {
-        if item_size != 0 && len > u64::MAX / item_size {
-            return Err(Error::ArrayTooLarge { len, item_size });
-        }
+    if let Some(item_size) = item_ty.scalar_size()
+        && item_size != 0
+        && len > u64::MAX / item_size
+    {
+        return Err(Error::ArrayTooLarge { len, item_size });
     }
 
     let len_usize = usize::try_from(len).map_err(|_| Error::ArrayTooLarge {
