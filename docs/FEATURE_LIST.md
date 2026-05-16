@@ -35,7 +35,7 @@
 | 001 | Cargo workspace 骨架 + 构建基线 | Internal | Critical | v0.1.0 | Completed | [v0.1.0.md#001](features/v0.1.0.md#feature_001-cargo-workspace-骨架--构建基线) |
 | 002 | GGUF 文件解析器（12 种 dequant + FP8 元素级转换） | New | Critical | v0.1.0 | **Phase 4 + F002.1 ✅ Completed** | [v0.1.0.md#002](features/v0.1.0.md#feature_002-gguf-文件解析器) |
 | 003 | **JoyAI 状态机分词器（DS V4 vocab，复刻 ds4）** | New | Critical | v0.1.0 | **✅ Completed** | [v0.1.0.md#003](features/v0.1.0.md#feature_003-joyai-状态机分词器ds4-复刻) |
-| 004 | **CPU 算子（DS V4 特化 + NEON + AVX-512 双 SIMD）** | New | Critical | v0.1.0 | Planned | [v0.1.0.md#004](features/v0.1.0.md#feature_004-cpu-算子ds-v4-flash-特化--双-simd) |
+| 004 | **CPU 算子（DS V4 特化 + NEON + AVX-512 双 SIMD）** | New | Critical | v0.1.0 | **✅ Completed**（Phases A-E；VNNI 优化 deferred） | [v0.1.0.md#004](features/v0.1.0.md#feature_004-cpu-算子ds-v4-flash-特化--双-simd) |
 | 005 | **DeepSeek V4 Flash 模型架构（MLA + HC + MoE）** | New | Critical | v0.1.0 | Planned | [v0.1.0.md#005](features/v0.1.0.md#feature_005-deepseek-v4-flash-模型架构) |
 | 006 | **三级 KV cache（SWA ring + compressed pool + indexer）** | New | Critical | v0.1.0 | Planned | [v0.1.0.md#006](features/v0.1.0.md#feature_006-三级-kv-cache) |
 | 007 | 采样器（greedy / temp / top-k / top-p / **min-p** / **think_mode**） | New | High | v0.1.0 | Planned | [v0.1.0.md#007](features/v0.1.0.md#feature_007-采样器) |
@@ -200,8 +200,8 @@
 - Medium: 5
 - Low: 3
 
-**Next Release (v0.1.0)**: 9 features（F001 ✅, F002 ✅, F003 ✅, F004-F008 Planned, F025 Planned）
-**Next to Start**: **F004**（CPU 算子 DS V4 特化 + NEON + AVX-512 双 SIMD）
+**Next Release (v0.1.0)**: 9 features（F001 ✅, F002 ✅, F003 ✅, F004 ✅, F005-F008 Planned, F025 Planned）
+**Next to Start**: **F005**（DeepSeek V4 Flash 模型架构 MLA + HC + MoE）
 
 ## 2026-05-14 重定位调整记录
 
