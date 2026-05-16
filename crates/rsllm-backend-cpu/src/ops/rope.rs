@@ -107,24 +107,21 @@ pub fn rope_yarn_tail(x: &mut [f32], params: &RoPEParams, tier: SimdTier) -> Res
             "rope_yarn_tail: n_rot must not exceed head_dim",
         ));
     }
-    if params.n_rot.is_multiple_of(2).not() {
+    if !params.n_rot.is_multiple_of(2) {
         return Err(Error::ShapeMismatch(
             "rope_yarn_tail: n_rot must be even (rotates 2-lane pairs)",
         ));
     }
+    // When YaRN ramp / mscale is engaged, `1.0 / freq_scale` is taken;
+    // a non-positive freq_scale would produce inf / NaN that silently
+    // corrupts every position embedding. Reject up front.
+    if params.ext_factor != 0.0 && !(params.freq_scale > 0.0 && params.freq_scale.is_finite()) {
+        return Err(Error::NonFiniteInput(
+            "rope_yarn_tail: freq_scale must be positive and finite when ext_factor != 0",
+        ));
+    }
     scalar_rope_yarn_tail(x, params);
     Ok(())
-}
-
-// Local extension trait — `bool::not()` exists but `usize.is_multiple_of(2)` returns
-// bool which we want to negate; use a small helper to keep the chain readable.
-trait BoolExt {
-    fn not(self) -> bool;
-}
-impl BoolExt for bool {
-    fn not(self) -> bool {
-        !self
-    }
 }
 
 fn scalar_rope_yarn_tail(x: &mut [f32], p: &RoPEParams) {
@@ -293,6 +290,41 @@ mod tests {
                 orig[i]
             );
         }
+    }
+
+    #[test]
+    fn rejects_zero_freq_scale_with_ext_factor() {
+        // Guard against silent NaN poisoning when freq_scale = 0 and
+        // ext_factor != 0 (1/0 → inf, ln(inf) → inf, mscale → inf).
+        let mut x = vec![1.0_f32; 16];
+        let mut p = baseline_params(1, 16, 8, 0);
+        p.ext_factor = 1.0;
+        p.freq_scale = 0.0;
+        let err = rope_yarn_tail(&mut x, &p, SimdTier::Scalar).unwrap_err();
+        assert!(matches!(err, Error::NonFiniteInput(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_negative_freq_scale_with_ext_factor() {
+        let mut x = vec![1.0_f32; 16];
+        let mut p = baseline_params(1, 16, 8, 0);
+        p.ext_factor = 1.0;
+        p.freq_scale = -1.0;
+        let err = rope_yarn_tail(&mut x, &p, SimdTier::Scalar).unwrap_err();
+        assert!(matches!(err, Error::NonFiniteInput(_)));
+    }
+
+    #[test]
+    fn accepts_zero_freq_scale_when_ext_factor_zero() {
+        // Without YaRN, freq_scale = 0 is benign (just multiplies theta
+        // by 0, so every rotation is by 0 = identity). Not useful but
+        // not corrupt — we should not error.
+        let mut x = vec![1.0_f32; 16];
+        let mut p = baseline_params(1, 16, 8, 5);
+        p.ext_factor = 0.0;
+        p.freq_scale = 0.0;
+        rope_yarn_tail(&mut x, &p, SimdTier::Scalar).unwrap();
+        assert!(x.iter().all(|v| v.is_finite()));
     }
 
     #[test]

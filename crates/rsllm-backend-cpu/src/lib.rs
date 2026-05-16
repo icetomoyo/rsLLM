@@ -53,11 +53,34 @@ impl CpuBackend {
         Self { tier: detect() }
     }
 
-    /// Construct with an explicit SIMD tier. Useful for unit tests that
-    /// want to exercise the scalar fallback on a host that would
-    /// otherwise pick NEON / AVX-512.
+    /// Construct with an explicit SIMD tier, validating that the host
+    /// actually supports it. Use this to force scalar in tests or to
+    /// down-tier the dispatcher for benchmarking.
+    ///
+    /// # Errors
+    /// Returns [`Error::UnsupportedTier`] if `tier` requires CPU
+    /// extensions the host lacks. Calling an `unsafe #[target_feature]`
+    /// kernel without the underlying extension would SIGILL at the
+    /// first SIMD instruction, so we refuse at construction time.
+    pub fn try_with_tier(tier: SimdTier) -> Result<Self, Error> {
+        if !tier.is_supported_on_host() {
+            return Err(Error::UnsupportedTier(tier.name()));
+        }
+        Ok(Self { tier })
+    }
+
+    /// Construct with an explicit SIMD tier without checking host
+    /// support. **Only safe for [`SimdTier::Scalar`]** (which is
+    /// universally supported). Other tiers will SIGILL on hosts that
+    /// lack the corresponding extension. Prefer
+    /// [`Self::try_with_tier`] in production code.
     #[must_use]
     pub fn with_tier(tier: SimdTier) -> Self {
+        debug_assert!(
+            tier.is_supported_on_host(),
+            "with_tier({tier:?}) called on a host without the required extension; \
+             use try_with_tier for runtime-checked construction",
+        );
         Self { tier }
     }
 
@@ -99,5 +122,26 @@ mod tests {
         let backend = CpuBackend::with_tier(SimdTier::Scalar);
         assert_eq!(backend.tier(), SimdTier::Scalar);
         assert_eq!(backend.capability().arch, "scalar");
+    }
+
+    #[test]
+    fn try_with_tier_scalar_succeeds() {
+        let backend = CpuBackend::try_with_tier(SimdTier::Scalar).unwrap();
+        assert_eq!(backend.tier(), SimdTier::Scalar);
+    }
+
+    #[test]
+    fn try_with_tier_rejects_unsupported() {
+        // At least one of NEON / AVX-512 / AVX2 is unsupported on the
+        // current host (they're cross-architecture exclusive), so one
+        // try_with_tier call should fail.
+        let candidates = [SimdTier::Neon, SimdTier::Avx512, SimdTier::Avx2];
+        let any_rejected = candidates
+            .iter()
+            .any(|&t| matches!(CpuBackend::try_with_tier(t), Err(Error::UnsupportedTier(_))));
+        assert!(
+            any_rejected,
+            "expected at least one of {candidates:?} to be rejected on this host"
+        );
     }
 }

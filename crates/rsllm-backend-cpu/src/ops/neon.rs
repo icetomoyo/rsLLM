@@ -24,9 +24,8 @@ use core::arch::aarch64::{
 };
 
 use bytemuck::cast_slice;
-use half::f16;
 
-use super::q8_0::{Q8_0_BLOCK, Q8_0_BLOCK_BYTES};
+use super::q8_0::{Q8_0_BLOCK, Q8_0_BLOCK_BYTES, block_scale_finite};
 
 /// NEON-accelerated Q8_0 row dot product. Caller must hold a runtime
 /// guarantee that `dotprod` is supported (e.g. via
@@ -139,16 +138,6 @@ unsafe fn accumulate_block(a: *const i8, b: *const i8) -> int32x4_t {
     }
 }
 
-/// Read the f16 scale at the start of a Q8_0 block and coerce
-/// non-finite values to 0.0. Matches the scalar path's sanitization
-/// (see [`super::q8_0::dot_q8_0_row_scalar`]).
-#[inline]
-fn block_scale_finite(block: &[u8]) -> f32 {
-    let bits = u16::from_le_bytes([block[0], block[1]]);
-    let s = f16::from_bits(bits).to_f32();
-    if s.is_finite() { s } else { 0.0 }
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::q8_0::{Q8_0_BLOCK, Q8_0_BLOCK_BYTES, dot_q8_0_row_scalar};
@@ -202,6 +191,40 @@ mod tests {
         assert!(
             (scalar - neon).abs() / denom < 1e-4,
             "neon {neon} vs scalar {scalar}"
+        );
+    }
+
+    #[test]
+    fn neon_matches_scalar_exactly_on_unit_input() {
+        // Tighter parity test: every weight quant = 1, every activation
+        // quant = 1, every scale = 1.0 → i32 dot = 32 per block, exact
+        // in f32. Catches integer accumulation off-by-one that the loose
+        // 1e-4 tolerance test above would miss.
+        if !std::arch::is_aarch64_feature_detected!("dotprod") {
+            return;
+        }
+        let blocks = 4;
+        let in_dim = blocks * Q8_0_BLOCK;
+        let mut row = vec![0u8; blocks * Q8_0_BLOCK_BYTES];
+        for b in 0..blocks {
+            let dst = &mut row[b * Q8_0_BLOCK_BYTES..];
+            let one_bits = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+            dst[0] = one_bits[0];
+            dst[1] = one_bits[1];
+            for i in 0..Q8_0_BLOCK {
+                dst[2 + i] = 1; // i8 = 1
+            }
+        }
+        let xq = vec![1i8; in_dim];
+        let xs = vec![1.0_f32; blocks];
+        let want = (blocks * Q8_0_BLOCK) as f32; // 1 × 1 × 32 per block × 4 blocks = 128
+
+        let scalar = dot_q8_0_row_scalar(&row, &xq, &xs, in_dim);
+        let neon = unsafe { dot_q8_0_row_neon(&row, &xq, &xs, in_dim) };
+        assert_eq!(scalar, want);
+        assert_eq!(
+            neon, scalar,
+            "neon and scalar must be bit-equal on this input"
         );
     }
 }

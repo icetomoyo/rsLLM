@@ -15,14 +15,13 @@
 #![cfg(target_arch = "x86_64")]
 
 use core::arch::x86_64::{
-    __m256i, __m512i, _mm256_loadu_si256, _mm512_add_epi32, _mm512_cvtepi8_epi16,
-    _mm512_madd_epi16, _mm512_reduce_add_epi32, _mm512_setzero_si512,
+    __m256i, __m512i, _mm256_loadu_si256, _mm512_cvtepi8_epi16, _mm512_madd_epi16,
+    _mm512_reduce_add_epi32,
 };
 
 use bytemuck::cast_slice;
-use half::f16;
 
-use super::q8_0::{Q8_0_BLOCK, Q8_0_BLOCK_BYTES};
+use super::q8_0::{Q8_0_BLOCK, Q8_0_BLOCK_BYTES, block_scale_finite};
 
 /// AVX-512-accelerated Q8_0 row dot product. Caller must hold a
 /// runtime guarantee that `avx512f` + `avx512bw` are supported.
@@ -88,17 +87,8 @@ unsafe fn madd_block(a: *const i8, b: *const i8) -> i32 {
         // `madd_epi16`: pairs adjacent i16 lanes, multiplies, sums to
         // i32 → 16 i32 lanes. Sum-of-products of all 32 i16 pairs.
         let prod: __m512i = _mm512_madd_epi16(a512, b512);
-        // Single accumulator + reduce.
-        let acc = _mm512_add_epi32(_mm512_setzero_si512(), prod);
-        _mm512_reduce_add_epi32(acc)
+        _mm512_reduce_add_epi32(prod)
     }
-}
-
-#[inline]
-fn block_scale_finite(block: &[u8]) -> f32 {
-    let bits = u16::from_le_bytes([block[0], block[1]]);
-    let s = f16::from_bits(bits).to_f32();
-    if s.is_finite() { s } else { 0.0 }
 }
 
 #[cfg(test)]

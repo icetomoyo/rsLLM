@@ -136,6 +136,15 @@ fn block_scale(block: &[u8]) -> f32 {
     f16::from_bits(bits).to_f32()
 }
 
+/// Read a Q8_0 block's scale and coerce non-finite values to `0.0`.
+/// Shared by the scalar and SIMD dot-product paths so corruption
+/// handling stays consistent across tiers.
+#[inline]
+pub(crate) fn block_scale_finite(block: &[u8]) -> f32 {
+    let s = block_scale(block);
+    if s.is_finite() { s } else { 0.0 }
+}
+
 /// Compute the dot product of one packed weight row against quantized
 /// activations: `sum_b w_scale[b] * x_scale[b] * dot_i32(w_quants[b], xq[b])`.
 ///
@@ -165,12 +174,7 @@ pub fn dot_q8_0_row_scalar(
     let mut acc = 0.0_f32;
     for b in 0..blocks {
         let block = &row[b * Q8_0_BLOCK_BYTES..(b + 1) * Q8_0_BLOCK_BYTES];
-        let mut wscale = block_scale(block);
-        // Sanitize corrupted f16 scales — Inf / NaN would poison the
-        // accumulator. Zero contribution is the safe fallback.
-        if !wscale.is_finite() {
-            wscale = 0.0;
-        }
+        let wscale = block_scale_finite(block);
         let wq: &[i8] = cast_slice(&block[2..]);
         let xqb = &xq[b * Q8_0_BLOCK..(b + 1) * Q8_0_BLOCK];
 

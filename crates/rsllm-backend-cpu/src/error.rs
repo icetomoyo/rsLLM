@@ -31,4 +31,13 @@ pub enum Error {
     /// than masked.
     #[error("`{0}` contains a non-finite value (NaN or Inf)")]
     NonFiniteInput(&'static str),
+
+    /// A caller asked the CPU backend to use a SIMD tier that the host
+    /// CPU does not support. Returned by
+    /// [`crate::CpuBackend::try_with_tier`] — calling an `unsafe
+    /// #[target_feature]` SIMD kernel without the underlying CPU
+    /// extension would produce a SIGILL at runtime, so we refuse at
+    /// construction time instead.
+    #[error("SIMD tier `{0}` is not supported on this host")]
+    UnsupportedTier(&'static str),
 }
