@@ -11,8 +11,10 @@
 //! crate-level docs for the schedule.
 
 pub mod q8_0;
+pub mod quant_matmul;
 pub mod rope;
 pub mod scalar;
+pub mod sinkhorn;
 
 #[cfg(target_arch = "aarch64")]
 pub mod neon;
