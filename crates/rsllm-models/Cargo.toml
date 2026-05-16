@@ -15,4 +15,5 @@ workspace = true
 rsllm-cal = { workspace = true }
 rsllm-gguf = { workspace = true }
 rsllm-kvcache = { workspace = true }
+rsllm-backend-cpu = { workspace = true }
 thiserror = { workspace = true }

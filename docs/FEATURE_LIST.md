@@ -124,7 +124,7 @@
 - **Category**: New
 - **Priority**: Critical
 - **Version**: v0.1.0
-- **Status**: Planned
+- **Status**: ✅ Completed（attention dot-product + KV cache 留待 F006）
 - **Description**: 实现 DS V4 Flash 完整 forward：MLA（Q/KV LoRA + 64 头 × 512 维）+ HC（4 路残差流 + Sinkhorn 20 轮）+ MoE（256 routed + 1 shared，前 3 层 hash 路由，其余层 top-6）+ SwiGLU + RMSNorm + RoPE-YaRN
 - **Design**: [v0.1.0.md#feature_005](features/v0.1.0.md#feature_005-deepseek-v4-flash-模型架构)
 
@@ -200,8 +200,8 @@
 - Medium: 5
 - Low: 3
 
-**Next Release (v0.1.0)**: 9 features（F001 ✅, F002 ✅, F003 ✅, F004 ✅, F005-F008 Planned, F025 Planned）
-**Next to Start**: **F005**（DeepSeek V4 Flash 模型架构 MLA + HC + MoE）
+**Next Release (v0.1.0)**: 9 features（F001 ✅, F002 ✅, F003 ✅, F004 ✅, F005 ✅, F006-F008 Planned, F025 Planned）
+**Next to Start**: **F006**（三级 KV cache：SWA ring + compressed pool + ratio-4 indexer）
 
 ## 2026-05-14 重定位调整记录
 

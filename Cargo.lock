@@ -426,6 +426,7 @@ dependencies = [
 name = "rsllm-models"
 version = "0.0.1"
 dependencies = [
+ "rsllm-backend-cpu",
  "rsllm-cal",
  "rsllm-gguf",
  "rsllm-kvcache",
