@@ -42,10 +42,10 @@ use crate::dsv4::moe::{
     apply_shared_expert, moe_hash_route, moe_topk_route,
 };
 use crate::dsv4::shape::{
-    DSV4_HASH_ROUTE_LAYERS, DSV4_N_EMBD, DSV4_N_HEAD, DSV4_HEAD_DIM, DSV4_N_LAYER, DSV4_N_VOCAB,
-    DSV4_RMS_EPS, validate_metadata,
+    DSV4_HASH_ROUTE_LAYERS, DSV4_HEAD_DIM, DSV4_N_EMBD, DSV4_N_HEAD, DSV4_N_LAYER, DSV4_N_LORA_O,
+    DSV4_N_OUT_GROUP, DSV4_N_VOCAB, DSV4_RMS_EPS, validate_metadata,
 };
-use crate::dsv4::weight::{WeightBlob, matmul_weight_f32};
+use crate::dsv4::weight::{WeightBlob, matmul_grouped_lora_down, matmul_weight_f32};
 
 /// Weight package for one transformer block.
 ///
@@ -59,8 +59,24 @@ pub struct DsV4Block<'a> {
     pub attn_norm: &'a [f32],
     /// MLA Q/KV LoRA projections.
     pub mla: MlaWeights<'a>,
-    /// Attention output projection `[N_EMBD × N_HEAD * HEAD_DIM]`.
-    pub attn_o: WeightBlob<'a>,
+    /// Per-head attention sink values `[N_HEAD]`. Each value plays the
+    /// role of a virtual sink-token logit in the attention softmax; it
+    /// is mixed into both the running max and the partition-sum denom
+    /// per head (`ds4.c:4904-4922`). Required by F006 attention, not
+    /// consumed in F005's projection-only forward path.
+    pub attn_sinks: &'a [f32],
+    /// Grouped LoRA **down**-projection of the attention output.
+    /// Logical shape `[N_OUT_GROUP × group_dim × N_LORA_O]` where
+    /// `group_dim = HEAD_DIM * (N_HEAD / N_OUT_GROUP) = 4096`.
+    /// Each input chunk of `group_dim` lanes projects to its own
+    /// `N_LORA_O = 1024` slot; the per-group outputs are concatenated
+    /// to form an `out_low_dim = N_OUT_GROUP * N_LORA_O = 8192` vector.
+    /// (`ds4.c:2312`, `ds4.c:4960`.)
+    pub attn_output_a: WeightBlob<'a>,
+    /// Dense LoRA **up**-projection of the attention output.
+    /// Shape `[out_low_dim × N_EMBD]` = `[8192 × 4096]`.
+    /// (`ds4.c:2313`, `ds4.c:4962`.)
+    pub attn_output_b: WeightBlob<'a>,
     /// HC pre-attn mix weights.
     pub hc_pre_attn: HcOpWeights<'a>,
     /// HC post-attn mix weights.
@@ -222,6 +238,10 @@ pub struct ForwardScratch {
     pub kv: Vec<f32>,
     /// `[n_tok × N_HEAD * HEAD_DIM]` — attention raw output.
     pub attn_raw: Vec<f32>,
+    /// `[n_tok × N_OUT_GROUP * N_LORA_O]` = `[n_tok × 8192]` — output
+    /// of the grouped LoRA down-projection (intermediate latent
+    /// between `attn_output_a` and `attn_output_b`).
+    pub attn_low: Vec<f32>,
     /// `[n_tok × N_EMBD]` — attention projected output.
     pub attn_proj: Vec<f32>,
     /// `[n_tok × N_EMBD]` — FFN (shared + MoE) output.
@@ -245,6 +265,7 @@ impl ForwardScratch {
             q: vec![0.0_f32; n_tok * DSV4_N_HEAD * DSV4_HEAD_DIM],
             kv: vec![0.0_f32; n_tok * DSV4_HEAD_DIM],
             attn_raw: vec![0.0_f32; n_tok * DSV4_N_HEAD * DSV4_HEAD_DIM],
+            attn_low: vec![0.0_f32; n_tok * DSV4_N_OUT_GROUP * DSV4_N_LORA_O],
             attn_proj: vec![0.0_f32; n_tok * DSV4_N_EMBD],
             ffn_out: vec![0.0_f32; n_tok * DSV4_N_EMBD],
             shared_out: vec![0.0_f32; n_tok * DSV4_N_EMBD],
@@ -263,6 +284,8 @@ impl ForwardScratch {
         self.kv.resize(n_tok * DSV4_HEAD_DIM, 0.0);
         self.attn_raw
             .resize(n_tok * DSV4_N_HEAD * DSV4_HEAD_DIM, 0.0);
+        self.attn_low
+            .resize(n_tok * DSV4_N_OUT_GROUP * DSV4_N_LORA_O, 0.0);
         self.attn_proj.resize(n_tok * DSV4_N_EMBD, 0.0);
         self.ffn_out.resize(n_tok * DSV4_N_EMBD, 0.0);
         self.shared_out.resize(n_tok * DSV4_N_EMBD, 0.0);
@@ -314,13 +337,33 @@ pub fn forward_block(
         )?;
     }
     attention(&scratch.q, &scratch.kv, layer_idx, &mut scratch.attn_raw)?;
-    // Output projection: attn_raw [n_tok × N_HEAD * HEAD_DIM] → attn_proj [n_tok × N_EMBD].
-    matmul_weight_f32(
-        &mut scratch.attn_proj,
-        &block.attn_o,
+    // Output projection (two-stage grouped LoRA, ds4.c:4960-4962):
+    //   attn_raw  [n_tok × N_HEAD * HEAD_DIM = n_tok × 32768]
+    //     │
+    //     │ attn_output_a  (grouped: 8 × [4096 → 1024])
+    //     ▼
+    //   attn_low  [n_tok × N_OUT_GROUP * N_LORA_O = n_tok × 8192]
+    //     │
+    //     │ attn_output_b  (dense: 8192 → 4096)
+    //     ▼
+    //   attn_proj [n_tok × N_EMBD = n_tok × 4096]
+    let group_dim = DSV4_HEAD_DIM * (DSV4_N_HEAD / DSV4_N_OUT_GROUP);
+    matmul_grouped_lora_down(
+        &mut scratch.attn_low,
+        &block.attn_output_a,
         &scratch.attn_raw,
         n_tok,
-        DSV4_N_HEAD * DSV4_HEAD_DIM,
+        DSV4_N_OUT_GROUP,
+        group_dim,
+        DSV4_N_LORA_O,
+        tier,
+    )?;
+    matmul_weight_f32(
+        &mut scratch.attn_proj,
+        &block.attn_output_b,
+        &scratch.attn_low,
+        n_tok,
+        DSV4_N_OUT_GROUP * DSV4_N_LORA_O,
         DSV4_N_EMBD,
         tier,
     )?;
@@ -503,7 +546,9 @@ mod tests {
         q_b: Vec<f32>,
         kv_a: Vec<f32>,
         kv_a_norm: Vec<f32>,
-        attn_o: Vec<f32>,
+        attn_sinks: Vec<f32>,
+        attn_output_a: Vec<u8>,
+        attn_output_b: Vec<u8>,
         hc_w: Vec<f32>,
         hc_base: Vec<f32>,
         ffn_norm: Vec<f32>,
@@ -527,7 +572,12 @@ mod tests {
                 q_b: vec![0.0; DSV4_N_HEAD * DSV4_HEAD_DIM * DSV4_N_LORA_Q],
                 kv_a: vec![0.0; DSV4_HEAD_DIM * DSV4_N_EMBD],
                 kv_a_norm: vec![1.0; DSV4_HEAD_DIM],
-                attn_o: vec![0.0; DSV4_N_EMBD * DSV4_N_HEAD * DSV4_HEAD_DIM],
+                attn_sinks: vec![0.0; DSV4_N_HEAD],
+                // Two-stage LoRA: a is [N_OUT_GROUP × group_dim × N_LORA_O],
+                // b is [out_low_dim × N_EMBD]. The stub uses empty bytes
+                // because structural tests don't run any matmul.
+                attn_output_a: vec![],
+                attn_output_b: vec![],
                 hc_w: vec![0.0; HC_SINKHORN_BUF_LEN * DSV4_N_EMBD],
                 hc_base: vec![0.0; HC_SINKHORN_BUF_LEN],
                 ffn_norm: vec![1.0; DSV4_N_EMBD],
@@ -557,7 +607,15 @@ mod tests {
                     attn_kv_a: WeightBlob::F32(&self.kv_a),
                     kv_a_norm: &self.kv_a_norm,
                 },
-                attn_o: WeightBlob::F32(&self.attn_o),
+                attn_sinks: &self.attn_sinks,
+                attn_output_a: WeightBlob::Quant {
+                    data: &self.attn_output_a,
+                    dtype: rsllm_gguf::GgmlType::Q8_0,
+                },
+                attn_output_b: WeightBlob::Quant {
+                    data: &self.attn_output_b,
+                    dtype: rsllm_gguf::GgmlType::Q8_0,
+                },
                 hc_pre_attn: hc,
                 hc_post_attn: hc,
                 ffn_norm: &self.ffn_norm,
@@ -593,6 +651,7 @@ mod tests {
                     Some(MoeHashRouter {
                         tid2eid: &self.tid2eid,
                         gate_inp: WeightBlob::F32(&self.gate_inp),
+                        gate_bias: None,
                     })
                 } else {
                     None
@@ -600,6 +659,7 @@ mod tests {
                 topk_router: if layer_idx >= DSV4_HASH_ROUTE_LAYERS {
                     Some(MoeTopkRouter {
                         gate_inp: WeightBlob::F32(&self.gate_inp),
+                        gate_bias: None,
                     })
                 } else {
                     None

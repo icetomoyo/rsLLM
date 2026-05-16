@@ -135,6 +135,11 @@ pub struct MoeHashRouter<'a> {
     /// Standard MoE gate logit projection used to compute the soft
     /// per-expert weight. Shape `[N_EXPERT × N_EMBD]` = `[256 × 4096]`.
     pub gate_inp: WeightBlob<'a>,
+    /// Optional per-expert gate bias `[N_EXPERT]`. Added to the gate
+    /// logits before routing weights are computed (`ds4.c:5256-5257`).
+    /// Most checkpoints ship this; if absent the gate logits go
+    /// through unmodified.
+    pub gate_bias: Option<&'a [f32]>,
 }
 
 /// Scratch buffers reused across MoE forward calls.
@@ -230,6 +235,7 @@ pub fn moe_hash_route(
         DSV4_N_EXPERT,
         tier,
     )?;
+    add_gate_bias(&mut scratch.gate_logits, router.gate_bias, n_tok)?;
 
     // 2. Pull the 6 hash-routed expert ids per token from tid2eid.
     for (t, &tid) in token_ids.iter().enumerate().take(n_tok) {
@@ -274,6 +280,9 @@ pub fn moe_hash_route(
 pub struct MoeTopkRouter<'a> {
     /// Same gate projection as hash routing: `[N_EXPERT × N_EMBD]`.
     pub gate_inp: WeightBlob<'a>,
+    /// Optional per-expert gate bias `[N_EXPERT]`. Same role as in
+    /// [`MoeHashRouter::gate_bias`].
+    pub gate_bias: Option<&'a [f32]>,
 }
 
 /// Run the MoE FFN with **top-k routing** (layers `[3, 43)`).
@@ -309,6 +318,7 @@ pub fn moe_topk_route(
         DSV4_N_EXPERT,
         tier,
     )?;
+    add_gate_bias(&mut scratch.gate_logits, router.gate_bias, n_tok)?;
 
     // 2. Per-token top-k selection.
     for t in 0..n_tok {
@@ -450,6 +460,30 @@ pub fn apply_expert_swiglu(
     matmul_weight_f32(h_up, up, x, 1, n_embd, n_ff, tier)?;
     scalar::swiglu(h_act, h_gate, h_up);
     matmul_weight_f32(out, down, h_act, 1, n_ff, n_embd, tier)?;
+    Ok(())
+}
+
+/// Add `bias[e]` to `gate_logits[t, e]` for every token. No-op when
+/// `bias` is `None`. Mirrors `ds4.c:5256-5257`.
+fn add_gate_bias(
+    gate_logits: &mut [f32],
+    bias: Option<&[f32]>,
+    n_tok: usize,
+) -> Result<(), Error> {
+    let Some(bias) = bias else { return Ok(()) };
+    if bias.len() != DSV4_N_EXPERT {
+        return Err(Error::ShapeMismatch {
+            key: "moe.gate_bias",
+            expected: format!("{DSV4_N_EXPERT}"),
+            actual: format!("{}", bias.len()),
+        });
+    }
+    for t in 0..n_tok {
+        let logits_t = &mut gate_logits[t * DSV4_N_EXPERT..(t + 1) * DSV4_N_EXPERT];
+        for (l, &b) in logits_t.iter_mut().zip(bias.iter()) {
+            *l += b;
+        }
+    }
     Ok(())
 }
 
@@ -664,6 +698,7 @@ mod tests {
                 data: &gate_inp_bytes,
                 dtype: GgmlType::Q4_K,
             },
+            gate_bias: None,
         };
         let token_ids = vec![super::super::shape::DSV4_N_VOCAB as u32]; // out of range
         let x = vec![0.0_f32; DSV4_N_EMBD];
@@ -680,6 +715,41 @@ mod tests {
             SimdTier::Scalar,
         )
         .unwrap_err();
+        assert!(matches!(err, Error::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn gate_bias_added_per_token() {
+        let n_tok = 2;
+        let mut logits = vec![0.0_f32; n_tok * DSV4_N_EXPERT];
+        // Token 0: all ones; Token 1: all twos.
+        for v in logits.iter_mut().take(DSV4_N_EXPERT) {
+            *v = 1.0;
+        }
+        for v in logits.iter_mut().skip(DSV4_N_EXPERT).take(DSV4_N_EXPERT) {
+            *v = 2.0;
+        }
+        let bias: Vec<f32> = (0..DSV4_N_EXPERT).map(|i| (i as f32) * 0.01).collect();
+        add_gate_bias(&mut logits, Some(&bias), n_tok).unwrap();
+        // Spot-check a couple of cells.
+        assert!((logits[0] - 1.0).abs() < 1e-6); // tok0 expert0: 1 + 0
+        assert!((logits[5] - 1.05).abs() < 1e-6); // tok0 expert5: 1 + 0.05
+        assert!((logits[DSV4_N_EXPERT] - 2.0).abs() < 1e-6); // tok1 expert0: 2 + 0
+        assert!((logits[DSV4_N_EXPERT + 5] - 2.05).abs() < 1e-6);
+    }
+
+    #[test]
+    fn gate_bias_none_is_noop() {
+        let mut logits = vec![3.5_f32; 2 * DSV4_N_EXPERT];
+        add_gate_bias(&mut logits, None, 2).unwrap();
+        assert!(logits.iter().all(|&v| (v - 3.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn gate_bias_rejects_wrong_length() {
+        let mut logits = vec![0.0_f32; DSV4_N_EXPERT];
+        let bias = vec![0.0_f32; 10]; // wrong
+        let err = add_gate_bias(&mut logits, Some(&bias), 1).unwrap_err();
         assert!(matches!(err, Error::ShapeMismatch { .. }));
     }
 

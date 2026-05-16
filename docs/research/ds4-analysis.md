@@ -2,16 +2,40 @@
 
 > 调研对象：`C:\Works\PubGItProj\ds4`
 > 目的：作为 rsLLM 的设计参考，吸收其低算力/单文件工程精神。
+> 最近 review 日期：2026-05-16（commit `d0357ec`，上游已有 backend 重构与 CUDA 支持）
 
 ---
+
+## 0. 上游近期变更摘要（2026-05-16 review）
+
+ds4 自 `d997b56 DS4 initial release` 之后已演化为多后端架构。我们 v0.1.0 计划基线
+建立在重构之后的代码上。关键 commit：
+
+| Commit | 影响范围 |
+|--------|--------|
+| `f5f414d CPU support improved` | 把原 Metal-only 内核扩展到 CPU 参考实现 |
+| `48beef8 CUDA support` | 新增 `ds4_cuda.cu` + Metal/CUDA 共用的 `ds4_gpu.h` |
+| `0ac5df3 Different backends refactoring` | 重构 ds4.c 1841 行；Metal/CUDA 共享 backend 抽象 |
+| `453a5fa Add DS4 imatrix and GGUF quantization tools` | `gguf-tools/` 子目录提供 imatrix + 量化 |
+| `899b207 Add DeepSeek V4 model card synopsis` | 仓库内带 `MODEL_CARD.md` |
+| `2964a93..d0357ec` 一系列 server / tool / KV decay | 影响 v0.1.x server 兼容层，不影响 v0.1.0 |
+
+**对 rsLLM 计划的具体影响**（详细修订见 `docs/features/v0.1.0.md`）：
+- F005 必须把 `attn_o` 拆成 `attn_output_a`（grouped LoRA down）+ `attn_output_b`（LoRA up）
+- F005 必须加 per-head `attn_sinks` 和 optional `ffn_exp_probs_b` MoE gate bias
+- 新增形状常量：`N_OUT_GROUP=8`、`N_EXPERT_SHARED=1`、`N_INDEXER_HEAD=64`、`N_INDEXER_HEAD_DIM=128`
+- 17 个核心形状常量值未变 ✅（行号从 `81-104` 移到 `87-108`）
+- v0.1.0 验收 gate 升级：用 `tests/test-vectors/official/*.json`
+  里 5 个官方测试向量做 top-1 hit rate / top-20 KL 校验
+  （取代之前的"和 ds4 同 prompt 同种子 first 50 token byte-equal"）
 
 ## 1. 项目定位
 
 - **作者**：antirez（Salvatore Sanfilippo，Redis 创始人）
 - **本质**：为 DeepSeek V4 Flash（284B MoE）量身打造的单模型 C 推理引擎
-- **平台**：macOS / Apple Silicon / Metal-only
-- **目标硬件**：MacBook Pro M3 Max 128GB / Mac Studio M3 Ultra 512GB
-- **代码量**：核心 `ds4.c` ~4000+ 行 C99
+- **平台**：~~macOS / Apple Silicon / Metal-only~~ → **多后端**：macOS Metal + Linux/Windows CUDA + 纯 CPU 参考
+- **目标硬件**：MacBook Pro M3 Max 128GB / Mac Studio M3 Ultra 512GB / RTX 4090 (CUDA)
+- **代码量**：核心 `ds4.c` ~7000+ 行 C99（重构后增长）
 - **License**：MIT
 - **状态**：alpha，AI 辅助编写，作者亲自把关设计
 

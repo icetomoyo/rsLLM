@@ -48,6 +48,18 @@ pub const DSV4_N_EXPERT: usize = 256;
 /// Number of routed experts activated per token (top-k MoE).
 pub const DSV4_N_EXPERT_USED: usize = 6;
 
+/// Number of shared (always-on) experts per layer. Always 1 for DS V4
+/// Flash; encoded as a constant rather than a literal so the
+/// shared-expert apply path is self-documenting.
+pub const DSV4_N_EXPERT_SHARED: usize = 1;
+
+/// Group count for the attention output LoRA projection. Each layer's
+/// post-attention projection is grouped into `N_OUT_GROUP` chunks of
+/// `HEAD_DIM * (N_HEAD / N_OUT_GROUP) = 4096`-dim input, each projected
+/// to a per-group `N_LORA_O`-rank latent before a final dense up.
+/// Ref: `ds4.c:95`.
+pub const DSV4_N_OUT_GROUP: usize = 8;
+
 /// Hyper-connection residual stream count.
 pub const DSV4_N_HC: usize = 4;
 
@@ -57,6 +69,13 @@ pub const DSV4_N_SWA: usize = 128;
 
 /// Top-k for the ratio-4 sparse KV indexer (used by F006).
 pub const DSV4_N_INDEXER_TOP_K: usize = 512;
+
+/// Number of indexer heads (used by F006). Each indexer head is
+/// `N_INDEXER_HEAD_DIM`-wide. Ref: `ds4.c:104`.
+pub const DSV4_N_INDEXER_HEAD: usize = 64;
+
+/// Per-head dimension for the indexer. Ref: `ds4.c:105`.
+pub const DSV4_N_INDEXER_HEAD_DIM: usize = 128;
 
 /// RoPE frequency base. Sized for the long-context YaRN scaling regime.
 pub const DSV4_ROPE_FREQ_BASE: f32 = 160_000.0;
@@ -149,7 +168,31 @@ pub fn validate_metadata(meta: &Metadata) -> Result<(), Error> {
         "deepseek-v4-flash.expert_feed_forward_length",
         DSV4_N_FF_EXP as u32,
     )?;
+    expect_u32(
+        meta,
+        "deepseek-v4-flash.expert_shared_count",
+        DSV4_N_EXPERT_SHARED as u32,
+    )?;
     expect_u32(meta, "deepseek-v4-flash.n_hc", DSV4_N_HC as u32)?;
+
+    // Attention output LoRA grouping (`ds4.c:2520`).
+    expect_u32(
+        meta,
+        "deepseek-v4-flash.attention.output_group_count",
+        DSV4_N_OUT_GROUP as u32,
+    )?;
+
+    // Indexer shape (`ds4.c:2536-2537`); used by F006 KV cache.
+    expect_u32(
+        meta,
+        "deepseek-v4-flash.attention.indexer.head_count",
+        DSV4_N_INDEXER_HEAD as u32,
+    )?;
+    expect_u32(
+        meta,
+        "deepseek-v4-flash.attention.indexer.key_length",
+        DSV4_N_INDEXER_HEAD_DIM as u32,
+    )?;
 
     // 9. RoPE base — float, exact match.
     expect_f32_close(
@@ -254,7 +297,23 @@ mod tests {
             "deepseek-v4-flash.expert_feed_forward_length",
             Value::U32(DSV4_N_FF_EXP as u32),
         );
+        m.insert(
+            "deepseek-v4-flash.expert_shared_count",
+            Value::U32(DSV4_N_EXPERT_SHARED as u32),
+        );
         m.insert("deepseek-v4-flash.n_hc", Value::U32(DSV4_N_HC as u32));
+        m.insert(
+            "deepseek-v4-flash.attention.output_group_count",
+            Value::U32(DSV4_N_OUT_GROUP as u32),
+        );
+        m.insert(
+            "deepseek-v4-flash.attention.indexer.head_count",
+            Value::U32(DSV4_N_INDEXER_HEAD as u32),
+        );
+        m.insert(
+            "deepseek-v4-flash.attention.indexer.key_length",
+            Value::U32(DSV4_N_INDEXER_HEAD_DIM as u32),
+        );
         m.insert(
             "deepseek-v4-flash.rope.freq_base",
             Value::F32(DSV4_ROPE_FREQ_BASE),
