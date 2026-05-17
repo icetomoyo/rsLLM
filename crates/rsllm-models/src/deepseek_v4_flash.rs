@@ -40,6 +40,7 @@ use rsllm_backend_cpu::ops::{rmsnorm, sinkhorn::N_HC};
 use rsllm_gguf::Metadata;
 
 use crate::Error;
+use crate::dsv4::compressor::{CompressorWeights, IndexerReadWeights, IndexerWriteWeights};
 use crate::dsv4::hc::{HcOpWeights, HcScratch, hc_post, hc_pre};
 use crate::dsv4::mla::{MlaOutput, MlaScratch, MlaWeights, mla_projections};
 use crate::dsv4::moe::{
@@ -87,6 +88,21 @@ pub struct DsV4Block<'a> {
     /// HC post-attn mix weights.
     pub hc_post_attn: HcOpWeights<'a>,
 
+    /// Per-dim compressed-KV score LoRA. Present iff this layer has
+    /// `compress_ratio > 0` (i.e. all layers except the first two
+    /// dense ones, per
+    /// [`rsllm_kvcache::dsv4::shape::layer_compress_ratio`]).
+    /// Consumed by F008.C to replace the zero-placeholder scores in
+    /// [`crate::dsv4::attention::ThreeTierAttention`].
+    pub compressor: Option<CompressorWeights<'a>>,
+    /// Per-token indexer write-side LoRA pair (produces the indexer
+    /// KV row + per-dim score). Present iff this layer is ratio-4
+    /// (even `il >= 2`).
+    pub indexer_write: Option<IndexerWriteWeights<'a>>,
+    /// Per-token indexer read-side LoRA + per-head scoring weights.
+    /// Present on the same set of layers as `indexer_write`.
+    pub indexer_read: Option<IndexerReadWeights<'a>>,
+
     /// Pre-FFN RMSNorm scale `[N_EMBD]`.
     pub ffn_norm: &'a [f32],
     /// MoE routed experts (`[N_EXPERT × N_FF_EXP × N_EMBD]`).
@@ -104,27 +120,69 @@ pub struct DsV4Block<'a> {
 }
 
 impl<'a> DsV4Block<'a> {
-    /// Sanity-check internal consistency: a hash-routed layer must
-    /// have `hash_router = Some(_)` and `topk_router = None`, and vice
-    /// versa. Called by [`DeepSeekV4Flash::new`].
+    /// Sanity-check internal consistency:
+    /// - hash-routed layer must have `hash_router = Some(_)` and `topk_router = None`,
+    ///   and vice versa;
+    /// - dense layers (`il < 2`) must NOT carry compressor/indexer weights;
+    /// - compressed layers must carry a `compressor`;
+    /// - ratio-4 layers must carry both `indexer_write` and `indexer_read`,
+    ///   ratio-128 layers must NOT.
     fn validate(&self, layer_idx: usize) -> Result<(), Error> {
         let is_hash = layer_idx < DSV4_HASH_ROUTE_LAYERS;
         match (is_hash, self.hash_router.is_some(), self.topk_router.is_some()) {
-            (true, true, false) | (false, false, true) => Ok(()),
-            _ => Err(Error::ShapeMismatch {
-                key: "block.router",
-                expected: if is_hash {
-                    "hash_router=Some, topk_router=None".to_string()
+            (true, true, false) | (false, false, true) => {}
+            _ => {
+                return Err(Error::ShapeMismatch {
+                    key: "block.router",
+                    expected: if is_hash {
+                        "hash_router=Some, topk_router=None".to_string()
+                    } else {
+                        "hash_router=None, topk_router=Some".to_string()
+                    },
+                    actual: format!(
+                        "hash_router={}, topk_router={}",
+                        self.hash_router.is_some(),
+                        self.topk_router.is_some()
+                    ),
+                });
+            }
+        }
+
+        let ratio = rsllm_kvcache::dsv4::shape::layer_compress_ratio(layer_idx);
+        let has_indexer = rsllm_kvcache::dsv4::shape::layer_has_indexer(layer_idx);
+        // Compressor: required iff ratio > 0.
+        if (ratio > 0) != self.compressor.is_some() {
+            return Err(Error::ShapeMismatch {
+                key: "block.compressor",
+                expected: if ratio > 0 {
+                    format!("Some (layer {layer_idx}, ratio={ratio})")
                 } else {
-                    "hash_router=None, topk_router=Some".to_string()
+                    format!("None (layer {layer_idx} is dense)")
+                },
+                actual: format!("{}", self.compressor.is_some()),
+            });
+        }
+        // Indexer pair: both required iff this is a ratio-4 layer.
+        if has_indexer
+            != (self.indexer_write.is_some() && self.indexer_read.is_some())
+        {
+            return Err(Error::ShapeMismatch {
+                key: "block.indexer",
+                expected: if has_indexer {
+                    format!(
+                        "indexer_write=Some, indexer_read=Some (layer {layer_idx} is ratio-4)"
+                    )
+                } else {
+                    format!("both None (layer {layer_idx} is not ratio-4)")
                 },
                 actual: format!(
-                    "hash_router={}, topk_router={}",
-                    self.hash_router.is_some(),
-                    self.topk_router.is_some()
+                    "indexer_write={}, indexer_read={}",
+                    self.indexer_write.is_some(),
+                    self.indexer_read.is_some(),
                 ),
-            }),
+            });
         }
+        Ok(())
     }
 }
 
@@ -578,6 +636,13 @@ mod tests {
         shared_down: Vec<f32>,
         gate_inp: Vec<f32>,
         tid2eid: Vec<i32>,
+        // F008.B per-layer LoRA backing buffers. All zero — the
+        // structural tests check Option-presence only.
+        compressor_w: Vec<f32>,
+        indexer_kv_w: Vec<f32>,
+        indexer_kv_score_w: Vec<f32>,
+        indexer_q_w: Vec<f32>,
+        indexer_head_weight: Vec<f32>,
     }
 
     impl StubBlockStorage {
@@ -606,6 +671,22 @@ mod tests {
                 shared_down: vec![0.0; DSV4_N_EMBD * DSV4_N_FF_EXP],
                 gate_inp: vec![0.0; DSV4_N_EXPERT * DSV4_N_EMBD],
                 tid2eid: vec![0_i32; DSV4_N_EXPERT_USED * DSV4_N_VOCAB],
+                compressor_w: vec![0.0; DSV4_HEAD_DIM * DSV4_N_EMBD],
+                indexer_kv_w: vec![
+                    0.0;
+                    crate::dsv4::shape::DSV4_N_INDEXER_HEAD_DIM * DSV4_N_EMBD
+                ],
+                indexer_kv_score_w: vec![
+                    0.0;
+                    crate::dsv4::shape::DSV4_N_INDEXER_HEAD_DIM * DSV4_N_EMBD
+                ],
+                indexer_q_w: vec![
+                    0.0;
+                    crate::dsv4::shape::DSV4_N_INDEXER_HEAD
+                        * crate::dsv4::shape::DSV4_N_INDEXER_HEAD_DIM
+                        * DSV4_N_EMBD
+                ],
+                indexer_head_weight: vec![1.0; crate::dsv4::shape::DSV4_N_INDEXER_HEAD],
             }
         }
 
@@ -683,6 +764,29 @@ mod tests {
                 },
                 hc_pre_ffn: hc,
                 hc_post_ffn: hc,
+                compressor: if rsllm_kvcache::dsv4::shape::layer_compress_ratio(layer_idx) > 0 {
+                    Some(CompressorWeights {
+                        attn_compressor: WeightBlob::F32(&self.compressor_w),
+                    })
+                } else {
+                    None
+                },
+                indexer_write: if rsllm_kvcache::dsv4::shape::layer_has_indexer(layer_idx) {
+                    Some(IndexerWriteWeights {
+                        attn_indexer_kv: WeightBlob::F32(&self.indexer_kv_w),
+                        attn_indexer_kv_score: WeightBlob::F32(&self.indexer_kv_score_w),
+                    })
+                } else {
+                    None
+                },
+                indexer_read: if rsllm_kvcache::dsv4::shape::layer_has_indexer(layer_idx) {
+                    Some(IndexerReadWeights {
+                        attn_indexer_q: WeightBlob::F32(&self.indexer_q_w),
+                        attn_indexer_head_weight: &self.indexer_head_weight,
+                    })
+                } else {
+                    None
+                },
             }
         }
     }
@@ -704,6 +808,67 @@ mod tests {
         hash_block.validate(0).unwrap();
         let topk_block = storage.block(10);
         topk_block.validate(10).unwrap();
+    }
+
+    #[test]
+    fn dense_layer_with_compressor_rejected() {
+        // Layer 0 is dense — compressor must be `None`. If the GGUF
+        // load path accidentally hands one in we want a loud failure.
+        let storage = StubBlockStorage::new();
+        let mut block = storage.block(0);
+        block.compressor = Some(CompressorWeights {
+            attn_compressor: WeightBlob::F32(&storage.compressor_w),
+        });
+        let err = block.validate(0).unwrap_err();
+        assert!(matches!(err, Error::ShapeMismatch { key, .. } if key == "block.compressor"));
+    }
+
+    #[test]
+    fn compressed_layer_without_compressor_rejected() {
+        // Layer 3 is ratio-128 — compressor required.
+        let storage = StubBlockStorage::new();
+        let mut block = storage.block(3);
+        block.compressor = None;
+        let err = block.validate(3).unwrap_err();
+        assert!(matches!(err, Error::ShapeMismatch { key, .. } if key == "block.compressor"));
+    }
+
+    #[test]
+    fn ratio4_layer_without_indexer_rejected() {
+        // Layer 2 is the first ratio-4 layer; indexer_write+read required.
+        let storage = StubBlockStorage::new();
+        let mut block = storage.block(2);
+        block.indexer_write = None;
+        let err = block.validate(2).unwrap_err();
+        assert!(matches!(err, Error::ShapeMismatch { key, .. } if key == "block.indexer"));
+    }
+
+    #[test]
+    fn ratio128_layer_with_indexer_rejected() {
+        // Layer 3 is ratio-128; carrying an indexer should error.
+        let storage = StubBlockStorage::new();
+        let mut block = storage.block(3);
+        block.indexer_write = Some(IndexerWriteWeights {
+            attn_indexer_kv: WeightBlob::F32(&storage.indexer_kv_w),
+            attn_indexer_kv_score: WeightBlob::F32(&storage.indexer_kv_score_w),
+        });
+        block.indexer_read = Some(IndexerReadWeights {
+            attn_indexer_q: WeightBlob::F32(&storage.indexer_q_w),
+            attn_indexer_head_weight: &storage.indexer_head_weight,
+        });
+        let err = block.validate(3).unwrap_err();
+        assert!(matches!(err, Error::ShapeMismatch { key, .. } if key == "block.indexer"));
+    }
+
+    #[test]
+    fn ratio4_layer_with_only_one_indexer_half_rejected() {
+        let storage = StubBlockStorage::new();
+        let mut block = storage.block(2);
+        block.indexer_read = None;
+        // indexer_write is Some but indexer_read is None — neither
+        // half is a usable signal on its own.
+        let err = block.validate(2).unwrap_err();
+        assert!(matches!(err, Error::ShapeMismatch { key, .. } if key == "block.indexer"));
     }
 
     #[test]
