@@ -62,9 +62,18 @@ impl LogprobDumper {
     }
 
     /// Write one decode-step entry. Logits and probabilities are
-    /// caller-supplied — the dumper does no sorting / filtering.
+    /// caller-supplied — the dumper truncates to `top_k_cap` and
+    /// drops any entry whose `logit` or `prob` is non-finite
+    /// (serde_json rejects NaN/Inf at serialization time, and aborting
+    /// a long dump mid-run leaves the operator without a clear
+    /// per-step error trail).
     pub fn write_step(&mut self, chosen_id: u32, top: &[LogprobEntry]) -> Result<(), CliError> {
-        let truncated: Vec<LogprobEntry> = top.iter().take(self.top_k_cap).copied().collect();
+        let truncated: Vec<LogprobEntry> = top
+            .iter()
+            .take(self.top_k_cap)
+            .copied()
+            .filter(|e| e.logit.is_finite() && e.prob.is_finite())
+            .collect();
         let rec = LogprobStep {
             step: self.step,
             chosen_id,
@@ -128,6 +137,32 @@ mod tests {
         assert!(lines[0].contains("\"step\":0"));
         assert!(lines[1].contains("\"chosen_id\":7"));
         assert!(lines[1].contains("\"step\":1"));
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn write_step_drops_non_finite_entries() {
+        let tmp = std::env::temp_dir().join("rsllm-dump-nan-test.jsonl");
+        let _ = std::fs::remove_file(&tmp);
+        {
+            let mut d = LogprobDumper::create(&tmp, 10).unwrap();
+            d.write_step(
+                1,
+                &[
+                    LogprobEntry { token_id: 0, logit: 1.0, prob: 0.5 },
+                    LogprobEntry { token_id: 1, logit: f32::NAN, prob: 0.3 },
+                    LogprobEntry { token_id: 2, logit: f32::INFINITY, prob: 0.2 },
+                    LogprobEntry { token_id: 3, logit: -3.0, prob: 0.05 },
+                ],
+            )
+            .unwrap();
+        }
+        let s = std::fs::read_to_string(&tmp).unwrap();
+        // Only the two finite entries (token 0 and 3) survive.
+        assert!(s.contains("\"token_id\":0"));
+        assert!(s.contains("\"token_id\":3"));
+        assert!(!s.contains("\"token_id\":1"));
+        assert!(!s.contains("\"token_id\":2"));
         let _ = std::fs::remove_file(&tmp);
     }
 

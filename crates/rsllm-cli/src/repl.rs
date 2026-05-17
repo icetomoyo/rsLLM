@@ -81,14 +81,26 @@ pub fn parse_command(line: &str) -> Result<Option<SlashCommand>, CliError> {
             SlashCommand::ReadFile(PathBuf::from(tail))
         }
         "/system" => {
-            // Strip optional surrounding quotes for ergonomic
-            // `/system "you are helpful"`.
-            let prompt = tail.trim_matches('"').to_string();
+            // Strip exactly one matched pair of surrounding double
+            // quotes — `trim_matches` would greedily strip every
+            // leading / trailing `"`, which mangles embedded quotes.
+            let prompt = strip_outer_quotes(tail).to_string();
             SlashCommand::SetSystem(prompt)
         }
         other => SlashCommand::Unknown(other.to_string()),
     };
     Ok(Some(cmd))
+}
+
+/// Strip a single matched pair of outermost ASCII double quotes.
+/// Returns the input unchanged if it isn't quote-wrapped.
+fn strip_outer_quotes(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
 }
 
 /// Mutable REPL state that survives across turns. Decode-side state
@@ -102,6 +114,9 @@ pub struct ReplState {
     pub ctx_size: usize,
     /// Optional system prompt. `None` = no system message injected.
     pub system_prompt: Option<String>,
+    /// File queued by `/read FILE` — consumed by the decode loop on
+    /// the next user turn (F008.C).
+    pub pending_read: Option<PathBuf>,
 }
 
 impl ReplState {
@@ -112,6 +127,7 @@ impl ReplState {
             think_mode,
             ctx_size,
             system_prompt: None,
+            pending_read: None,
         }
     }
 
@@ -136,10 +152,14 @@ impl ReplState {
                 self.ctx_size = n;
                 CommandOutcome::stay(format!("ctx_size = {n} (session will rebuild)"))
             }
-            SlashCommand::ReadFile(path) => CommandOutcome::stay(format!(
-                "/read queued: {} (consumed on next message)",
-                path.display()
-            )),
+            SlashCommand::ReadFile(path) => {
+                let msg = format!(
+                    "/read queued: {} (consumed on next message)",
+                    path.display()
+                );
+                self.pending_read = Some(path);
+                CommandOutcome::stay(msg)
+            }
             SlashCommand::SetSystem(prompt) => {
                 if prompt.is_empty() {
                     self.system_prompt = None;
@@ -150,7 +170,12 @@ impl ReplState {
                     CommandOutcome::stay(format!("system prompt set ({len} bytes)"))
                 }
             }
-            SlashCommand::Clear => CommandOutcome::stay("session cleared".into()),
+            SlashCommand::Clear => {
+                // Drop any queued `/read` along with the session.
+                self.pending_read = None;
+                self.system_prompt = None;
+                CommandOutcome::stay("session cleared".into())
+            }
             SlashCommand::Quit => CommandOutcome::exit(),
             SlashCommand::Unknown(name) => CommandOutcome::stay(format!(
                 "unknown command `{name}`. Type /help for a list."
@@ -249,6 +274,33 @@ mod tests {
     }
 
     #[test]
+    fn system_preserves_embedded_quotes() {
+        // Only the outermost matched pair is stripped — embedded
+        // quotes survive intact.
+        let ok = parse_command(r#"/system "say \"hi\"""#).unwrap();
+        assert_eq!(
+            ok,
+            Some(SlashCommand::SetSystem(r#"say \"hi\""#.into())),
+            "embedded quotes must be preserved"
+        );
+    }
+
+    #[test]
+    fn system_unquoted_passes_through() {
+        let ok = parse_command("/system bare prompt").unwrap();
+        assert_eq!(ok, Some(SlashCommand::SetSystem("bare prompt".into())));
+    }
+
+    #[test]
+    fn system_empty_quotes_clears_prompt() {
+        let mut s = ReplState::new(ThinkMode::NoThink, 1024);
+        s.system_prompt = Some("old".into());
+        let cmd = parse_command(r#"/system """#).unwrap().unwrap();
+        s.apply(cmd);
+        assert!(s.system_prompt.is_none());
+    }
+
+    #[test]
     fn unknown_command_is_returned_to_caller() {
         let r = parse_command("/foobar").unwrap();
         assert_eq!(r, Some(SlashCommand::Unknown("/foobar".into())));
@@ -288,6 +340,30 @@ mod tests {
         assert_eq!(s.system_prompt.as_deref(), Some("hello"));
         s.apply(SlashCommand::SetSystem(String::new()));
         assert!(s.system_prompt.is_none());
+    }
+
+    #[test]
+    fn read_file_queues_pending_read() {
+        let mut s = ReplState::new(ThinkMode::NoThink, 1024);
+        assert!(s.pending_read.is_none());
+        s.apply(SlashCommand::ReadFile(PathBuf::from("/tmp/q.txt")));
+        assert_eq!(s.pending_read.as_deref(), Some(std::path::Path::new("/tmp/q.txt")));
+    }
+
+    #[test]
+    fn clear_drops_pending_read_and_system() {
+        let mut s = ReplState::new(ThinkMode::NoThink, 1024);
+        s.apply(SlashCommand::SetSystem("hello".into()));
+        s.apply(SlashCommand::ReadFile(PathBuf::from("/tmp/q.txt")));
+        s.apply(SlashCommand::Clear);
+        assert!(s.pending_read.is_none());
+        assert!(s.system_prompt.is_none());
+    }
+
+    #[test]
+    fn leading_whitespace_still_parses() {
+        let r = parse_command("   /help").unwrap();
+        assert_eq!(r, Some(SlashCommand::Help));
     }
 
     #[test]

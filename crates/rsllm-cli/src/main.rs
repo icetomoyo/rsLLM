@@ -99,9 +99,11 @@ fn one_shot(run: &RunFlags, prompt: String) -> Result<(), CliError> {
         run.dump_tokens,
         run.seed,
     );
-    Err(CliError::NotImplemented(
-        "decode loop lands in F008.C — CLI surface ready, Engine wiring pending",
-    ))
+    Err(CliError::NotImplemented(format!(
+        "decode loop lands in F008.C (model={:?}, prompt={} chars)",
+        run.model.as_deref().map(std::path::Path::display),
+        prompt.len(),
+    )))
 }
 
 /// REPL loop. Uses `rustyline` for line editing + history. The decode
@@ -163,9 +165,11 @@ fn run_repl(run: RunFlags) -> Result<(), CliError> {
                 // future telemetry can grep one string.
                 eprintln!(
                     "rsllm: {}",
-                    CliError::NotImplemented(
-                        "decode loop lands in F008.C — slash commands work today"
-                    )
+                    CliError::NotImplemented(format!(
+                        "decode loop lands in F008.C (msg={} chars, think={})",
+                        trimmed.len(),
+                        state.think_mode.label(),
+                    ))
                 );
             }
         }
@@ -173,8 +177,22 @@ fn run_repl(run: RunFlags) -> Result<(), CliError> {
 
     if let Some(p) = &hist_path {
         let _ = rl.save_history(p);
+        // History lines may contain sensitive prompt text. Tighten
+        // permissions on Unix; Windows uses ACLs so this is a no-op.
+        restrict_history_perms(p);
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_history_perms(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn restrict_history_perms(_path: &std::path::Path) {
+    // Windows: ACLs from the parent directory cover us.
 }
 
 fn print_banner() {

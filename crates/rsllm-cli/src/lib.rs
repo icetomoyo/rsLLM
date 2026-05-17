@@ -27,9 +27,10 @@ pub enum CliError {
     /// A decode-mode invocation requires a model but the user didn't supply one.
     #[error("model required: {0}")]
     ModelRequired(String),
-    /// Sub-feature is parked behind a future commit.
+    /// Sub-feature is parked behind a future commit. Owns its message
+    /// so call sites can embed paths / token counts / config snippets.
     #[error("not yet implemented: {0}")]
-    NotImplemented(&'static str),
+    NotImplemented(String),
 }
 
 #[cfg(test)]

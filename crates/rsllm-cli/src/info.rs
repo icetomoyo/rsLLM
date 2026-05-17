@@ -20,10 +20,12 @@ pub fn run(model: Option<&Path>, ctx_size: usize) -> Result<(), CliError> {
     println!("  Endianness      : little (assumed; GGUF is little-endian)");
     println!("  CPU threads     : {}", available_parallelism());
     println!();
+    // Use ASCII status markers — Windows `cmd.exe` defaults to cp1252
+    // and cannot render the U+2705 check mark without `chcp 65001`.
     println!("Backends");
-    println!("  CPU (NEON/AVX2) : ✅");
-    println!("  Metal           : pending FEATURE_025");
-    println!("  CUDA            : pending FEATURE_026");
+    println!("  CPU (NEON/AVX2) : [ready]");
+    println!("  Metal           : [pending F025]");
+    println!("  CUDA            : [pending F026]");
     println!();
 
     if let Some(path) = model {
