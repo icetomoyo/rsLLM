@@ -7,7 +7,8 @@
 //! splits the input around them; spans of non-special text are forwarded
 //! to [`crate::bpe::encode_text`].
 //!
-//! Ported by reference from `ds4.c:13970-14023` (MIT, The ds4.c authors).
+//! Ported by reference from `ds4.c:14730-14780` (MIT, The ds4.c authors).
+//! Line numbers pinned to ds4 commit `ef0a490` (2026-05-17).
 
 use crate::bpe::encode_text;
 use crate::vocab::{SPECIAL_TEXTS, Vocab};

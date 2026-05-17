@@ -6,7 +6,8 @@
 //! vocab's `merge_rank` table. The final symbol list is mapped to token
 //! ids and pushed to `out`.
 //!
-//! Ported by reference from `ds4.c:13619-13701` (MIT, The ds4.c authors).
+//! Ported by reference from `ds4.c:14381-14470` (MIT, The ds4.c authors).
+//! Line numbers pinned to ds4 commit `ef0a490` (2026-05-17).
 
 use crate::byte_encode::encode_bytes;
 use crate::vocab::Vocab;
@@ -14,7 +15,7 @@ use crate::vocab::Vocab;
 /// Apply byte-level BPE to one pre-tokenized piece and append token ids
 /// to `out`.
 ///
-/// Algorithm (matching ds4.c:13636-13697):
+/// Algorithm (matching ds4.c:14398-14470):
 ///   1. Byte-encode the piece (raw bytes → GPT-2 printable codepoints).
 ///   2. Split the encoded UTF-8 string into one symbol per codepoint.
 ///   3. Repeatedly find the adjacent symbol pair `(a, b)` whose merge
@@ -27,7 +28,7 @@ use crate::vocab::Vocab;
 ///
 /// Complexity: O(n²) per piece in the worst case (n = encoded length).
 /// Pieces are short enough (one pre-tokenized word) that this is the
-/// approach ds4 itself uses; see ds4.c:13655-13683.
+/// approach ds4 itself uses; see ds4.c:14416-14444.
 pub(crate) fn encode_piece(vocab: &Vocab, piece: &str, out: &mut Vec<u32>) {
     if piece.is_empty() {
         return;
@@ -73,7 +74,7 @@ pub(crate) fn encode_piece(vocab: &Vocab, piece: &str, out: &mut Vec<u32>) {
         // string in the GPT-2 alphabet (188 printable bytes that map to
         // themselves + 68 lifted control / whitespace bytes in
         // U+0100..=U+0143) must be a token in a well-formed DS V4 Flash
-        // vocab; ds4 relies on the same invariant (ds4.c:13687-13694).
+        // vocab; ds4 relies on the same invariant (ds4.c:14454-14463).
         // Iterating `chars()` works because `encode_bytes` produces
         // exactly one Unicode scalar per source byte.
         for ch in s.chars() {

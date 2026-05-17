@@ -25,9 +25,55 @@ ds4 自 `d997b56 DS4 initial release` 之后已演化为多后端架构。我们
 - F005 必须加 per-head `attn_sinks` 和 optional `ffn_exp_probs_b` MoE gate bias
 - 新增形状常量：`N_OUT_GROUP=8`、`N_EXPERT_SHARED=1`、`N_INDEXER_HEAD=64`、`N_INDEXER_HEAD_DIM=128`
 - 17 个核心形状常量值未变 ✅（行号从 `81-104` 移到 `87-108`）
-- v0.1.0 验收 gate 升级：用 `tests/test-vectors/official/*.json`
+- F007 默认采样器从 top-p 改为 min-p（`DS4_DEFAULT_MIN_P = 0.05`），对齐 ds4 `613e9b2`
+- v0.1.0 验收 gate 升级：用 `tests/dsv4-vectors/official/*.json`（已 vendor 到本仓）
   里 5 个官方测试向量做 top-1 hit rate / top-20 KL 校验
   （取代之前的"和 ds4 同 prompt 同种子 first 50 token byte-equal"）
+
+## 0.1 ds4.c 行号引用基线（commit `ef0a490`，2026-05-17）
+
+rsLLM 代码内嵌的所有 `ds4.c:LINE` 注释引用，都基于这一 commit。如果 ds4 上游再次
+重构(往往会导致 backend 抽象层挤压代码上下行)，需要按下表锚点重新对齐。锚点优于行号 —
+精确行号会因为内部注释微调而漂移几行，而 anchor 符号是稳定的。
+
+| 主题 | Anchor symbol（`git -C ds4 grep -n <symbol> ds4.c`） | 当前行号 | 旧行号 |
+|------|------------------------------------|---------|--------|
+| Fixed shape constants | `DS4_N_LAYER`（首项） | 87-108 | 81-104 |
+| SwiGLU clamp const | `DS4_SWIGLU_CLAMP_EXP` | 55 | 55 |
+| think-max min ctx | `DS4_THINK_MAX_MIN_CONTEXT` | 71 | 71 |
+| IQ2_XXS tables | `iq2xxs_grid`（首项） | 217-298 | 217-298 |
+| compress_ratio | `ds4_layer_compress_ratio` | 411 | 407-411 |
+| GGUF metadata parse | `parse_metadata` / 13 value-type enum | 813-1118 | 813-1118 |
+| `model_open` family | `tensor_expect_layout` first call | 2286-2451 | 1820-1870 |
+| Q8_0 NEON dot | `vdotq_s32` first use | 2740-2801 (估计 + 800) | 2726-2801 |
+| Q8_0 activation quant | `quantize_q8_0_*` (grep symbol) | ~2977-3000 | 2977-3000 |
+| Q8_0 batched matmul outer | `matvec_q8_0_*` | ~3277-3297 | 3277-3297 |
+| HC Sinkhorn | `hc_split_sinkhorn_one` | 4186-4310 | 4040-4117 |
+| RoPE-YaRN family | `rope_yarn_corr_dim` | 4675-4750 | 4529-4596 |
+| sigmoid_stable | `sigmoid_stable` | 4885 | 4739-4747 |
+| Attention sinks usage | `sinks[h]` first occurrence | 4912-4922 | 4904-4922 |
+| swiglu kernel | `static void swiglu` | 5022-5025 | 4876-4880 |
+| MoE softplus → sqrt | `sqrtf(softplus_stable(` | 5178 | 5045-5050 |
+| MoE hash router | `layer_hash_router_weights_*` | 5182-5208 | 5002-5050 |
+| MoE routed FFN | `layer_routed_moe_*` | 5278+ | 5088-5097 |
+| MoE gate bias | grep `ffn_exp_probs_b` use | ~5256-5257 (估计) | n/a (新增) |
+| KV three-tier layout | `DsV4LayerCache` 结构定义 | ~5872-5893 (估计) | 5872-5893 |
+| KV compression trigger | `compress_state_*` 触发点 | ~6154-6206 (估计) | 6154-6206 |
+| Indexer top-K attention | grep `index_q` allocations | 6166-6797 | n/a (新增) |
+| BPE rank + emit | `bpe_rank` / `bpe_emit_piece` | 14381-14470 | 13619-13701 |
+| GPT-2 byte encode | `gpt2_byte_to_codepoint` | 14329-14360 | 13567-13595 |
+| JoyAI pre-tokenizer | `joyai_ascii_punct_symbol` | 14488-14660 | 13703-13879 |
+| Vocab loader | `vocab_load` | 14653+ | 13891-13931 |
+| Chat append message | `ds4_chat_append_message` | 14808+ | 13943-13964 |
+| Decode token text | `ds4_token_text` | 14911+ | 14140-14177 |
+| Argmax sampler | `static int sample_argmax(` | 14953 | 14183-14194 |
+| Think-Max prefix | `ds4_think_max_prefix` | 15512+ | 14046-14066 |
+| `vocab_load` callsite | `vocab_load(&vocab,` | 16602 / 17057 | n/a |
+
+更新流程：
+1. `git -C path/to/ds4 grep -n <anchor> ds4.c` 拿当前行号
+2. 更新本表 + 必要的 file header 引用
+3. 内嵌细粒度注释引用通常不必逐行更新,以本表 anchor 为准
 
 ## 1. 项目定位
 

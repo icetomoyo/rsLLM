@@ -3,11 +3,13 @@
 //! DS V4 Flash has two MoE routing regimes that share the same expert
 //! pool but differ in how the per-token routing decision is made:
 //!
-//! - **Hash routing** (layers `[0, 3)`, `ds4.c:5002-5050`). The
+//! - **Hash routing** (layers `[0, 3)`, `ds4.c:5182-5208` —
+//!   `layer_hash_router_weights_*`). The
 //!   `ffn_gate_tid2eid` tensor maps every vocabulary id directly to a
 //!   fixed list of `N_EXPERT_USED = 6` expert indices. Routing is
 //!   purely lookup; the gate logit only contributes the soft weight.
-//! - **Top-k routing** (layers `[3, 43)`, `ds4.c:5088-5097`). The
+//! - **Top-k routing** (layers `[3, 43)`, `ds4.c:5278+` —
+//!   `layer_routed_moe_one`). The
 //!   `ffn_gate_inp` projection produces a 256-vector of logits per
 //!   token; the top-6 indices are selected and weighted.
 //!
@@ -19,7 +21,8 @@
 //! [`apply_expert_swiglu`]. F005.E will add the top-k variant on top of
 //! the same primitives.
 //!
-//! Ported by reference from `ds4.c:5002-5097` (MIT, The ds4.c authors).
+//! Ported by reference from `ds4.c:5178-5466` (MIT, The ds4.c authors).
+//! Line numbers pinned to ds4 commit `ef0a490` (2026-05-17).
 
 use rsllm_backend_cpu::SimdTier;
 use rsllm_backend_cpu::ops::scalar;
@@ -340,9 +343,15 @@ pub fn moe_topk_route(
     accumulate_moe_outputs(out, x, weights, scratch, n_tok, tier)
 }
 
-/// Select the indices of the `out.len()` largest entries in `logits`,
-/// in descending-score order. Ties break to the smaller index (matches
-/// `ds4.c:5091` partial-sort behavior).
+/// Select the indices of the `out.len()` largest entries in `logits`.
+///
+/// **Output order is unspecified** — the algorithm tracks the running
+/// minimum of a fixed-size "top-k so far" buffer and evicts to that
+/// slot whenever a larger candidate arrives, so the resulting indices
+/// are not sorted. Downstream consumer
+/// ([`compute_routing_weights`]) looks up each selected index in the
+/// logit vector by value, so order does not affect routing weights.
+/// If a future caller needs sorted output, sort externally.
 ///
 /// Uses a small linear scan over a fixed-size "top-k so far" buffer.
 /// Cost is `O(N * k)` which dominates at `N = 256, k = 6` (≈1500 ops)

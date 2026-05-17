@@ -7,6 +7,10 @@
 //!
 //! Pre-conditions: every function here trusts its inputs. Length /
 //! shape validation is done by the public wrappers in [`crate::ops`].
+//!
+//! `ds4.c:LINE` references in this file are pinned to ds4 commit
+//! `ef0a490` (2026-05-17). See `docs/research/ds4-analysis.md` for the
+//! anchor-based mapping table when ds4 upstream evolves.
 
 /// Scalar RMSNorm reference. See [`crate::ops::rmsnorm`].
 ///
@@ -33,7 +37,7 @@ pub fn rmsnorm(out: &mut [f32], x: &[f32], weight: &[f32], eps: f32) {
 }
 
 /// Scalar argmax. See [`crate::ops::argmax`]. Ties break to the
-/// lowest index — mirrors ds4's `sample_argmax` (`ds4.c:14183-14194`).
+/// lowest index — mirrors ds4's `sample_argmax` (`ds4.c:14953`).
 pub fn argmax(logits: &[f32]) -> u32 {
     debug_assert!(!logits.is_empty());
     let mut best_i: u32 = 0;
@@ -48,7 +52,7 @@ pub fn argmax(logits: &[f32]) -> u32 {
 }
 
 /// Numerically stable sigmoid: chooses the branch that avoids `exp` of
-/// a large positive operand. Mirrors `ds4.c:4739-4747`.
+/// a large positive operand. Mirrors `ds4.c:4885` (`sigmoid_stable`).
 #[inline]
 pub fn sigmoid(x: f32) -> f32 {
     if x >= 0.0 {
@@ -68,10 +72,11 @@ pub fn silu(x: f32) -> f32 {
 
 /// SwiGLU activation: `out[i] = silu(gate[i]) * up[i]`.
 ///
-/// Ported from `ds4.c:4876-4880`. DS V4 Flash uses this with a clamp
-/// applied upstream on the gate input (`DS4_SWIGLU_CLAMP_EXP = 10.0`,
-/// `ds4.c:55`); the clamp is the caller's responsibility — it's applied
-/// during the gate-projection matmul before this kernel runs.
+/// Ported from `ds4.c:5022-5025` (`swiglu`). DS V4 Flash uses this with
+/// a clamp applied upstream on the gate input
+/// (`DS4_SWIGLU_CLAMP_EXP = 10.0`, `ds4.c:55`); the clamp is the caller's
+/// responsibility — it's applied during the gate-projection matmul
+/// before this kernel runs.
 pub fn swiglu(out: &mut [f32], gate: &[f32], up: &[f32]) {
     debug_assert_eq!(out.len(), gate.len());
     debug_assert_eq!(out.len(), up.len());

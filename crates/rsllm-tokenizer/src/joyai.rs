@@ -1,7 +1,8 @@
 //! JoyAI BPE pre-tokenizer (DeepSeek V4 Flash `tokenizer.ggml.pre =
 //! "joyai-llm"`).
 //!
-//! Ported by reference from `ds4.c:13703-13879` (MIT, The ds4.c authors).
+//! Ported by reference from `ds4.c:14488-14660` (MIT, The ds4.c authors).
+//! Line numbers pinned to ds4 commit `ef0a490` (2026-05-17).
 //!
 //! Splits an input text into byte ranges per the JoyAI rule set:
 //!

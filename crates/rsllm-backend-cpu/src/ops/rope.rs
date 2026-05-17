@@ -7,12 +7,13 @@
 //! extrapolation (`freq_base = 10000`, `original_context = 65536`,
 //! `scale_factor = 16`, `beta_fast = 32`, `beta_slow = 1`).
 //!
-//! Ported by reference from `ds4.c:4529-4596` (MIT, The ds4.c authors):
+//! Ported by reference from `ds4.c:4675-4750` (MIT, The ds4.c authors).
+//! Line numbers pinned to ds4 commit `ef0a490` (2026-05-17).
 //!
-//! - `rope_yarn_ramp` — smooth interpolation window
-//! - `rope_yarn_corr_dim` — dimension at which `freq * n_ctx_orig` completes one full rotation
-//! - `rope_yarn_corr_dims` — `[start, end]` of the ramp
-//! - `rope_tail_ext_inplace` — in-place rotation of each head's tail
+//! - `rope_yarn_ramp` (`ds4.c:4675`) — smooth interpolation window
+//! - `rope_yarn_corr_dim` (`ds4.c:4680`) — dim where freq completes a rotation
+//! - `rope_yarn_corr_dims` (`ds4.c:4684`) — `[start, end]` of the ramp
+//! - `rope_tail_ext_inplace` (`ds4.c:4694`) — in-place rotation of tail
 
 use core::f32::consts::PI;
 
@@ -31,7 +32,7 @@ fn yarn_ramp(low: f32, high: f32, i0: i32) -> f32 {
 
 /// The dimension index at which a sinusoidal frequency `n_rot` would
 /// complete `n_ctx_orig / (2π)` rotations across `n_ctx_orig` tokens.
-/// Mirrors `rope_yarn_corr_dim` (`ds4.c:4534-4536`).
+/// Mirrors `rope_yarn_corr_dim` (`ds4.c:4680-4682`).
 #[inline]
 fn yarn_corr_dim(n_dims: i32, n_ctx_orig: u64, n_rot: f32, base: f32) -> f32 {
     (n_dims as f32) * (n_ctx_orig as f32 / (n_rot * 2.0 * PI)).ln() / (2.0 * base.ln())
@@ -51,7 +52,7 @@ fn yarn_corr_dims(
 }
 
 /// Parameter bundle for RoPE-YaRN tail rotation. Mirrors the
-/// twelve-arg signature of `ds4.c:4548-4561` minus the `inverse` flag
+/// twelve-arg signature of `ds4.c:4694-4707` minus the `inverse` flag
 /// (handled by [`RoPEParams::inverse`]).
 #[derive(Debug, Clone, Copy)]
 pub struct RoPEParams {
@@ -155,7 +156,7 @@ fn scalar_rope_yarn_tail(x: &mut [f32], p: &RoPEParams) {
             if p.ext_factor != 0.0 {
                 let ramp_mix = yarn_ramp(corr_dims[0], corr_dims[1], i as i32) * p.ext_factor;
                 theta = theta_interp * (1.0 - ramp_mix) + theta_extrap * ramp_mix;
-                // ds4.c:4582 — m-scale correction once freq_scale != 1.
+                // ds4.c:4728 — m-scale correction once freq_scale != 1.
                 mscale *= 1.0 + 0.1 * (1.0 / p.freq_scale).ln();
             }
 

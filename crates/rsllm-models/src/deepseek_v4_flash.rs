@@ -27,8 +27,13 @@
 //!                 └─ hc_post(ffn) [in-place add into streams]
 //! ```
 //!
-//! Ported by reference from `ds4.c:4136-4169, 1846-1853, 5002-5097`
-//! (MIT, The ds4.c authors).
+//! Ported by reference from ds4.c (MIT, The ds4.c authors):
+//! - HC family: `ds4.c:4186-4310`
+//! - MLA Q/KV LoRA: see `dsv4::mla` (anchored on `attn_q_a` family in
+//!   ds4.c:2306+ for the layer-weight struct)
+//! - MoE routing: `ds4.c:5178-5466`
+//!
+//! Line numbers pinned to ds4 commit `ef0a490` (2026-05-17).
 
 use rsllm_backend_cpu::SimdTier;
 use rsllm_backend_cpu::ops::{rmsnorm, sinkhorn::N_HC};
@@ -185,6 +190,16 @@ impl<'a> DeepSeekV4Flash<'a> {
                     key: "block.ffn_norm",
                     expected: format!("{DSV4_N_EMBD}"),
                     actual: format!("{}", block.ffn_norm.len()),
+                });
+            }
+            // attn_sinks is consumed by F006 attention but we validate
+            // here so a malformed GGUF fails at load time rather than at
+            // first forward call (per security review 2026-05-17).
+            if block.attn_sinks.len() != DSV4_N_HEAD {
+                return Err(Error::ShapeMismatch {
+                    key: "block.attn_sinks",
+                    expected: format!("{DSV4_N_HEAD}"),
+                    actual: format!("{}", block.attn_sinks.len()),
                 });
             }
         }
@@ -710,6 +725,32 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn model_rejects_wrong_attn_sinks_dim() {
+        let mut storage = StubBlockStorage::new();
+        storage.attn_sinks = vec![0.0_f32; 10]; // wrong: should be N_HEAD = 64
+        let blocks: Vec<_> = (0..DSV4_N_LAYER).map(|i| storage.block(i)).collect();
+        let norm = vec![1.0_f32; DSV4_N_EMBD];
+        let bytes: Vec<u8> = vec![];
+        let err = DeepSeekV4Flash::new(
+            WeightBlob::Quant {
+                data: &bytes,
+                dtype: rsllm_gguf::GgmlType::F16,
+            },
+            blocks,
+            &norm,
+            WeightBlob::Quant {
+                data: &bytes,
+                dtype: rsllm_gguf::GgmlType::F16,
+            },
+        )
+        .unwrap_err();
+        match err {
+            Error::ShapeMismatch { key, .. } => assert_eq!(key, "block.attn_sinks"),
+            other => panic!("expected ShapeMismatch.attn_sinks, got {other:?}"),
+        }
     }
 
     #[test]

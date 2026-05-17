@@ -5,7 +5,8 @@
 //! verbatim; everything else is decoded codepoint-by-codepoint back into
 //! the original raw byte sequence.
 //!
-//! Ported by reference from `ds4.c:14140-14177` (MIT, The ds4.c authors).
+//! Ported by reference from `ds4.c:14911+` (`ds4_token_text`, MIT, The
+//! ds4.c authors). Line numbers pinned to ds4 commit `ef0a490` (2026-05-17).
 
 use crate::byte_encode::codepoint_to_byte;
 use crate::error::Error;

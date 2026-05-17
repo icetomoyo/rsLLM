@@ -122,24 +122,37 @@ pub fn matmul_weight_f32(
 
 /// Grouped matmul for the attention output LoRA down-projection.
 ///
-/// DS V4 Flash's `attn_output_a` is a `[N_HEAD * HEAD_DIM × out_low_dim]`
-/// weight matrix whose rows are partitioned into `n_groups` blocks of
-/// `group_dim = HEAD_DIM * (N_HEAD / N_OUT_GROUP)` consecutive input
-/// rows. Each group projects to its own `rank` output slot, and the
-/// `n_groups` outputs are concatenated into `[n_groups × rank]`.
+/// DS V4 Flash's `attn_output_a` partitions the post-attention activation
+/// (shape `[N_HEAD * HEAD_DIM] = [32768]`) into `N_OUT_GROUP = 8` contiguous
+/// chunks of `group_dim = HEAD_DIM * (N_HEAD / N_OUT_GROUP) = 4096` lanes
+/// each. Each chunk projects through its own `[rank × group_dim]` weight
+/// slab into a `rank = N_LORA_O = 1024`-dim slot. The 8 slots concatenate
+/// into the `out_low_dim = N_OUT_GROUP * N_LORA_O = 8192`-dim intermediate
+/// that `attn_output_b` then projects back to `N_EMBD`.
 ///
-/// In other words: input row `i ∈ [g*group_dim, (g+1)*group_dim)`
-/// only contributes to output column `[g*rank, (g+1)*rank)`. Cross-
-/// group contributions are zero, so a dense matmul would compute the
-/// wrong result.
+/// **GGUF byte-layout reasoning** (essential for correctness):
 ///
-/// `weight_per_group` carries the per-group `[group_dim × rank]`
-/// matrix. The total `weight_per_group.byte_len()` must equal
-/// `n_groups * group_dim * rank * (bytes_per_element)`.
+/// ds4 declares the GGUF tensor as
+/// `tensor_expect_layout(attn_output_a, Q8_0, 2, group_dim, out_low_dim)`
+/// (ds4.c:2312). The GGUF convention is `shape[0] = fastest (inner)`:
+/// element `(a, b)` of declared shape `[A, B]` lives at byte offset
+/// `(b*A + a) * sizeof(elem)`. So `attn_output_a` with shape
+/// `[group_dim=4096, out_low_dim=8192]` is byte-equivalent to a
+/// **row-major** `[out_low_dim=8192, group_dim=4096]` matrix.
+///
+/// In that row-major view, output rows `[g*rank .. (g+1)*rank]` form a
+/// contiguous block of `rank * group_dim` elements per group. We slice
+/// the blob into 8 such per-group blocks and feed each to
+/// [`matmul_weight_f32`], which interprets a `[out × in]` row-major
+/// weight as `weight[o * in_dim + i]`. With `out_dim = rank` and
+/// `in_dim = group_dim`, this exactly matches the per-group sub-matrix.
 ///
 /// Shape contracts:
-/// - `x`     : `[n_tok × (n_groups * group_dim)]`
-/// - `out`   : `[n_tok × (n_groups * rank)]`
+/// - `x`                : `[n_tok × (n_groups * group_dim)]`
+/// - `out`              : `[n_tok × (n_groups * rank)]`
+/// - `weight_per_group` : `n_groups * rank * group_dim` elements total,
+///   logically organized as `n_groups` contiguous `[rank × group_dim]`
+///   sub-matrices in row-major order.
 ///
 /// # Errors
 /// Bubbles up shape errors from the underlying matmul kernel.
@@ -227,6 +240,19 @@ fn grouped_weight_slice<'a>(
         WeightBlob::Quant { data, dtype } => {
             let block_elems = dtype.block_elements() as usize;
             let block_bytes = dtype.block_bytes() as usize;
+            // A quantized stacked layout requires each group's element
+            // count to align to the quant block size. Non-divisibility
+            // would silently truncate `stride` by < 1 block, dropping
+            // the tail of every group without a runtime error. The
+            // F005 fixed shapes are all divisible, but assert so future
+            // variants fail loudly. (Reviewer note 2026-05-17.)
+            if !elements_per_group.is_multiple_of(block_elems) {
+                return Err(Error::ShapeMismatch {
+                    key: "grouped_weight_slice.alignment",
+                    expected: format!("multiple of {block_elems}"),
+                    actual: format!("{elements_per_group}"),
+                });
+            }
             let blocks = elements_per_group / block_elems;
             let stride = blocks * block_bytes;
             let start = g * stride;
@@ -325,6 +351,46 @@ mod tests {
         // tok 1 g0: [1*10+0*20+1*30, 0*10+1*20+1*30] = [40, 50]
         // tok 1 g1: [2*40+0*50+0*60, 0*40+2*50+0*60] = [80, 100]
         assert_eq!(out, vec![4.0, 5.0, 8.0, 10.0, 40.0, 50.0, 80.0, 100.0]);
+    }
+
+    #[test]
+    fn grouped_weight_slice_quant_path_bounds_check() {
+        // Quant path: must reject a slice whose elements_per_group is
+        // not a multiple of the dtype's block_elements.
+        use rsllm_gguf::GgmlType;
+        let data = vec![0u8; 1024];
+        let blob = WeightBlob::Quant {
+            data: &data,
+            dtype: GgmlType::Q8_0, // block_elements = 32
+        };
+        // 31 is not a multiple of 32 → must reject (else silent truncation).
+        let err = grouped_weight_slice(&blob, 0, 31).unwrap_err();
+        assert!(matches!(err, Error::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn grouped_weight_slice_quant_path_slices_correctly() {
+        // Quant path: with proper block alignment, the slice points to
+        // the correct per-group byte range.
+        use rsllm_gguf::GgmlType;
+        // Q8_0 block = 32 elements / 34 bytes. Group size = 32 elements
+        // = 1 block = 34 bytes. 4 groups total = 136 bytes.
+        let data: Vec<u8> = (0..136u8).collect();
+        let blob = WeightBlob::Quant {
+            data: &data,
+            dtype: GgmlType::Q8_0,
+        };
+        let g2 = grouped_weight_slice(&blob, 2, 32).unwrap();
+        match g2 {
+            WeightBlob::Quant { data: d, dtype } => {
+                assert_eq!(dtype, GgmlType::Q8_0);
+                // Group 2 starts at byte 2 * 34 = 68, ends at 102.
+                assert_eq!(d.len(), 34);
+                assert_eq!(d[0], 68);
+                assert_eq!(d[33], 101);
+            }
+            other => panic!("expected Quant variant, got {other:?}"),
+        }
     }
 
     #[test]

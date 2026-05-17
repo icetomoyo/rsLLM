@@ -22,7 +22,9 @@
 //! [ g[0..4]  | p[0..4]  | c[0..16] (row-major dst*4 + src) ]
 //! ```
 //!
-//! Ported by reference from `ds4.c:4136-4169` (MIT, The ds4.c authors).
+//! Ported by reference from `ds4.c:4186-4310` (`hc_split_sinkhorn_one`,
+//! MIT, The ds4.c authors). Line numbers pinned to ds4 commit
+//! `ef0a490` (2026-05-17).
 
 use rsllm_backend_cpu::SimdTier;
 use rsllm_backend_cpu::ops::sinkhorn::{N_HC, N_HC_SINKHORN_ITER, hc_split_sinkhorn};
@@ -96,7 +98,7 @@ impl HcScratch {
 /// Reasoning for using row 0 of `c`: the Sinkhorn output is doubly
 /// stochastic, so every row sums to 1 — picking any fixed row gives a
 /// valid convex combination of streams. Row 0 matches our reading of
-/// `ds4.c:4144` (`hc_split_pre`).
+/// `ds4.c:4186+` (`hc_split_sinkhorn_one`).
 ///
 /// **TODO (numerical-parity gate)**: this assumption — that ds4 reads
 /// row 0 unconditionally rather than a per-token learned destination
@@ -197,7 +199,7 @@ pub fn hc_pre(
 ///   `streams[t, h] = p[h] * streams[t, h] + g[h] * sublayer_out[t]`
 ///
 /// Both `g[h]` and `p[h]` come from the Sinkhorn output buffer; ds4's
-/// `hc_split_post` (`ds4.c:4158-4169`) uses the same combination.
+/// `hc_split_post` (`ds4.c:4186+` HC family) uses the same combination.
 pub fn hc_post(
     streams: &mut [f32],
     sublayer_out: &[f32],

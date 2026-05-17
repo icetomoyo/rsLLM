@@ -4,8 +4,9 @@
 //! `id_to_token`, and the BPE merge ranking table — plus the IDs of the
 //! special tokens that DeepSeek V4 Flash's chat protocol requires.
 //!
-//! Loading logic ported by reference from `ds4.c:13891-13931` (MIT, The
-//! ds4.c authors).
+//! Loading logic ported by reference from `ds4.c:14653+` (`vocab_load`,
+//! MIT, The ds4.c authors). Line numbers pinned to ds4 commit
+//! `ef0a490` (2026-05-17).
 
 use std::collections::HashMap;
 

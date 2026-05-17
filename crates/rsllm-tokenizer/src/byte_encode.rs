@@ -6,7 +6,8 @@
 //! map to themselves (the "printable" range), and the remaining 68 control /
 //! whitespace bytes are mapped to codepoints `256..324`.
 //!
-//! Ported by reference from `ds4.c:13567-13595` (MIT, The ds4.c authors).
+//! Ported by reference from `ds4.c:14329-14360` (MIT, The ds4.c authors).
+//! Line numbers pinned to ds4 commit `ef0a490` (2026-05-17).
 
 /// Returns whether byte `b` belongs to the "printable" GPT-2 range that
 /// maps to itself.
@@ -17,7 +18,7 @@ const fn byte_is_printable(b: u8) -> bool {
 
 /// Map a raw byte to the GPT-2 codepoint that represents it.
 ///
-/// Direct port of `gpt2_byte_to_codepoint` (`ds4.c:13567-13581`):
+/// Direct port of `gpt2_byte_to_codepoint` (`ds4.c:14329-14343`):
 /// printable bytes map to themselves; non-printable bytes (33 control /
 /// whitespace bytes and the gaps at 127, 160, 173) map to consecutive
 /// codepoints starting at 256.

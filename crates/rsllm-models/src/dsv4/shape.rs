@@ -1,13 +1,18 @@
 //! Fixed shape constants for DeepSeek V4 Flash.
 //!
-//! Every value here is **hard-coded** from `ds4.c:81-104` (MIT, The ds4.c
+//! Every value here is **hard-coded** from `ds4.c:87-108` (MIT, The ds4.c
 //! authors). The DS V4 Flash architecture is not a tunable family: there
 //! is only one set of dimensions, and we fail-fast at GGUF load time on
-//! any mismatch. This matches ds4's `model_open` validation behavior
-//! (`ds4.c:1820-1870`) and is the cheapest way to keep our forward path
-//! arithmetic free of dynamic-shape branching.
+//! any mismatch. This matches ds4's tensor-layout validation behavior
+//! (`tensor_expect_layout` family at `ds4.c:2291-2351`) and is the
+//! cheapest way to keep our forward path arithmetic free of
+//! dynamic-shape branching.
 //!
 //! Ported by reference from `ds4.c` (MIT, The ds4.c authors).
+//! Line numbers in this file (and across rsllm-models) are pinned to
+//! ds4 commit `ef0a490` (2026-05-17). See `docs/research/ds4-analysis.md`
+//! §"ds4.c 行号引用基线" for the mapping table; re-audit on upstream
+//! bumps via `git -C path/to/ds4 grep -n <anchor>`.
 
 use rsllm_gguf::Metadata;
 

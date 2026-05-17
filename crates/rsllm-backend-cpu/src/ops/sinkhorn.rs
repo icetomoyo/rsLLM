@@ -16,8 +16,9 @@
 //! kernel is fully deterministic.
 //!
 //! Ported by reference from `ds4.c:4040-4117` (MIT, The ds4.c authors).
+//! Line numbers pinned to ds4 commit `ef0a490` (2026-05-17).
 //!
-//! Constants (from `ds4.c:103-104`):
+//! Constants (from `ds4.c:107-108`):
 //!
 //!   * `N_HC = 4`
 //!   * `N_HC_SINKHORN_ITER = 20`

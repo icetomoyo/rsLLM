@@ -4,8 +4,8 @@
 //! trained on, and prepends the "Reasoning Effort: Absolute maximum…"
 //! preface when the caller selects [`ThinkMode::Max`].
 //!
-//! Ported by reference from `ds4.c:13943-13964, 14046-14072` (MIT, The
-//! ds4.c authors).
+//! Ported by reference from `ds4.c:14700-14830` (MIT, The ds4.c authors).
+//! Line numbers pinned to ds4 commit `ef0a490` (2026-05-17).
 
 use crate::bpe::encode_text;
 use crate::vocab::Vocab;
