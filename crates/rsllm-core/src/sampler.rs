@@ -54,8 +54,11 @@ pub struct SamplingParams {
     /// the v0.1.0 default active filter (`min_p = 0.05`).
     pub min_p: Option<f32>,
 
-    /// Seed for the multinomial draw. `None` means "non-deterministic"
-    /// — the seed is drawn from a fresh `xoshiro256**` state.
+    /// Seed for the multinomial draw. `None` selects a **fixed
+    /// fallback seed**, so a sampler constructed with `seed: None`
+    /// is still deterministic across process launches. Callers that
+    /// want OS entropy must pin a value (e.g. via the `getrandom`
+    /// crate at the call site) before constructing.
     pub seed: Option<u64>,
 }
 
@@ -160,6 +163,11 @@ impl Xoshiro256StarStar {
 /// Logits sampler. Constructed once per session (the PRNG state
 /// persists across calls so successive draws don't all share the
 /// same seed).
+///
+/// Note: `SamplingParams` is `Copy` and carries the seed by value, so
+/// constructing two samplers from the same `SamplingParams` value
+/// gives two PRNGs that start in the **same** state — the sequences
+/// are identical, not independent.
 #[derive(Debug, Clone)]
 pub struct Sampler {
     params: SamplingParams,
@@ -168,14 +176,16 @@ pub struct Sampler {
     /// Held on the sampler so a high-rate decode loop doesn't
     /// reallocate per token.
     scratch: Vec<usize>,
+    /// Reusable keep-mask scratch — kept on the sampler for the same
+    /// reason. At ~150k vocab a fresh `vec![false; vocab]` per token
+    /// would burn ~150 KiB of heap traffic per filter pass.
+    keep_mask: Vec<bool>,
 }
 
 impl Sampler {
     /// Build a sampler from explicit params. If `params.seed` is
-    /// `None`, the sampler still uses a deterministic PRNG (seeded
-    /// from a constant); the field is `None` only because the caller
-    /// did not pin one. For true non-determinism, seed from the OS RNG
-    /// before constructing.
+    /// `None`, the sampler uses a fixed fallback seed — see the
+    /// [`SamplingParams::seed`] doc.
     #[must_use]
     pub fn new(params: SamplingParams) -> Self {
         let seed = params.seed.unwrap_or(0xDEAD_BEEF_CAFE_F00D);
@@ -183,6 +193,7 @@ impl Sampler {
             params,
             rng: Xoshiro256StarStar::from_seed(seed),
             scratch: Vec::new(),
+            keep_mask: Vec::new(),
         }
     }
 
@@ -210,8 +221,12 @@ impl Sampler {
     pub fn sample(&mut self, logits: &mut [f32]) -> u32 {
         assert!(!logits.is_empty(), "sampler: logits must be non-empty");
 
-        // 1. Greedy short-circuit (temperature == 0).
-        if self.params.temperature <= 0.0 {
+        // 1. Greedy short-circuit. Triggers on `temperature == 0`
+        //    (canonical greedy) and also on `NaN` / negative
+        //    temperature, which would otherwise propagate NaN through
+        //    the chain and silently collapse to "always token 0".
+        let t = self.params.temperature;
+        if !t.is_finite() || t <= 0.0 {
             return argmax(logits) as u32;
         }
 
@@ -231,14 +246,19 @@ impl Sampler {
 
         // 4. top-k.
         if let Some(k) = self.params.top_k {
-            apply_top_k(logits, k, &mut self.scratch);
+            apply_top_k(logits, k, &mut self.scratch, &mut self.keep_mask);
         }
 
-        // 5. top-p. top_p = 1.0 is a no-op; skip the sort cost.
+        // 5. top-p. `top_p = 1.0` is deliberately treated as "no
+        //    filter": it skips the sort + truncation step entirely,
+        //    so the full distribution (including any long tail) is
+        //    preserved unchanged. `top_p < 1.0` runs the nucleus
+        //    filter, which always retains the boundary token (the
+        //    one that pushes cumulative mass over the threshold).
         if let Some(p) = self.params.top_p
             && p < 1.0
         {
-            apply_top_p(logits, p, &mut self.scratch);
+            apply_top_p(logits, p, &mut self.scratch, &mut self.keep_mask);
         }
 
         // 6. min-p.
@@ -271,8 +291,19 @@ impl Sampler {
                 return i as u32;
             }
         }
-        // Floating-point slop — return the last non-zero bucket.
-        (logits.len() - 1) as u32
+        // Floating-point slop — `u` (in `[0, 1)`) can land above the
+        // final cumulative sum when re-normalization rounds slightly
+        // low. Scan backward for the last bucket with non-zero
+        // probability so we never return a filter-zeroed token.
+        for (i, &p) in logits.iter().enumerate().rev() {
+            if p > 0.0 {
+                return i as u32;
+            }
+        }
+        // Truly all-zero (would normally be caught by the sum<=0
+        // guard above, but reachable if NaNs slipped past); argmax of
+        // the original input is the safest pick.
+        argmax(logits) as u32
     }
 }
 
@@ -320,9 +351,16 @@ fn softmax_in_place(x: &mut [f32]) {
     }
 }
 
+/// Reset `mask` to length `n`, all `false`, reusing its capacity.
+fn reset_mask(mask: &mut Vec<bool>, n: usize) {
+    mask.clear();
+    mask.resize(n, false);
+}
+
 /// Keep only the top `k` probabilities; zero out the rest. No-op when
-/// `k >= probs.len()`.
-fn apply_top_k(probs: &mut [f32], k: usize, scratch: &mut Vec<usize>) {
+/// `k >= probs.len()`. `k == 0` zeroes the full slice, which causes
+/// the caller to fall back to argmax on the original input.
+fn apply_top_k(probs: &mut [f32], k: usize, scratch: &mut Vec<usize>, keep: &mut Vec<bool>) {
     if k == 0 {
         for p in probs.iter_mut() {
             *p = 0.0;
@@ -338,9 +376,7 @@ fn apply_top_k(probs: &mut [f32], k: usize, scratch: &mut Vec<usize>) {
     scratch.select_nth_unstable_by(k - 1, |&a, &b| {
         probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal)
     });
-    // The first `k` entries of scratch are the top-k indices (in some
-    // order). Build a keep-mask, then zero the rest.
-    let mut keep = vec![false; probs.len()];
+    reset_mask(keep, probs.len());
     for &idx in &scratch[..k] {
         keep[idx] = true;
     }
@@ -352,9 +388,10 @@ fn apply_top_k(probs: &mut [f32], k: usize, scratch: &mut Vec<usize>) {
 }
 
 /// Nucleus filter — keep the smallest set of tokens whose cumulative
-/// probability ≥ `p`. `p` must already be in `(0.0, 1.0]`; callers
-/// short-circuit on `p == 1.0`.
-fn apply_top_p(probs: &mut [f32], p: f32, scratch: &mut Vec<usize>) {
+/// probability ≥ `p`. `p` must already be in `(0.0, 1.0)`; callers
+/// short-circuit on `p >= 1.0`. The boundary token (the one that
+/// pushes cumulative mass over the threshold) is always retained.
+fn apply_top_p(probs: &mut [f32], p: f32, scratch: &mut Vec<usize>, keep: &mut Vec<bool>) {
     scratch.clear();
     scratch.extend(0..probs.len());
     scratch.sort_unstable_by(|&a, &b| {
@@ -371,7 +408,7 @@ fn apply_top_p(probs: &mut [f32], p: f32, scratch: &mut Vec<usize>) {
     }
     // Always keep at least 1 token.
     let keep_count = keep_count.max(1);
-    let mut keep = vec![false; probs.len()];
+    reset_mask(keep, probs.len());
     for &idx in &scratch[..keep_count] {
         keep[idx] = true;
     }
@@ -597,5 +634,138 @@ mod tests {
         let p = SamplingParams::think();
         assert_eq!(p.min_p, Some(DEFAULT_MIN_P));
         assert!((p.temperature - DEFAULT_THINK_TEMPERATURE).abs() < 1e-9);
+    }
+
+    #[test]
+    fn nan_temperature_falls_back_to_greedy() {
+        // NaN temperature must not silently propagate through softmax
+        // (would collapse to "always token 0"). The `>0.0` guard
+        // treats NaN as a greedy short-circuit.
+        let params = SamplingParams {
+            temperature: f32::NAN,
+            ..SamplingParams::default()
+        };
+        let mut s = Sampler::new(params);
+        let mut logits = vec![1.0_f32, 5.0, 2.0, 3.0];
+        assert_eq!(s.sample(&mut logits), 1, "argmax of input is index 1");
+    }
+
+    #[test]
+    fn negative_temperature_falls_back_to_greedy() {
+        let params = SamplingParams {
+            temperature: -1.0,
+            ..SamplingParams::default()
+        };
+        let mut s = Sampler::new(params);
+        let mut logits = vec![1.0_f32, 5.0, 2.0];
+        assert_eq!(s.sample(&mut logits), 1);
+    }
+
+    #[test]
+    fn top_p_boundary_token_included() {
+        // Softmax of [ln(0.6), ln(0.4)] gives probs [0.6, 0.4].
+        // top_p=0.7: cumulative at rank 0 is 0.6 (< 0.7, continue);
+        // rank 1 brings it to 1.0 (>= 0.7, stop) — both tokens kept.
+        // The "boundary" token (rank 1, the one that pushed mass
+        // over the threshold) must survive.
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_p: Some(0.7),
+            min_p: None,
+            top_k: None,
+            seed: Some(99),
+        };
+        let mut s = Sampler::new(params);
+        let logit_p = 0.6_f32.ln();
+        let logit_q = 0.4_f32.ln();
+        let mut seen = [false; 2];
+        for _ in 0..200 {
+            let mut l = vec![logit_p, logit_q];
+            let pick = s.sample(&mut l) as usize;
+            seen[pick] = true;
+        }
+        assert!(seen[0] && seen[1], "top_p=0.7 must retain both tokens, saw {seen:?}");
+    }
+
+    #[test]
+    fn top_p_strict_threshold_drops_tail() {
+        // Same probs [0.6, 0.4]; with top_p=0.6 the cumulative is
+        // already met at rank 0, so token 1 must NOT appear in 200
+        // draws. Pins the semantic that `cumulative >= p` is
+        // non-strict (matches HF/PyTorch convention).
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_p: Some(0.6),
+            min_p: None,
+            top_k: None,
+            seed: Some(100),
+        };
+        let mut s = Sampler::new(params);
+        let logit_p = 0.6_f32.ln();
+        let logit_q = 0.4_f32.ln();
+        for _ in 0..200 {
+            let mut l = vec![logit_p, logit_q];
+            assert_eq!(s.sample(&mut l), 0);
+        }
+    }
+
+    #[test]
+    fn top_k_and_top_p_chain_correctly() {
+        // top_k=2 selects [logit=5, logit=4]; top_p=0.5 over the
+        // surviving two-token distribution should keep just the top.
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: Some(2),
+            top_p: Some(0.5),
+            min_p: None,
+            seed: Some(17),
+        };
+        let mut s = Sampler::new(params);
+        for _ in 0..16 {
+            let mut l = vec![1.0_f32, 2.0, 5.0, 4.0, 3.0];
+            // logit=5 is index 2 — must always win after both filters.
+            assert_eq!(s.sample(&mut l), 2);
+        }
+    }
+
+    #[test]
+    fn multinomial_fallback_never_returns_zeroed_bucket() {
+        // Set up a distribution where top-k=1 keeps only the highest
+        // bucket, then verify across 200 draws every result is
+        // exactly that bucket (the fallback path must NOT return
+        // index len-1 if its mass was zeroed).
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: Some(1),
+            top_p: None,
+            min_p: None,
+            seed: Some(31),
+        };
+        let mut s = Sampler::new(params);
+        for _ in 0..200 {
+            // The biggest logit is at index 2; the last slot (index 4)
+            // would be the buggy fallback target.
+            let mut l = vec![0.1_f32, 0.2, 9.0, 0.3, 0.05];
+            let pick = s.sample(&mut l);
+            assert_eq!(pick, 2);
+        }
+    }
+
+    #[test]
+    fn scratch_buffers_are_reused() {
+        // After a sample, scratch + keep_mask must hold capacity so
+        // subsequent calls don't reallocate. We can only observe this
+        // through `Vec::capacity` — at least non-zero after one call.
+        let mut s = Sampler::new(SamplingParams {
+            temperature: 1.0,
+            top_k: Some(3),
+            top_p: Some(0.9),
+            min_p: None,
+            seed: Some(5),
+        });
+        let mut l = vec![1.0_f32, 2.0, 3.0, 4.0, 5.0];
+        let _ = s.sample(&mut l);
+        assert!(s.scratch.capacity() >= 5);
+        assert!(s.keep_mask.capacity() >= 5);
     }
 }
