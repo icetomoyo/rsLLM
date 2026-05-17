@@ -1,35 +1,24 @@
-//! rsLLM command-line interface.
+//! `rsllm` binary entry point.
 //!
-//! v0.0.1 — workspace skeleton only. The real subcommands (`chat` / `run` /
-//! `info`) are tracked as FEATURE_008 and will be implemented as the other
-//! v0.1.0 features land.
+//! Argument parsing, sub-command dispatch, and the REPL launcher live
+//! here. The actual decode loop is gated on F008.C (Engine / Session
+//! integration); today the inference paths return a clear "not yet
+//! implemented" error so the rest of the CLI surface (info / inspect
+//! / parse / REPL editing / slash commands) is independently
+//! testable and shippable.
 
-use clap::{Parser, Subcommand};
+use std::io::IsTerminal;
+use std::process::ExitCode;
 
-/// rsLLM — Rust-native LLM inference engine.
-#[derive(Debug, Parser)]
-#[command(name = "rsllm", version, about, long_about = None)]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Command>,
-}
+use clap::Parser;
+use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 
-/// Top-level subcommands.
-///
-/// All variants are stubs in v0.0.1 — they print a "not yet implemented"
-/// message and exit. Stubs are kept so that downstream tooling, shell
-/// completions, and documentation can be wired up early.
-#[derive(Debug, Subcommand)]
-enum Command {
-    /// Print system capabilities (OS, CPU features, available backends).
-    Info,
-    /// Run a one-shot inference against a model.
-    Run,
-    /// Open an interactive chat REPL.
-    Chat,
-}
+use rsllm_cli::cli::{Cli, Command, RunFlags};
+use rsllm_cli::repl::{ReplState, parse_command};
+use rsllm_cli::{CliError, dump, info, inspect};
 
-fn main() {
+fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -39,31 +28,165 @@ fn main() {
 
     let cli = Cli::parse();
 
-    match cli.command {
-        None => print_banner(),
-        Some(Command::Info) => {
-            println!("rsLLM info (stub)");
-            println!("  Library version : {}", rsllm_core::version());
-            println!("  Target os       : {}", std::env::consts::OS);
-            println!("  Target arch     : {}", std::env::consts::ARCH);
-            println!();
-            println!("Real capability detection arrives with FEATURE_008.");
-        }
-        Some(Command::Run | Command::Chat) => {
-            eprintln!(
-                "rsLLM v{} — this subcommand is not yet implemented.",
-                rsllm_core::version()
-            );
-            eprintln!("See docs/features/v0.1.0.md for the M0 roadmap.");
-            std::process::exit(2);
+    match dispatch(cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("rsllm: {e}");
+            ExitCode::from(2)
         }
     }
 }
 
+fn dispatch(cli: Cli) -> Result<(), CliError> {
+    match cli.command {
+        Some(Command::Info(args)) => info::run(args.model.as_deref(), args.ctx_size),
+        Some(Command::Inspect(args)) => inspect::run(&args.model),
+        None => dispatch_default(cli.run),
+    }
+}
+
+/// No subcommand: pick between one-shot inference, REPL, or the
+/// fallback banner. Mirrors ds4's "default = REPL" behavior.
+fn dispatch_default(run: RunFlags) -> Result<(), CliError> {
+    // 1. Explicit one-shot prompt (`-p TEXT` / `--prompt-file FILE`)
+    if let Some(text) = run.prompt.clone() {
+        return one_shot(&run, text);
+    }
+    if let Some(path) = run.prompt_file.clone() {
+        let text = std::fs::read_to_string(&path)?;
+        return one_shot(&run, text);
+    }
+
+    // 2. REPL — only if stdin is a tty AND we have something to run
+    //    against. Without a model, the REPL would just print errors
+    //    so we shortcut to the banner instead.
+    if !std::io::stdin().is_terminal() {
+        print_banner();
+        return Ok(());
+    }
+    if run.model.is_none() {
+        eprintln!(
+            "rsLLM v{} — no model supplied; not entering REPL.",
+            rsllm_core::version()
+        );
+        eprintln!("Try `rsllm -m PATH` (F008.C will wire the full decode loop),");
+        eprintln!("or `rsllm info` / `rsllm inspect -m PATH` for read-only inspection.");
+        print_banner();
+        return Ok(());
+    }
+    run_repl(run)
+}
+
+/// One-shot mode: parse args, then bail with `NotImplemented` until
+/// F008.C lands the decode loop. We still validate the dump-logprobs
+/// path so a user-facing typo is caught immediately.
+fn one_shot(run: &RunFlags, prompt: String) -> Result<(), CliError> {
+    if run.model.is_none() {
+        return Err(CliError::ModelRequired(
+            "one-shot mode (`-p`) needs `-m PATH`".into(),
+        ));
+    }
+    // Validate `--dump-logprobs` early — opening the file now means
+    // a permission error fires before we burn time loading the model.
+    if let Some(path) = &run.dump_logprobs {
+        let _ = dump::LogprobDumper::create(path, run.logprobs_top_k.max(1))?;
+    }
+    eprintln!(
+        "rsllm one-shot (prompt={} chars, think={}, ctx={}, dump_tokens={}, seed={:?})",
+        prompt.len(),
+        run.think.label(),
+        run.ctx_size,
+        run.dump_tokens,
+        run.seed,
+    );
+    Err(CliError::NotImplemented(
+        "decode loop lands in F008.C — CLI surface ready, Engine wiring pending",
+    ))
+}
+
+/// REPL loop. Uses `rustyline` for line editing + history. The decode
+/// path is stubbed exactly like `one_shot` — slash commands work
+/// today, model invocations land with F008.C.
+fn run_repl(run: RunFlags) -> Result<(), CliError> {
+    let mut state = ReplState::new(run.think, run.ctx_size);
+    let mut rl = DefaultEditor::new()
+        .map_err(|e| CliError::Io(std::io::Error::other(format!("rustyline init: {e}"))))?;
+
+    // Load history if present — file path mirrors ds4's `~/.ds4_history`
+    // convention (rsLLM uses its own name to avoid collisions).
+    let hist_path = history_path();
+    if let Some(p) = &hist_path {
+        let _ = rl.load_history(p);
+    }
+
+    println!("rsLLM v{}", rsllm_core::version());
+    println!("type /help for command list, /quit to exit.");
+
+    loop {
+        let prompt = format!("[{}]> ", state.think_mode.label());
+        let line = match rl.readline(&prompt) {
+            Ok(s) => s,
+            Err(ReadlineError::Interrupted) => {
+                eprintln!("^C — type /quit to exit");
+                continue;
+            }
+            Err(ReadlineError::Eof) => {
+                println!("bye.");
+                break;
+            }
+            Err(e) => {
+                return Err(CliError::Io(std::io::Error::other(format!(
+                    "readline: {e}"
+                ))));
+            }
+        };
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let _ = rl.add_history_entry(trimmed);
+
+        match parse_command(trimmed)? {
+            Some(cmd) => {
+                let outcome = state.apply(cmd);
+                if !outcome.message.is_empty() {
+                    println!("{}", outcome.message);
+                }
+                if outcome.exit {
+                    break;
+                }
+            }
+            None => {
+                // Regular user message — decode lands in F008.C. We
+                // surface the same `NotImplemented` as one-shot so
+                // future telemetry can grep one string.
+                eprintln!(
+                    "rsllm: {}",
+                    CliError::NotImplemented(
+                        "decode loop lands in F008.C — slash commands work today"
+                    )
+                );
+            }
+        }
+    }
+
+    if let Some(p) = &hist_path {
+        let _ = rl.save_history(p);
+    }
+    Ok(())
+}
+
 fn print_banner() {
     println!("rsLLM v{}", rsllm_core::version());
-    println!("Status: pre-M0 (workspace skeleton only)");
-    println!();
-    println!("Try `rsllm info` for system info, or see docs/00-overview.md for the project plan.");
-    println!("Issue tracker: https://github.com/icetomoyo/rsLLM");
+    println!("Try `rsllm info` for system info, or `rsllm inspect -m MODEL` for a GGUF summary.");
+    println!("Full decode loop lands with F008.C; see docs/features/v0.1.0.md.");
+}
+
+/// `~/.rsllm_history` — the convention ds4 follows for its REPL
+/// history, namespaced to avoid collisions.
+fn history_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(std::path::PathBuf::from(home).join(".rsllm_history"))
 }

@@ -200,8 +200,8 @@
 - Medium: 5
 - Low: 3
 
-**Next Release (v0.1.0)**: 9 features（F001 ✅, F002 ✅, F003 ✅, F004 ✅, F005 ✅, F006 ✅, F007 ✅, F008 Planned, F025 Planned）
-**Next to Start**: **F008**（CLI：linenoise REPL + 斜杠命令 + `inspect/info/dump`；附数值对齐 — attn_compressor / attn_indexer LoRA 接入）
+**Next Release (v0.1.0)**: 9 features（F001 ✅, F002 ✅, F003 ✅, F004 ✅, F005 ✅, F006 ✅, F007 ✅, F008.A ✅ / F008.B-C Planned, F025 Planned）
+**Next to Start**: **F008.B**（数值对齐 — attn_compressor / attn_indexer LoRA 接入；dsv4-vectors 重放）然后 **F008.C**（Engine/Session + decode loop） → **F025**（Metal）
 
 ## 2026-05-14 重定位调整记录
 

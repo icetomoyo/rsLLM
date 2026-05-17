@@ -15,8 +15,18 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[lib]
+name = "rsllm_cli"
+path = "src/lib.rs"
+
 [dependencies]
 rsllm-core = { workspace = true }
+rsllm-gguf = { workspace = true }
+rsllm-models = { workspace = true }
 clap = { workspace = true }
+rustyline = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
