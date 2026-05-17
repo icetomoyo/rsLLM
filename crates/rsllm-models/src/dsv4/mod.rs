@@ -11,6 +11,7 @@
 //!
 //! Ported by reference from `ds4.c` (MIT, The ds4.c authors).
 
+pub mod attention;
 pub mod hc;
 pub mod mla;
 pub mod moe;

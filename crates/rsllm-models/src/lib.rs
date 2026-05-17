@@ -50,6 +50,11 @@ pub enum Error {
     /// An underlying GGUF parse / dequant error bubbled up.
     #[error("gguf error: {0}")]
     Gguf(#[from] rsllm_gguf::Error),
+
+    /// A KV-cache operation failed (shape mismatch, full pool, etc.).
+    /// Raised by the F006 three-tier attention adapter.
+    #[error("kv-cache error: {0}")]
+    KvCache(#[from] rsllm_kvcache::Error),
 }
 
 #[cfg(test)]

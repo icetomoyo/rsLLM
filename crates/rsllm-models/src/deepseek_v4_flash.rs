@@ -221,11 +221,13 @@ impl<'a> DeepSeekV4Flash<'a> {
     }
 }
 
-/// Pluggable attention callback. v0.1.0 supplies a no-op stub for
-/// shape validation; the real implementation lands in F006/F007 when
-/// the three-tier KV cache is ready. The signature is intentionally
-/// generic across layers so a single closure can carry both prefill
-/// and decode state.
+/// Pluggable attention callback. [`crate::dsv4::attention::ThreeTierAttention`]
+/// (F006) is the v0.1.0 production implementation — wrap it in a
+/// `&mut |q, kv, il, out| attn.run_layer(q, kv, il, out)` closure to
+/// satisfy this type. The full numerical-parity attention with
+/// compressed-pool + indexer read-back lands in F008.
+/// The signature is intentionally generic across layers so a single
+/// closure can carry both prefill and decode state.
 ///
 /// Inputs:
 /// - `q`: `[n_tok × N_HEAD × HEAD_DIM]` RoPE'd query latent.

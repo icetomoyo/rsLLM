@@ -133,7 +133,7 @@
 - **Category**: New
 - **Priority**: Critical
 - **Version**: v0.1.0
-- **Status**: Planned
+- **Status**: ✅ Completed（SWA + compressed + indexer + ThreeTierAttention 适配器；compressed-pool / indexer 数值读回留待 F008）
 - **Description**: 复刻 ds4 三级 KV：Raw SWA ring（128 token）+ compressed pool（ratio-2/4 池化）+ ratio-4 sparse indexer（top-512）。CPU 路径用 f32，Metal 路径用 FP8 E4M3
 - **Design**: [v0.1.0.md#feature_006](features/v0.1.0.md#feature_006-三级-kv-cache)
 
@@ -200,8 +200,8 @@
 - Medium: 5
 - Low: 3
 
-**Next Release (v0.1.0)**: 9 features（F001 ✅, F002 ✅, F003 ✅, F004 ✅, F005 ✅, F006-F008 Planned, F025 Planned）
-**Next to Start**: **F006**（三级 KV cache：SWA ring + compressed pool + ratio-4 indexer）
+**Next Release (v0.1.0)**: 9 features（F001 ✅, F002 ✅, F003 ✅, F004 ✅, F005 ✅, F006 ✅, F007-F008 Planned, F025 Planned）
+**Next to Start**: **F007**（采样器：greedy / temperature / top-k / top-p / min-p 链式过滤器 + min-p=0.05 默认）
 
 ## 2026-05-14 重定位调整记录
 
