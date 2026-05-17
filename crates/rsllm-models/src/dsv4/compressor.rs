@@ -24,6 +24,17 @@ use super::shape::{DSV4_HEAD_DIM, DSV4_N_EMBD, DSV4_N_INDEXER_HEAD, DSV4_N_INDEX
 use super::weight::{WeightBlob, matmul_weight_f32};
 use crate::Error;
 
+/// Multiply `a * b` and surface a `ShapeMismatch` on overflow.
+/// Pattern established in F007 review fixes; applied here so a
+/// caller-supplied `n_tok` cannot wrap and bypass the shape checks.
+fn checked_mul_or_err(a: usize, b: usize, tag: &'static str) -> Result<usize, Error> {
+    a.checked_mul(b).ok_or(Error::ShapeMismatch {
+        key: tag,
+        expected: format!("{a} * {b} (overflow)"),
+        actual: "n/a".to_string(),
+    })
+}
+
 /// Per-layer weights for the compressed-KV scoring path. Present on
 /// every layer with `compress_ratio > 0` (i.e. all but the first
 /// two dense layers, per
@@ -90,17 +101,19 @@ pub fn project_compressor_score(
     n_tok: usize,
     tier: SimdTier,
 ) -> Result<(), Error> {
-    if x.len() != n_tok * DSV4_N_EMBD {
+    let in_total = checked_mul_or_err(n_tok, DSV4_N_EMBD, "compressor.x")?;
+    let out_total = checked_mul_or_err(n_tok, DSV4_HEAD_DIM, "compressor.out")?;
+    if x.len() != in_total {
         return Err(Error::ShapeMismatch {
             key: "compressor.x",
-            expected: format!("{}", n_tok * DSV4_N_EMBD),
+            expected: format!("{in_total}"),
             actual: format!("{}", x.len()),
         });
     }
-    if out.len() != n_tok * DSV4_HEAD_DIM {
+    if out.len() != out_total {
         return Err(Error::ShapeMismatch {
             key: "compressor.out",
-            expected: format!("{}", n_tok * DSV4_HEAD_DIM),
+            expected: format!("{out_total}"),
             actual: format!("{}", out.len()),
         });
     }
@@ -129,8 +142,9 @@ pub fn project_indexer_write(
     n_tok: usize,
     tier: SimdTier,
 ) -> Result<(), Error> {
-    let expected_in = n_tok * DSV4_N_EMBD;
-    let expected_out = n_tok * DSV4_N_INDEXER_HEAD_DIM;
+    let expected_in = checked_mul_or_err(n_tok, DSV4_N_EMBD, "indexer_write.x")?;
+    let expected_out =
+        checked_mul_or_err(n_tok, DSV4_N_INDEXER_HEAD_DIM, "indexer_write.out")?;
     if x.len() != expected_in {
         return Err(Error::ShapeMismatch {
             key: "indexer_write.x",
@@ -188,17 +202,19 @@ pub fn project_indexer_query(
     tier: SimdTier,
 ) -> Result<(), Error> {
     let q_lanes = DSV4_N_INDEXER_HEAD * DSV4_N_INDEXER_HEAD_DIM;
-    if x.len() != n_tok * DSV4_N_EMBD {
+    let expected_in = checked_mul_or_err(n_tok, DSV4_N_EMBD, "indexer_query.x")?;
+    let expected_q = checked_mul_or_err(n_tok, q_lanes, "indexer_query.q_out")?;
+    if x.len() != expected_in {
         return Err(Error::ShapeMismatch {
             key: "indexer_query.x",
-            expected: format!("{}", n_tok * DSV4_N_EMBD),
+            expected: format!("{expected_in}"),
             actual: format!("{}", x.len()),
         });
     }
-    if q_out.len() != n_tok * q_lanes {
+    if q_out.len() != expected_q {
         return Err(Error::ShapeMismatch {
             key: "indexer_query.q_out",
-            expected: format!("{}", n_tok * q_lanes),
+            expected: format!("{expected_q}"),
             actual: format!("{}", q_out.len()),
         });
     }
@@ -335,6 +351,91 @@ mod tests {
         // Lane 5 of the output should carry the input value because
         // truncating_weight is identity on the first `out_dim` rows.
         assert!((q_out[5] - 3.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn compressor_threads_multiple_tokens() {
+        // Exercises the per-token row stride — a 1-token test would
+        // pass even if the matmul forgot to advance the output row.
+        let w = truncating_weight(DSV4_HEAD_DIM, DSV4_N_EMBD);
+        let weights = CompressorWeights {
+            attn_compressor: WeightBlob::F32(&w),
+        };
+        let mut x = vec![0.0_f32; 3 * DSV4_N_EMBD];
+        // Token t puts (t+1)*10 at lane t.
+        for t in 0..3 {
+            x[t * DSV4_N_EMBD + t] = ((t as f32) + 1.0) * 10.0;
+        }
+        let mut out = vec![0.0_f32; 3 * DSV4_HEAD_DIM];
+        project_compressor_score(&weights, &x, &mut out, 3, SimdTier::Scalar).unwrap();
+        for t in 0..3 {
+            let v = out[t * DSV4_HEAD_DIM + t];
+            assert!(
+                (v - ((t as f32) + 1.0) * 10.0).abs() < 1e-5,
+                "token {t} lane {t} = {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn indexer_query_per_head_stride_is_correct() {
+        // Sanity-pin the per-head stride convention F008.C relies on:
+        // head h's Q vector lives at `q_out[h * N_INDEXER_HEAD_DIM ..]`.
+        // truncating_weight wraps after `in_dim = N_EMBD`, so rows
+        // 0..4096 are identity-on-x and rows >= 4096 wrap. We set
+        // lane 0 of x; lanes 0 of every head row should pick it up.
+        let q_lanes = DSV4_N_INDEXER_HEAD * DSV4_N_INDEXER_HEAD_DIM;
+        let w_q = truncating_weight(q_lanes, DSV4_N_EMBD);
+        let head_weights = vec![1.0_f32; DSV4_N_INDEXER_HEAD];
+        let weights = IndexerReadWeights {
+            attn_indexer_q: WeightBlob::F32(&w_q),
+            attn_indexer_head_weight: &head_weights,
+        };
+        let mut x = vec![0.0_f32; DSV4_N_EMBD];
+        x[0] = 11.0;
+        let mut q_out = vec![0.0_f32; q_lanes];
+        project_indexer_query(&weights, &x, &mut q_out, 1, SimdTier::Scalar).unwrap();
+        // Head 0 lane 0 = lane 0 of x = 11.0.
+        assert!((q_out[0] - 11.0).abs() < 1e-5);
+        // Head 1 lane 0 lives at q_out[128]; truncating_weight has a
+        // 1.0 at row=128, col=128 — but x[128] = 0.0. So q_out[128] = 0.
+        assert!(q_out[DSV4_N_INDEXER_HEAD_DIM].abs() < 1e-5);
+    }
+
+    #[test]
+    fn indexer_write_rejects_mismatched_score_out() {
+        // Symmetric of indexer_write_rejects_mismatched_out — verify
+        // the second guard fires even when kv_out is correct.
+        let w = vec![0.0_f32; DSV4_N_INDEXER_HEAD_DIM * DSV4_N_EMBD];
+        let weights = IndexerWriteWeights {
+            attn_indexer_kv: WeightBlob::F32(&w),
+            attn_indexer_kv_score: WeightBlob::F32(&w),
+        };
+        let x = vec![0.0_f32; DSV4_N_EMBD];
+        let mut kv_out = vec![0.0_f32; DSV4_N_INDEXER_HEAD_DIM];
+        let mut score_out = vec![0.0_f32; DSV4_N_INDEXER_HEAD_DIM - 1];
+        let err = project_indexer_write(
+            &weights,
+            &x,
+            &mut kv_out,
+            &mut score_out,
+            1,
+            SimdTier::Scalar,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::ShapeMismatch { key, .. } if key == "indexer_write.score_out"));
+    }
+
+    #[test]
+    fn check_shape_rejects_wrong_byte_len() {
+        // Exercises WeightBlob::check_shape directly — undersized
+        // F32 storage must error out at load time.
+        let w_short = vec![0.0_f32; DSV4_HEAD_DIM * DSV4_N_EMBD - 1];
+        let blob = WeightBlob::F32(&w_short);
+        let err = blob
+            .check_shape(DSV4_HEAD_DIM, DSV4_N_EMBD, "test.compressor")
+            .unwrap_err();
+        assert!(matches!(err, Error::ShapeMismatch { .. }));
     }
 
     #[test]

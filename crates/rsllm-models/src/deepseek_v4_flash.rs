@@ -182,6 +182,46 @@ impl<'a> DsV4Block<'a> {
                 ),
             });
         }
+
+        // Deep shape checks on the LoRA byte storage. Catches a
+        // wrong-sized GGUF tensor at load time instead of at first
+        // matmul (security-review F008.B finding). We only run these
+        // on layers that actually carry the weights — dense layers
+        // already had `compressor.is_none()` enforced above.
+        if let Some(c) = self.compressor.as_ref() {
+            c.attn_compressor.check_shape(
+                DSV4_HEAD_DIM,
+                DSV4_N_EMBD,
+                "block.compressor.attn_compressor",
+            )?;
+        }
+        if let Some(w) = self.indexer_write.as_ref() {
+            w.attn_indexer_kv.check_shape(
+                crate::dsv4::shape::DSV4_N_INDEXER_HEAD_DIM,
+                DSV4_N_EMBD,
+                "block.indexer_write.attn_indexer_kv",
+            )?;
+            w.attn_indexer_kv_score.check_shape(
+                crate::dsv4::shape::DSV4_N_INDEXER_HEAD_DIM,
+                DSV4_N_EMBD,
+                "block.indexer_write.attn_indexer_kv_score",
+            )?;
+        }
+        if let Some(r) = self.indexer_read.as_ref() {
+            r.attn_indexer_q.check_shape(
+                crate::dsv4::shape::DSV4_N_INDEXER_HEAD
+                    * crate::dsv4::shape::DSV4_N_INDEXER_HEAD_DIM,
+                DSV4_N_EMBD,
+                "block.indexer_read.attn_indexer_q",
+            )?;
+            if r.attn_indexer_head_weight.len() != crate::dsv4::shape::DSV4_N_INDEXER_HEAD {
+                return Err(Error::ShapeMismatch {
+                    key: "block.indexer_read.attn_indexer_head_weight",
+                    expected: format!("{}", crate::dsv4::shape::DSV4_N_INDEXER_HEAD),
+                    actual: format!("{}", r.attn_indexer_head_weight.len()),
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -869,6 +909,43 @@ mod tests {
         // half is a usable signal on its own.
         let err = block.validate(2).unwrap_err();
         assert!(matches!(err, Error::ShapeMismatch { key, .. } if key == "block.indexer"));
+    }
+
+    #[test]
+    fn compressor_with_wrong_byte_len_rejected() {
+        // Load-time byte-length check (security-review F008.B fix).
+        // Build a compressed layer (il=3 ratio-128) whose compressor
+        // backing storage is one element short of the expected
+        // HEAD_DIM × N_EMBD.
+        let storage = StubBlockStorage::new();
+        let wrong = vec![0.0_f32; DSV4_HEAD_DIM * DSV4_N_EMBD - 1];
+        let mut block = storage.block(3);
+        block.compressor = Some(CompressorWeights {
+            attn_compressor: WeightBlob::F32(&wrong),
+        });
+        let err = block.validate(3).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::ShapeMismatch { key, .. } if key == "block.compressor.attn_compressor"
+        ));
+    }
+
+    #[test]
+    fn indexer_q_with_wrong_byte_len_rejected() {
+        let storage = StubBlockStorage::new();
+        let q_lanes = crate::dsv4::shape::DSV4_N_INDEXER_HEAD
+            * crate::dsv4::shape::DSV4_N_INDEXER_HEAD_DIM;
+        let wrong = vec![0.0_f32; q_lanes * DSV4_N_EMBD - 1];
+        let mut block = storage.block(2);
+        block.indexer_read = Some(IndexerReadWeights {
+            attn_indexer_q: WeightBlob::F32(&wrong),
+            attn_indexer_head_weight: &storage.indexer_head_weight,
+        });
+        let err = block.validate(2).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::ShapeMismatch { key, .. } if key == "block.indexer_read.attn_indexer_q"
+        ));
     }
 
     #[test]

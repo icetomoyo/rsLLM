@@ -48,6 +48,55 @@ impl WeightBlob<'_> {
             Self::Quant { data, .. } => data.len(),
         }
     }
+
+    /// Validate that this blob's backing storage has the exact byte
+    /// length implied by a logical `[out_dim × in_dim]` weight tensor.
+    /// Lets load-time validation refuse a malformed GGUF before the
+    /// first matmul instead of triggering an out-of-range error
+    /// during prefill.
+    ///
+    /// `tag` is included in the `ShapeMismatch` for diagnosability —
+    /// pass the human-readable name of the weight (e.g.
+    /// `"block.compressor.attn_compressor"`).
+    ///
+    /// # Errors
+    /// - [`Error::ShapeMismatch`] if the byte length doesn't match.
+    pub fn check_shape(
+        &self,
+        out_dim: usize,
+        in_dim: usize,
+        tag: &'static str,
+    ) -> Result<(), Error> {
+        let elements = (out_dim as u64).checked_mul(in_dim as u64).ok_or(
+            Error::ShapeMismatch {
+                key: tag,
+                expected: format!("out_dim × in_dim overflowed ({out_dim} × {in_dim})"),
+                actual: "n/a".to_string(),
+            },
+        )?;
+        let expected_bytes = match self {
+            Self::F32(_) => elements.checked_mul(4),
+            Self::Quant { dtype, .. } => dtype.byte_size(elements),
+        };
+        let expected = match expected_bytes {
+            Some(b) => b as usize,
+            None => {
+                return Err(Error::ShapeMismatch {
+                    key: tag,
+                    expected: "expected byte size overflowed u64".to_string(),
+                    actual: format!("{}", self.byte_len()),
+                });
+            }
+        };
+        if self.byte_len() != expected {
+            return Err(Error::ShapeMismatch {
+                key: tag,
+                expected: format!("{expected} bytes"),
+                actual: format!("{} bytes", self.byte_len()),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Compute `out[t, o] = sum_i W[o, i] * x[t, i]` for any supported
