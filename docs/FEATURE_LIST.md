@@ -142,7 +142,7 @@
 - **Category**: New
 - **Priority**: High
 - **Version**: v0.1.0
-- **Status**: Planned
+- **Status**: ✅ Completed（temp → top-k → top-p → min-p → multinomial 链 + xoshiro256\*\* 确定性 PRNG；min-p=0.05 默认。think_mode prompt 前缀留待 F008 CLI）
 - **Description**: greedy / temperature / top-k / top-p / min-p（链式过滤器，端口 `ds4.c:14183-14386`）+ think_mode 触发的 prompt 前缀注入（实际拼装在 F003/F008）
 - **Design**: [v0.1.0.md#feature_007](features/v0.1.0.md#feature_007-采样器)
 
@@ -200,8 +200,8 @@
 - Medium: 5
 - Low: 3
 
-**Next Release (v0.1.0)**: 9 features（F001 ✅, F002 ✅, F003 ✅, F004 ✅, F005 ✅, F006 ✅, F007-F008 Planned, F025 Planned）
-**Next to Start**: **F007**（采样器：greedy / temperature / top-k / top-p / min-p 链式过滤器 + min-p=0.05 默认）
+**Next Release (v0.1.0)**: 9 features（F001 ✅, F002 ✅, F003 ✅, F004 ✅, F005 ✅, F006 ✅, F007 ✅, F008 Planned, F025 Planned）
+**Next to Start**: **F008**（CLI：linenoise REPL + 斜杠命令 + `inspect/info/dump`；附数值对齐 — attn_compressor / attn_indexer LoRA 接入）
 
 ## 2026-05-14 重定位调整记录
 
