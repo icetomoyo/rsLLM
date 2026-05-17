@@ -262,6 +262,35 @@ mod tests {
     }
 
     #[test]
+    fn truncate_to_recent_zero_empties_ring() {
+        let mut r = RawSwaRing::new(5, 2);
+        for s in 0..4 {
+            r.append(&mk_row(s as f32, 2)).unwrap();
+        }
+        r.truncate_to_recent(0);
+        assert_eq!(r.len(), 0);
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn truncate_after_shift_preserves_chronological_order() {
+        // Fill past capacity to trigger the memmove-shift, then
+        // truncate — the kept rows must remain newest-last.
+        let mut r = RawSwaRing::new(3, 1);
+        for s in 0..5 {
+            r.append(&mk_row(s as f32, 1)).unwrap();
+        }
+        // Ring should hold rows {2, 3, 4} after wrapping.
+        assert_eq!(r.row(0).unwrap()[0], 2.0);
+        assert_eq!(r.row(2).unwrap()[0], 4.0);
+        r.truncate_to_recent(2);
+        // Tail = {3, 4}, in order.
+        assert_eq!(r.len(), 2);
+        assert_eq!(r.row(0).unwrap()[0], 3.0);
+        assert_eq!(r.row(1).unwrap()[0], 4.0);
+    }
+
+    #[test]
     fn rows_slice_matches_individual_row_borrows() {
         let mut r = RawSwaRing::new(3, 4);
         for s in 0..3 {

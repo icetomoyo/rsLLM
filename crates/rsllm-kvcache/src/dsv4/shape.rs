@@ -107,12 +107,12 @@ mod tests {
     }
 
     #[test]
-    fn ratio_4_layer_count_matches_ds4_estimate() {
-        // F006 mem estimate: ~14 of 43 layers are ratio-4
-        // (layers 2,4,6,...,42 = 21 even layers ≥ 2; ds4 has different math but our doc said 14).
-        // Verify the actual count.
+    fn ratio_4_layer_count_matches_ds4() {
+        // ds4's `ds4_layer_compress_ratio` (`ds4.c:411-416`): dense for
+        // il<2, then even→4, odd→128. With N_LAYER=43 the even-and-≥2
+        // count is 21 (layers 2, 4, 6, …, 42), which is also the
+        // number of layers that maintain a ratio-4 indexer.
         let ratio4 = (0..DSV4_N_LAYER).filter(|&i| layer_compress_ratio(i) == 4).count();
-        // Layers 2, 4, 6, ..., 42 → 21 even layers
         assert_eq!(ratio4, 21);
     }
 

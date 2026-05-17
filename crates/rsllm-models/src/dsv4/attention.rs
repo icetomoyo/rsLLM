@@ -100,17 +100,24 @@ impl<'cache> ThreeTierAttention<'cache> {
         }
         let n_tok = kv.len() / head_dim;
         let q_stride = n_head * head_dim;
-        if q.len() != n_tok * q_stride {
+        // Use checked_mul so a maliciously large `n_tok` (derived from
+        // `kv.len() / head_dim`) cannot wrap and bypass the shape check.
+        let expected_q = n_tok.checked_mul(q_stride).ok_or(Error::ShapeMismatch {
+            key: "ThreeTierAttention::run_layer.q",
+            expected: format!("n_tok * q_stride (overflow with n_tok={n_tok})"),
+            actual: format!("{}", q.len()),
+        })?;
+        if q.len() != expected_q {
             return Err(Error::ShapeMismatch {
                 key: "ThreeTierAttention::run_layer.q",
-                expected: format!("{}", n_tok * q_stride),
+                expected: format!("{expected_q}"),
                 actual: format!("{}", q.len()),
             });
         }
-        if attn_out.len() != n_tok * q_stride {
+        if attn_out.len() != expected_q {
             return Err(Error::ShapeMismatch {
                 key: "ThreeTierAttention::run_layer.attn_out",
-                expected: format!("{}", n_tok * q_stride),
+                expected: format!("{expected_q}"),
                 actual: format!("{}", attn_out.len()),
             });
         }
@@ -182,6 +189,23 @@ impl<'cache> ThreeTierAttention<'cache> {
                     logits.push(l);
                 }
 
+                // Weighted-sum target. Zero before either the NaN
+                // fallback or the real softmax mass flows in.
+                let out_h = &mut attn_out
+                    [t * q_stride + h * head_dim..t * q_stride + (h + 1) * head_dim];
+                for o in out_h.iter_mut() {
+                    *o = 0.0;
+                }
+
+                // Guard against non-finite max_logit (all-NaN or all
+                // negative-infinity inputs). Mirrors the equivalent
+                // guard in `CompressedKvPool::per_dim_softmax_aggregate`
+                // so a NaN in upstream weights does not silently
+                // propagate to model logits.
+                if !max_logit.is_finite() {
+                    continue;
+                }
+
                 // Softmax (numerically stable).
                 let mut denom = 0.0_f32;
                 for l in logits.iter_mut() {
@@ -191,11 +215,6 @@ impl<'cache> ThreeTierAttention<'cache> {
                 let inv_denom = 1.0_f32 / denom;
 
                 // Weighted sum into attn_out.
-                let out_h = &mut attn_out
-                    [t * q_stride + h * head_dim..t * q_stride + (h + 1) * head_dim];
-                for o in out_h.iter_mut() {
-                    *o = 0.0;
-                }
                 for (k, &logit) in logits.iter().enumerate() {
                     let k_row = layer.swa.row(k)?;
                     let w = logit * inv_denom;
@@ -275,6 +294,20 @@ mod tests {
         // First token of 4-cycle: no compressed-pool emission yet.
         assert_eq!(cache.layers[2].compressed.as_ref().unwrap().len(), 0);
         assert_eq!(cache.layers[2].indexer.as_ref().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn run_layer_zeros_output_on_nan_inputs() {
+        // NaN-laced Q would normally produce NaN logits → NaN softmax →
+        // silent NaN propagation. The guard should zero the output
+        // instead so the upstream pipeline can detect bad inputs.
+        let mut cache = ThreeTierKvCache::new(8);
+        let mut attn = ThreeTierAttention::new(&mut cache);
+        let q = vec![f32::NAN; DSV4_N_HEAD * DSV4_HEAD_DIM];
+        let kv = make_kv(1, 1.0);
+        let mut out = vec![123.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
+        attn.run_layer(&q, &kv, 0, &mut out).unwrap();
+        assert!(out.iter().all(|v| *v == 0.0), "expected all zeros, got {:?}", &out[..4]);
     }
 
     #[test]

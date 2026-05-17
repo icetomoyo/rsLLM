@@ -41,16 +41,33 @@ pub struct LayerCache {
     pub indexer: Option<IndexerPool>,
 }
 
+/// Hard upper bound on `ctx_size`. Anything larger would imply
+/// per-layer allocations in the multi-GiB range and is rejected
+/// at construction time. Picked at 1 M tokens — comfortably above
+/// any v0.1.0 use case, comfortably below the multiplicative
+/// overflow threshold for `ctx_size * head_dim * f32_size`.
+pub const DSV4_KVC_MAX_CTX_SIZE: usize = 1 << 20;
+
 impl LayerCache {
     /// Allocate cache state for layer `il`. `ctx_size` is the maximum
     /// supported context length; the compressed-pool capacity is
     /// derived from it (`ctx_size / ratio + 2`, matching ds4's sizing
     /// at `ds4.c:6128`).
+    ///
+    /// # Panics
+    /// Panics if `il >= DSV4_N_LAYER`, `ctx_size == 0`, or
+    /// `ctx_size > DSV4_KVC_MAX_CTX_SIZE`. Callers that need a
+    /// fallible interface should validate up front.
     #[must_use]
     pub fn new(il: usize, ctx_size: usize) -> Self {
-        assert!(il < DSV4_N_LAYER);
+        assert!(il < DSV4_N_LAYER, "layer index {il} >= DSV4_N_LAYER {DSV4_N_LAYER}");
+        assert!(ctx_size > 0, "ctx_size must be > 0");
+        assert!(
+            ctx_size <= DSV4_KVC_MAX_CTX_SIZE,
+            "ctx_size {ctx_size} exceeds DSV4_KVC_MAX_CTX_SIZE = {DSV4_KVC_MAX_CTX_SIZE}",
+        );
         let ratio = layer_compress_ratio(il);
-        let swa = RawSwaRing::new(DSV4_N_SWA.min(ctx_size.max(1)), DSV4_HEAD_DIM);
+        let swa = RawSwaRing::new(DSV4_N_SWA.min(ctx_size), DSV4_HEAD_DIM);
         let compressed = if ratio == 0 {
             None
         } else {
@@ -124,6 +141,10 @@ pub struct ThreeTierKvCache {
 
 impl ThreeTierKvCache {
     /// Allocate a cache sized for `ctx_size` tokens.
+    ///
+    /// # Panics
+    /// Panics if `ctx_size == 0` or `ctx_size > DSV4_KVC_MAX_CTX_SIZE`
+    /// (see [`LayerCache::new`]).
     #[must_use]
     pub fn new(ctx_size: usize) -> Self {
         let layers = (0..DSV4_N_LAYER).map(|il| LayerCache::new(il, ctx_size)).collect();
@@ -412,5 +433,17 @@ mod tests {
         cache.clear();
         assert_eq!(cache.current_pos(), 0);
         assert_eq!(cache.layers[0].swa.len(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "ctx_size must be > 0")]
+    fn ctx_size_zero_panics() {
+        let _ = ThreeTierKvCache::new(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds DSV4_KVC_MAX_CTX_SIZE")]
+    fn ctx_size_above_cap_panics() {
+        let _ = ThreeTierKvCache::new(DSV4_KVC_MAX_CTX_SIZE + 1);
     }
 }
