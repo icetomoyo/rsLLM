@@ -320,22 +320,26 @@ impl<'a> DeepSeekV4Flash<'a> {
 }
 
 /// Pluggable attention callback. [`crate::dsv4::attention::ThreeTierAttention`]
-/// (F006) is the v0.1.0 production implementation — wrap it in a
-/// `&mut |q, kv, il, out| attn.run_layer(q, kv, il, out)` closure to
-/// satisfy this type. The full numerical-parity attention with
-/// compressed-pool + indexer read-back lands in F008.
+/// (F006 + F008) is the v0.1.0 production implementation — wrap it in
+/// a `&mut |q, kv, x, il, out| attn.run_layer(q, kv, x, il, out)`
+/// closure to satisfy this type.
+///
 /// The signature is intentionally generic across layers so a single
 /// closure can carry both prefill and decode state.
 ///
 /// Inputs:
 /// - `q`: `[n_tok × N_HEAD × HEAD_DIM]` RoPE'd query latent.
 /// - `kv`: `[n_tok × HEAD_DIM]` RoPE'd KV latent (1-head, MLA).
+/// - `x`: `[n_tok × N_EMBD]` the post-RMSNorm hidden state. The
+///   attention adapter re-projects this through the per-layer
+///   `attn_compressor` / `attn_indexer_*` LoRAs to produce the per-dim
+///   compression score and the indexer KV+score (F008.B weight types).
 /// - `layer_idx`: 0-based block index, 0..N_LAYER.
 ///
 /// Output:
 /// - `attn_out`: `[n_tok × N_HEAD × HEAD_DIM]` (pre output-projection).
 pub type AttentionFn<'f> =
-    &'f mut dyn FnMut(&[f32], &[f32], usize, &mut [f32]) -> Result<(), Error>;
+    &'f mut dyn FnMut(&[f32], &[f32], &[f32], usize, &mut [f32]) -> Result<(), Error>;
 
 /// Reusable per-forward scratch. Held by the caller so we don't
 /// re-allocate large activation buffers between tokens.
@@ -451,7 +455,13 @@ pub fn forward_block(
             tier,
         )?;
     }
-    attention(&scratch.q, &scratch.kv, layer_idx, &mut scratch.attn_raw)?;
+    attention(
+        &scratch.q,
+        &scratch.kv,
+        &scratch.normed,
+        layer_idx,
+        &mut scratch.attn_raw,
+    )?;
     // Output projection (two-stage grouped LoRA, ds4.c:4960-4962):
     //   attn_raw  [n_tok × N_HEAD * HEAD_DIM = n_tok × 32768]
     //     │

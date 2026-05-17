@@ -64,6 +64,12 @@ impl<'cache> ThreeTierAttention<'cache> {
     /// Inputs (matches [`crate::AttentionFn`]):
     ///   - `q`: `[n_tok × DSV4_N_HEAD × DSV4_HEAD_DIM]` (RoPE'd query).
     ///   - `kv`: `[n_tok × DSV4_HEAD_DIM]` (1-head MLA KV latent).
+    ///   - `x`: `[n_tok × DSV4_N_EMBD]` post-RMSNorm hidden state.
+    ///     Currently ignored — F008.C.2 will use it to call the
+    ///     per-layer `attn_compressor` / `attn_indexer_*` LoRAs and
+    ///     replace the zero-placeholder compress/indexer scores. The
+    ///     signature is locked in now so the AttentionFn ABI is
+    ///     stable across F008.C.1 → F008.C.2.
     ///   - `layer_idx`: 0-based block index.
     ///   - `attn_out`: `[n_tok × DSV4_N_HEAD × DSV4_HEAD_DIM]` (write-only).
     ///
@@ -80,6 +86,7 @@ impl<'cache> ThreeTierAttention<'cache> {
         &mut self,
         q: &[f32],
         kv: &[f32],
+        x: &[f32],
         layer_idx: usize,
         attn_out: &mut [f32],
     ) -> Result<(), Error> {
@@ -99,6 +106,22 @@ impl<'cache> ThreeTierAttention<'cache> {
             });
         }
         let n_tok = kv.len() / head_dim;
+        // Validate the residual stream's length now that we accept it
+        // — F008.C.2 will read it during LoRA projection.
+        let expected_x = n_tok
+            .checked_mul(crate::dsv4::shape::DSV4_N_EMBD)
+            .ok_or(Error::ShapeMismatch {
+                key: "ThreeTierAttention::run_layer.x",
+                expected: format!("n_tok × N_EMBD (overflow with n_tok={n_tok})"),
+                actual: format!("{}", x.len()),
+            })?;
+        if x.len() != expected_x {
+            return Err(Error::ShapeMismatch {
+                key: "ThreeTierAttention::run_layer.x",
+                expected: format!("{expected_x}"),
+                actual: format!("{}", x.len()),
+            });
+        }
         let q_stride = n_head * head_dim;
         // Use checked_mul so a maliciously large `n_tok` (derived from
         // `kv.len() / head_dim`) cannot wrap and bypass the shape check.
@@ -243,6 +266,9 @@ mod tests {
     fn make_kv(n_tok: usize, fill: f32) -> Vec<f32> {
         vec![fill; n_tok * DSV4_HEAD_DIM]
     }
+    fn make_x(n_tok: usize) -> Vec<f32> {
+        vec![0.0_f32; n_tok * crate::dsv4::shape::DSV4_N_EMBD]
+    }
 
     #[test]
     fn run_layer_writes_attn_out_for_dense_layer() {
@@ -251,7 +277,7 @@ mod tests {
         let q = make_q(1, 0.0);
         let kv = make_kv(1, 1.0);
         let mut out = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
-        attn.run_layer(&q, &kv, 0, &mut out).unwrap();
+        attn.run_layer(&q, &kv, &make_x(kv.len() / DSV4_HEAD_DIM), 0, &mut out).unwrap();
         // With Q=0 and 1 cached KV row of all-ones, softmax gives w=1.0
         // and weighted sum = the KV row itself (all ones).
         assert!(out.iter().all(|&v| (v - 1.0).abs() < 1e-6));
@@ -269,7 +295,7 @@ mod tests {
         }
         let q = make_q(2, 0.0); // uniform → softmax averages keys
         let mut out = vec![0.0_f32; 2 * DSV4_N_HEAD * DSV4_HEAD_DIM];
-        attn.run_layer(&q, &kv, 0, &mut out).unwrap();
+        attn.run_layer(&q, &kv, &make_x(kv.len() / DSV4_HEAD_DIM), 0, &mut out).unwrap();
         // Token 0 attends only to itself (value 1.0).
         for &v in out.iter().take(DSV4_HEAD_DIM) {
             assert!((v - 1.0).abs() < 1e-5);
@@ -289,7 +315,7 @@ mod tests {
         let kv = make_kv(1, 0.1);
         let mut out = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
         // Layer 2 is ratio-4 with an indexer.
-        attn.run_layer(&q, &kv, 2, &mut out).unwrap();
+        attn.run_layer(&q, &kv, &make_x(1), 2, &mut out).unwrap();
         assert_eq!(cache.layers[2].swa.len(), 1);
         // First token of 4-cycle: no compressed-pool emission yet.
         assert_eq!(cache.layers[2].compressed.as_ref().unwrap().len(), 0);
@@ -306,7 +332,7 @@ mod tests {
         let q = vec![f32::NAN; DSV4_N_HEAD * DSV4_HEAD_DIM];
         let kv = make_kv(1, 1.0);
         let mut out = vec![123.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
-        attn.run_layer(&q, &kv, 0, &mut out).unwrap();
+        attn.run_layer(&q, &kv, &make_x(kv.len() / DSV4_HEAD_DIM), 0, &mut out).unwrap();
         assert!(out.iter().all(|v| *v == 0.0), "expected all zeros, got {:?}", &out[..4]);
     }
 
@@ -317,10 +343,27 @@ mod tests {
         let q = make_q(1, 0.0);
         let kv = make_kv(1, 0.0);
         let mut out = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
-        let err = attn.run_layer(&q, &kv, DSV4_N_LAYER, &mut out).unwrap_err();
+        let err = attn.run_layer(&q, &kv, &make_x(1), DSV4_N_LAYER, &mut out).unwrap_err();
         assert!(matches!(
             err,
             Error::KvCache(rsllm_kvcache::Error::InvalidLayer { .. })
+        ));
+    }
+
+    #[test]
+    fn run_layer_rejects_x_length_mismatch() {
+        // F008.C.1 adds the residual-stream length check; a mismatched
+        // x must fire before the LoRA projections in F008.C.2.
+        let mut cache = ThreeTierKvCache::new(32);
+        let mut attn = ThreeTierAttention::new(&mut cache);
+        let q = make_q(1, 0.0);
+        let kv = make_kv(1, 0.0);
+        let bad_x = vec![0.0_f32; crate::dsv4::shape::DSV4_N_EMBD + 1];
+        let mut out = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
+        let err = attn.run_layer(&q, &kv, &bad_x, 0, &mut out).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::ShapeMismatch { key, .. } if key == "ThreeTierAttention::run_layer.x"
         ));
     }
 
@@ -331,7 +374,7 @@ mod tests {
         let q = make_q(1, 0.0);
         let bad_kv = vec![0.0_f32; DSV4_HEAD_DIM - 1];
         let mut out = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
-        let err = attn.run_layer(&q, &bad_kv, 0, &mut out).unwrap_err();
+        let err = attn.run_layer(&q, &bad_kv, &make_x(0), 0, &mut out).unwrap_err();
         assert!(matches!(err, Error::ShapeMismatch { .. }));
     }
 
@@ -345,11 +388,15 @@ mod tests {
         let kv = make_kv(1, 1.0);
         let mut out = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
 
-        let mut closure = |q: &[f32], kv: &[f32], il: usize, o: &mut [f32]| -> Result<(), Error> {
-            attn.run_layer(q, kv, il, o)
-        };
+        let mut closure = |q: &[f32],
+                           kv: &[f32],
+                           x: &[f32],
+                           il: usize,
+                           o: &mut [f32]|
+         -> Result<(), Error> { attn.run_layer(q, kv, x, il, o) };
         let attn_fn: crate::AttentionFn<'_> = &mut closure;
-        attn_fn(&q, &kv, 0, &mut out).unwrap();
+        let x = make_x(1);
+        attn_fn(&q, &kv, &x, 0, &mut out).unwrap();
         assert!(out.iter().all(|&v| (v - 1.0).abs() < 1e-6));
     }
 }
