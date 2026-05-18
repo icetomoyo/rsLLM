@@ -264,7 +264,8 @@ fn reinterpret_as_i32<'a>(bytes: &'a [u8], name: &str) -> Result<&'a [i32], Erro
     Ok(slice)
 }
 
-/// Resolve an I32-typed tensor (GGUF type `I32 = 24`) to a `&[i32]`.
+/// Resolve an I32-typed tensor (GGUF type `I32 = 26`, per
+/// `rsllm-gguf::GgmlType`) to a `&[i32]`.
 ///
 /// # Errors
 /// - [`Error::MissingTensor`] if the name is absent.
@@ -493,16 +494,14 @@ pub fn load_router<'a>(
     let gate_inp = resolve_blob(gguf, &tensor_names::blk(il, tensor_names::FFN_GATE_INP))?;
     gate_inp.check_shape(DSV4_N_EXPERT, DSV4_N_EMBD, "loader.router.gate_inp")?;
     // Optional gate bias `[N_EXPERT]`. Most checkpoints ship it.
-    let gate_bias = match resolve_blob_opt(
-        gguf,
-        &tensor_names::blk(il, tensor_names::FFN_EXP_PROBS_B),
-    )? {
+    let gate_bias_name = tensor_names::blk(il, tensor_names::FFN_EXP_PROBS_B);
+    let gate_bias = match resolve_blob_opt(gguf, &gate_bias_name)? {
         Some(WeightBlob::F32(s)) => {
             if s.len() != DSV4_N_EXPERT {
                 return Err(Error::ShapeMismatch {
                     key: "loader.router.gate_bias",
                     expected: format!("{DSV4_N_EXPERT}"),
-                    actual: format!("{}", s.len()),
+                    actual: format!("{gate_bias_name}: {}", s.len()),
                 });
             }
             Some(s)
@@ -511,7 +510,7 @@ pub fn load_router<'a>(
             return Err(Error::ShapeMismatch {
                 key: "loader.router.gate_bias",
                 expected: "F32".into(),
-                actual: "quantised".into(),
+                actual: format!("{gate_bias_name}: quantised"),
             });
         }
         None => None,
@@ -525,7 +524,7 @@ pub fn load_router<'a>(
             return Err(Error::ShapeMismatch {
                 key: "loader.router.tid2eid",
                 expected: format!("{expected}"),
-                actual: format!("{}", tid2eid.len()),
+                actual: format!("{tid2eid_name}: {}", tid2eid.len()),
             });
         }
         Ok((
@@ -636,6 +635,16 @@ pub fn load_block<'a>(gguf: &'a GgufFile, il: usize) -> Result<DsV4Block<'a>, Er
 /// per-layer tensor, and constructs a [`DeepSeekV4Flash`] borrowing
 /// the GGUF mmap for its weight views.
 ///
+/// ## Caveat: HC scales are placeholders
+///
+/// Until ds4 upstream confirms the per-layer HC `[pre, post, comb]`
+/// scale metadata keys (TODO(ds4)), every loaded [`HcOpWeights`]
+/// carries `scale: [1.0, 1.0, 1.0]`. Forward passes will still run,
+/// but the Sinkhorn merge weights will be numerically off vs ds4 —
+/// a clear `tracing::warn!` is emitted once on every load so any
+/// numerical-parity test sees the placeholder situation in its
+/// trace output.
+///
 /// # Errors
 /// - [`Error::MissingMetadata`] / [`Error::ShapeMismatch`] for any
 ///   GGUF metadata key that disagrees with the DS V4 Flash spec.
@@ -646,6 +655,15 @@ pub fn load_block<'a>(gguf: &'a GgufFile, il: usize) -> Result<DsV4Block<'a>, Er
 pub fn load_dsv4_flash(gguf: &GgufFile) -> Result<DeepSeekV4Flash<'_>, Error> {
     // 1. Metadata sanity. Catches arch / shape constant drift early.
     validate_metadata(gguf.metadata())?;
+
+    // HC scale placeholder advisory. Emitted at WARN so any caller
+    // running numerics under tracing sees it loudly.
+    tracing::warn!(
+        target: "rsllm_models::dsv4::loader",
+        "HC scales are placeholders [1.0, 1.0, 1.0] — TODO(ds4): wire \
+         per-layer scale metadata once upstream keys are confirmed. \
+         Forward outputs will diverge from ds4 by the Sinkhorn merge."
+    );
 
     // 2. Global tensors.
     let embed_tokens = resolve_blob(gguf, tensor_names::TOKEN_EMBD)?;
@@ -660,6 +678,13 @@ pub fn load_dsv4_flash(gguf: &GgufFile) -> Result<DeepSeekV4Flash<'_>, Error> {
     }
     // `output.weight` is optional — falls back to the tied
     // `token_embd.weight` matrix when the LM head shares parameters.
+    //
+    // Note: `WeightBlob` is `Copy` (it holds only a slice reference +
+    // `GgmlType` enum), so the `None => embed_tokens` arm copies
+    // rather than moves. Both `embed_tokens` and `lm_head` then alias
+    // the same mmap region — that's exactly what tied-weight semantics
+    // demand. The final `DeepSeekV4Flash::new(embed_tokens, ..., lm_head)`
+    // call is therefore well-formed despite the apparent move.
     let lm_head = match resolve_blob_opt(gguf, tensor_names::OUTPUT)? {
         Some(blob) => {
             blob.check_shape(DSV4_N_VOCAB, DSV4_N_EMBD, "loader.lm_head")?;
@@ -685,23 +710,40 @@ pub fn architecture_name(meta: &Metadata) -> Option<&str> {
     meta.get_str("general.architecture")
 }
 
-/// Report the dimensions of all expected MLA weights so a caller
-/// can summarise which tensors were located vs missing without
-/// actually building a model. Used by `rsllm inspect` to surface
-/// the per-layer regime distribution.
+/// Count of expected GGUF tensors for layer `il`. Used by
+/// `rsllm inspect` to surface the per-layer regime distribution
+/// — not load-bearing for any test.
+///
+/// Baseline (every layer):
+///   attn_norm                         1
+///   MLA: q_a, q_a_norm, q_b, kv_a, kv_a_norm   5
+///   attn_sinks                        1
+///   attn_output_a, attn_output_b      2
+///   HC: 4 ops × 2 tensors each (.weight + .base)   8
+///   ffn_norm                          1
+///   MoE routed: gate_exps, up_exps, down_exps      3
+///   shared expert: gate, up, down     3
+///   router: gate_inp                  1
+///                                    --
+///                                    25
+///
+/// Plus per-regime additions:
+///   compressed (ratio > 0): +1 (attn_compressor)
+///   ratio-4 only:           +4 (attn_indexer_{kv, kv_score, q, head_weight})
+///   hash-routed (il<3):     +1 (tid2eid)
+///   gate_bias (when shipped): +1 (optional, not counted here)
 #[must_use]
 pub fn expected_layer_tensor_count(il: usize) -> usize {
-    // 8 baseline (norm, q_a, q_a_norm, q_b, kv_a, kv_a_norm, sinks,
-    // output_a, output_b) — that's 9. Plus 4 HC. Plus 4 MoE
-    // (gate/up/down + shared triplet + router gate_inp + tid2eid
-    // when hash). Numeric value isn't load-bearing for any test —
-    // it's an informational helper.
-    let mut count = 9 + 4 + 7 + 1; // mla(7)+sinks(1)+out(2)+hc(4)+ffn_norm(1)+moe(6)+router(1) ≈ 21
+    // Baseline = 1+5+1+2+8+1+3+3+1 = 25.
+    let mut count = 25;
     if layer_compress_ratio(il) > 0 {
         count += 1; // compressor
     }
     if layer_has_indexer(il) {
         count += 4; // indexer kv/score/q/head_w
+    }
+    if il < DSV4_HASH_ROUTE_LAYERS {
+        count += 1; // tid2eid
     }
     count
 }
@@ -1030,14 +1072,60 @@ mod tests {
     }
 
     #[test]
+    fn load_router_tid2eid_wrong_length_carries_layer_index() {
+        // Build a tid2eid that's correctly-typed (I32) but has the
+        // wrong row count. load_router's explicit length check should
+        // fire AND the error should mention "blk.1.ffn_hash_tid2eid".
+        let bad = vec![0i32; DSV4_N_EXPERT_USED * DSV4_N_VOCAB - 1];
+        let mut payload = Vec::with_capacity(bad.len() * 4);
+        for v in &bad {
+            payload.extend_from_slice(&v.to_le_bytes());
+        }
+        // The gate_inp also needs to exist before load_router gets to
+        // tid2eid (the function resolves gate_inp first). Build a
+        // correctly-shaped F32 gate_inp.
+        let gate_inp_bytes = vec![0u8; DSV4_N_EXPERT * DSV4_N_EMBD * 4];
+        let bytes = build_gguf(
+            &[],
+            &[
+                (
+                    "blk.1.ffn_gate_inp.weight",
+                    GgmlType::F32 as u32,
+                    vec![DSV4_N_EMBD as u64, DSV4_N_EXPERT as u64],
+                    gate_inp_bytes,
+                ),
+                (
+                    "blk.1.ffn_hash_tid2eid",
+                    GgmlType::I32 as u32,
+                    vec![bad.len() as u64],
+                    payload,
+                ),
+            ],
+        );
+        let file = GgufFile::from_bytes(bytes).unwrap();
+        let err = load_router(&file, 1).unwrap_err();
+        match err {
+            Error::ShapeMismatch { key, actual, .. } => {
+                assert_eq!(key, "loader.router.tid2eid");
+                assert!(
+                    actual.contains("blk.1.ffn_hash_tid2eid"),
+                    "expected layer index in error, got {actual}"
+                );
+            }
+            other => panic!("expected ShapeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn expected_layer_tensor_count_grows_with_regime() {
-        // Dense layer: baseline count.
-        let dense = expected_layer_tensor_count(0);
-        // Ratio-128 layer: baseline + 1 (compressor).
-        let r128 = expected_layer_tensor_count(3);
-        // Ratio-4 layer: baseline + 1 (compressor) + 4 (indexer).
-        let r4 = expected_layer_tensor_count(2);
-        assert_eq!(r128, dense + 1);
-        assert_eq!(r4, dense + 5);
+        // Reference table: baseline = 25 per the function's doc.
+        //   il=0: dense + hash router      → 25 +  0 + 1 = 26
+        //   il=2: ratio-4 + hash router    → 25 +  5 + 1 = 31
+        //   il=3: ratio-128 + topk router  → 25 +  1 + 0 = 26
+        //   il=4: ratio-4 + topk router    → 25 +  5 + 0 = 30
+        assert_eq!(expected_layer_tensor_count(0), 26);
+        assert_eq!(expected_layer_tensor_count(2), 31);
+        assert_eq!(expected_layer_tensor_count(3), 26);
+        assert_eq!(expected_layer_tensor_count(4), 30);
     }
 }
