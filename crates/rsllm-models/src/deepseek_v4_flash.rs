@@ -251,10 +251,34 @@ pub struct DeepSeekV4Flash<'a> {
     pub embed_tokens: WeightBlob<'a>,
     /// 43 transformer blocks.
     pub blocks: Vec<DsV4Block<'a>>,
+    /// Output-head HC merge weights — collapse the 4 residual streams
+    /// back into a single `[N_EMBD]` vector before the final RMSNorm
+    /// and LM-head projection (ds4.c:7916-7944 `output_hc_head_one`).
+    pub output_hc: OutputHcWeights<'a>,
     /// Final RMSNorm scale `[N_EMBD]`.
     pub output_norm: &'a [f32],
     /// LM head `[N_VOCAB × N_EMBD]` (often the embedding tied weight).
     pub lm_head: WeightBlob<'a>,
+}
+
+/// Top-level HC head weights — used once at the end of the model to
+/// reduce `[N_HC × N_EMBD]` residual streams to a single `[N_EMBD]`
+/// vector that feeds the LM head.
+///
+/// Verified against ds4 commit `ef0a490`:
+/// - shapes at `ds4.c:2292-2294`
+/// - loader at `ds4.c:2581-2583`
+/// - algorithm at `ds4.c:7916-7944`
+#[derive(Debug, Clone, Copy)]
+pub struct OutputHcWeights<'a> {
+    /// `[HC_DIM × N_HC]` = `[16384 × 4]` F16. Projects the flat+normed
+    /// residual to per-stream gate logits.
+    pub mix_fn: WeightBlob<'a>,
+    /// `[1]` F32 scalar applied to all gate logits before
+    /// the sigmoid: `w[i] = sigmoid(pre[i] * scale[0] + base[i]) + eps`.
+    pub scale: &'a [f32],
+    /// `[N_HC]` F32 bias added to the gate logits.
+    pub base: &'a [f32],
 }
 
 impl<'a> DeepSeekV4Flash<'a> {
@@ -271,6 +295,7 @@ impl<'a> DeepSeekV4Flash<'a> {
     pub fn new(
         embed_tokens: WeightBlob<'a>,
         blocks: Vec<DsV4Block<'a>>,
+        output_hc: OutputHcWeights<'a>,
         output_norm: &'a [f32],
         lm_head: WeightBlob<'a>,
     ) -> Result<Self, Error> {
@@ -315,9 +340,31 @@ impl<'a> DeepSeekV4Flash<'a> {
                 });
             }
         }
+        // Validate output_hc bundle shapes — these are tiny (a few
+        // dozen elements aside from mix_fn) so the check is cheap and
+        // catches a malformed GGUF before the first forward pass.
+        let hc_dim = crate::dsv4::hc::HC_DIM;
+        output_hc
+            .mix_fn
+            .check_shape(N_HC, hc_dim, "model.output_hc.mix_fn")?;
+        if output_hc.scale.len() != 1 {
+            return Err(Error::ShapeMismatch {
+                key: "model.output_hc.scale",
+                expected: "1".to_string(),
+                actual: format!("{}", output_hc.scale.len()),
+            });
+        }
+        if output_hc.base.len() != N_HC {
+            return Err(Error::ShapeMismatch {
+                key: "model.output_hc.base",
+                expected: format!("{N_HC}"),
+                actual: format!("{}", output_hc.base.len()),
+            });
+        }
         Ok(Self {
             embed_tokens,
             blocks,
+            output_hc,
             output_norm,
             lm_head,
         })
@@ -1014,6 +1061,29 @@ mod tests {
         ));
     }
 
+    /// Build a minimal `OutputHcWeights` for tests. mix_fn is sized
+    /// for the F16 [HC_DIM × N_HC] tensor (`16384 × 4 × 2 bytes`).
+    fn stub_output_hc<'a>(
+        oh_fn_bytes: &'a [u8],
+        oh_scale: &'a [f32],
+        oh_base: &'a [f32],
+    ) -> OutputHcWeights<'a> {
+        OutputHcWeights {
+            mix_fn: WeightBlob::Quant {
+                data: oh_fn_bytes,
+                dtype: rsllm_gguf::GgmlType::F16,
+            },
+            scale: oh_scale,
+            base: oh_base,
+        }
+    }
+
+    fn stub_output_hc_storage() -> (Vec<u8>, Vec<f32>, Vec<f32>) {
+        let hc_dim = crate::dsv4::hc::HC_DIM;
+        // F16 = 2 bytes/element
+        (vec![0u8; hc_dim * N_HC * 2], vec![1.0_f32; 1], vec![0.0_f32; N_HC])
+    }
+
     #[test]
     fn model_requires_all_n_layer_blocks() {
         let storage = StubBlockStorage::new();
@@ -1021,12 +1091,15 @@ mod tests {
         let lm_head_bytes: Vec<u8> = vec![];
         let embed_bytes: Vec<u8> = vec![];
         let norm = vec![1.0_f32; DSV4_N_EMBD];
+        let (oh_fn, oh_scale, oh_base) = stub_output_hc_storage();
+        let oh = stub_output_hc(&oh_fn, &oh_scale, &oh_base);
         let err = DeepSeekV4Flash::new(
             WeightBlob::Quant {
                 data: &embed_bytes,
                 dtype: rsllm_gguf::GgmlType::F16,
             },
             blocks,
+            oh,
             &norm,
             WeightBlob::Quant {
                 data: &lm_head_bytes,
@@ -1044,12 +1117,15 @@ mod tests {
         let blocks: Vec<_> = (0..DSV4_N_LAYER).map(|i| storage.block(i)).collect();
         let norm = vec![1.0_f32; DSV4_N_EMBD];
         let bytes: Vec<u8> = vec![];
+        let (oh_fn, oh_scale, oh_base) = stub_output_hc_storage();
+        let oh = stub_output_hc(&oh_fn, &oh_scale, &oh_base);
         let err = DeepSeekV4Flash::new(
             WeightBlob::Quant {
                 data: &bytes,
                 dtype: rsllm_gguf::GgmlType::F16,
             },
             blocks,
+            oh,
             &norm,
             WeightBlob::Quant {
                 data: &bytes,
@@ -1069,12 +1145,15 @@ mod tests {
         let blocks: Vec<_> = (0..DSV4_N_LAYER).map(|i| storage.block(i)).collect();
         let norm = vec![1.0_f32; 10]; // wrong
         let bytes: Vec<u8> = vec![];
+        let (oh_fn, oh_scale, oh_base) = stub_output_hc_storage();
+        let oh = stub_output_hc(&oh_fn, &oh_scale, &oh_base);
         let err = DeepSeekV4Flash::new(
             WeightBlob::Quant {
                 data: &bytes,
                 dtype: rsllm_gguf::GgmlType::F16,
             },
             blocks,
+            oh,
             &norm,
             WeightBlob::Quant {
                 data: &bytes,

@@ -59,6 +59,11 @@ pub mod tensor_names {
     /// — the loader falls back to TOKEN_EMBD if OUTPUT is absent.
     pub const OUTPUT: &str = "output.weight";
 
+    /// Output-head HC merge tensors (verified ds4.c:2581-2583, 2292-2294).
+    pub const OUTPUT_HC_FN: &str = "output_hc_fn.weight";
+    pub const OUTPUT_HC_SCALE: &str = "output_hc_scale.weight";
+    pub const OUTPUT_HC_BASE: &str = "output_hc_base.weight";
+
     // --- Per-layer suffixes (formatted as `blk.{N}.{SUFFIX}`). ---
 
     /// Pre-attention RMSNorm.
@@ -746,10 +751,23 @@ pub fn load_dsv4_flash(gguf: &GgufFile) -> Result<DeepSeekV4Flash<'_>, Error> {
         }
         None => (embed_tokens, true),
     };
+
+    // Output-head HC merge tensors. Shapes are enforced inside
+    // `DeepSeekV4Flash::new`; this resolve step turns
+    // MissingTensor into a clear blk-less error message.
+    let oh_fn = resolve_blob(gguf, tensor_names::OUTPUT_HC_FN)?;
+    let oh_scale = resolve_f32_slice(gguf, tensor_names::OUTPUT_HC_SCALE)?;
+    let oh_base = resolve_f32_slice(gguf, tensor_names::OUTPUT_HC_BASE)?;
+    let output_hc = crate::deepseek_v4_flash::OutputHcWeights {
+        mix_fn: oh_fn,
+        scale: oh_scale,
+        base: oh_base,
+    };
+
     tracing::info!(
         target: "rsllm_models::dsv4::loader",
         tied_lm_head,
-        "global tensors loaded (token_embd, output_norm, lm_head)",
+        "global tensors loaded (token_embd, output_norm, lm_head, output_hc)",
     );
 
     // 3. Per-layer blocks. Per-block DEBUG events are reasonable
@@ -783,7 +801,7 @@ pub fn load_dsv4_flash(gguf: &GgufFile) -> Result<DeepSeekV4Flash<'_>, Error> {
         }
     }
 
-    let model = DeepSeekV4Flash::new(embed_tokens, blocks, output_norm, lm_head)?;
+    let model = DeepSeekV4Flash::new(embed_tokens, blocks, output_hc, output_norm, lm_head)?;
     tracing::info!(
         target: "rsllm_models::dsv4::loader",
         elapsed_ms = started.elapsed().as_millis() as u64,

@@ -228,18 +228,25 @@ impl<'engine, 'gguf: 'engine> DsV4FlashSession<'engine, 'gguf> {
         // Advance the cache's logical position cursor once per pass.
         self.cache.advance_pos(n_tok);
 
-        // Extract the last-token hidden state from `scratch.streams`.
-        //
-        // TODO(ds4): the final HC merge convention is unverified
-        // against ds4 upstream. The placeholder reads stream 0 of
-        // the last token; F008.C.3.e replay against dsv4-vectors will
-        // expose this if it's wrong (top-1 token mismatch). The
-        // structural pipeline is correct independent of the choice.
+        // Final HC merge: reduce the last token's `[N_HC × N_EMBD]`
+        // residual streams to a single `[N_EMBD]` vector via the
+        // learned output_hc gate (ds4.c:7916-7944). Mirrors
+        // `output_hc_head_one` exactly; replaces the F008.C.3.d
+        // stream-0 placeholder that was algorithmically wrong.
         let last_tok = n_tok - 1;
-        let stream0_off = last_tok * rsllm_backend_cpu::ops::sinkhorn::N_HC * DSV4_N_EMBD;
-        out_last_hidden.copy_from_slice(
-            &self.scratch.streams[stream0_off..stream0_off + DSV4_N_EMBD],
-        );
+        let hc_dim = crate::dsv4::hc::HC_DIM;
+        let stream_off = last_tok * hc_dim;
+        let last_inp_hc = &self.scratch.streams[stream_off..stream_off + hc_dim];
+        let oh = &self.engine.model.output_hc;
+        crate::dsv4::hc::output_hc_collapse(
+            last_inp_hc,
+            out_last_hidden,
+            &oh.mix_fn,
+            oh.scale,
+            oh.base,
+            tier,
+        )
+        .map_err(map_model_err)?;
         Ok(())
     }
 }

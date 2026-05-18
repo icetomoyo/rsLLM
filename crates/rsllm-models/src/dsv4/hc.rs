@@ -319,6 +319,102 @@ pub fn hc_post(
     Ok(())
 }
 
+/// Output-side HC head collapse: reduce one token's `[N_HC × N_EMBD]`
+/// residual streams to a single `[N_EMBD]` vector, ready for the
+/// final RMSNorm + LM head projection.
+///
+/// Ported from `ds4.c:7916-7944` (`output_hc_head_one`):
+///
+/// ```text
+/// flat = rms_norm_no_weight(inp_hc)             # [HC_DIM]
+/// pre  = matvec_f16(output_hc_fn, flat)         # [N_HC]
+/// w[i] = sigmoid(pre[i] * scale[0] + base[i]) + eps   # [N_HC]
+/// out  = Σ_h w[h] * inp_hc[h, :]                 # [N_EMBD]
+/// ```
+///
+/// `inp_hc` is `[N_HC × N_EMBD]` for one token; `out` is `[N_EMBD]`.
+/// `mix_fn` must be `[HC_DIM × N_HC]` (caller-validated).
+///
+/// # Errors
+/// [`Error::ShapeMismatch`] if any slice length disagrees.
+pub fn output_hc_collapse(
+    inp_hc: &[f32],
+    out: &mut [f32],
+    mix_fn: &WeightBlob<'_>,
+    scale: &[f32],
+    base: &[f32],
+    tier: SimdTier,
+) -> Result<(), Error> {
+    if inp_hc.len() != HC_DIM {
+        return Err(Error::ShapeMismatch {
+            key: "output_hc_collapse.inp_hc",
+            expected: format!("{HC_DIM}"),
+            actual: format!("{}", inp_hc.len()),
+        });
+    }
+    if out.len() != DSV4_N_EMBD {
+        return Err(Error::ShapeMismatch {
+            key: "output_hc_collapse.out",
+            expected: format!("{DSV4_N_EMBD}"),
+            actual: format!("{}", out.len()),
+        });
+    }
+    if scale.len() != 1 {
+        return Err(Error::ShapeMismatch {
+            key: "output_hc_collapse.scale",
+            expected: "1".to_string(),
+            actual: format!("{}", scale.len()),
+        });
+    }
+    if base.len() != N_HC {
+        return Err(Error::ShapeMismatch {
+            key: "output_hc_collapse.base",
+            expected: format!("{N_HC}"),
+            actual: format!("{}", base.len()),
+        });
+    }
+
+    // Flatten + RMS-norm-no-weight (matches ds4.c:7930).
+    let mut flat = vec![0.0_f32; HC_DIM];
+    rms_norm_no_weight_into(inp_hc, &mut flat, HC_SINKHORN_EPS);
+
+    // Project: pre = mix_fn @ flat, shape [HC_DIM × N_HC] @ [HC_DIM] → [N_HC].
+    let mut pre = vec![0.0_f32; N_HC];
+    matmul_weight_f32(&mut pre, mix_fn, &flat, 1, HC_DIM, N_HC, tier)?;
+
+    // Per-stream sigmoid gate.
+    let s = scale[0];
+    let mut w = [0.0_f32; N_HC];
+    for (i, w_i) in w.iter_mut().enumerate() {
+        let z = pre[i] * s + base[i];
+        *w_i = sigmoid(z) + HC_SINKHORN_EPS;
+    }
+
+    // Weighted sum across streams. ds4's hc_weighted_sum_one
+    // (ds4.c:4267-4280) takes per-stream weights and the per-stream
+    // residual; same shape as our hc_pre's pre-region weighted_sum.
+    for d in 0..DSV4_N_EMBD {
+        let mut acc = 0.0_f32;
+        for (h, &wh) in w.iter().enumerate() {
+            acc += wh * inp_hc[h * DSV4_N_EMBD + d];
+        }
+        out[d] = acc;
+    }
+    Ok(())
+}
+
+/// Numerically stable sigmoid (mirrors `ds4.c:4885` `sigmoid_stable`).
+#[inline]
+fn sigmoid(x: f32) -> f32 {
+    if x >= 0.0 {
+        let e = (-x).exp();
+        1.0 / (1.0 + e)
+    } else {
+        let e = x.exp();
+        e / (1.0 + e)
+    }
+}
+
 /// In-place RMS-norm-no-weight: `dst[i] = src[i] / sqrt(mean(src²) +
 /// eps)`. Mirrors ds4's `rms_norm_no_weight` (used at `ds4.c:4301`).
 ///
@@ -498,6 +594,58 @@ mod tests {
                 "expected merged ≈ 5.0, got {v}"
             );
         }
+    }
+
+    #[test]
+    fn output_hc_collapse_zero_weights_yields_half_sigmoid_mix() {
+        // With mix_fn = 0, scale[0] = 0, base = 0: pre = 0, w[h] =
+        // sigmoid(0) + eps ≈ 0.5 for every stream. So
+        //   out[d] = Σ_h 0.5 * inp_hc[h, d] = 0.5 * Σ_h inp_hc[h, d].
+        //
+        // Set inp_hc[h, :] = (h + 1) * 1.0; then Σ_h(h+1) = 1+2+3+4 = 10.
+        // out[d] should be ≈ 0.5 * 10 = 5.0 for every d.
+        let mut inp_hc = vec![0.0_f32; HC_DIM];
+        for h in 0..N_HC {
+            for d in 0..DSV4_N_EMBD {
+                inp_hc[h * DSV4_N_EMBD + d] = (h + 1) as f32;
+            }
+        }
+        let mix_storage = vec![0.0_f32; HC_DIM * N_HC];
+        let scale = [0.0_f32];
+        let base = vec![0.0_f32; N_HC];
+        let mut out = vec![0.0_f32; DSV4_N_EMBD];
+        output_hc_collapse(
+            &inp_hc,
+            &mut out,
+            &WeightBlob::F32(&mix_storage),
+            &scale,
+            &base,
+            SimdTier::Scalar,
+        )
+        .unwrap();
+        for &v in out.iter().take(16) {
+            assert!(
+                (v - 5.0).abs() < 0.05,
+                "expected ≈ 5.0, got {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn output_hc_collapse_rejects_wrong_shapes() {
+        let bad_inp = vec![0.0_f32; HC_DIM - 1];
+        let mut out = vec![0.0_f32; DSV4_N_EMBD];
+        let mix = vec![0.0_f32; HC_DIM * N_HC];
+        let err = output_hc_collapse(
+            &bad_inp,
+            &mut out,
+            &WeightBlob::F32(&mix),
+            &[0.0_f32],
+            &[0.0_f32; N_HC],
+            SimdTier::Scalar,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::ShapeMismatch { .. }));
     }
 
     #[test]
