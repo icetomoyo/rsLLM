@@ -87,11 +87,12 @@ const EMPTY_LORAS: &[LayerLoRAs<'static>] = &[];
 impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
     /// Construct an adapter around the given cache. Without LoRA
     /// weights — falls back to F006's zero-placeholder behavior.
+    ///
+    /// `EMPTY_LORAS` is `&'static [...]`, which coerces to any
+    /// `&'lora [...]` automatically (Rust's reborrow / variance
+    /// rules); no explicit lifetime bound needed.
     #[must_use]
-    pub fn new(cache: &'cache mut ThreeTierKvCache) -> Self
-    where
-        'static: 'lora,
-    {
+    pub fn new(cache: &'cache mut ThreeTierKvCache) -> Self {
         Self {
             cache,
             loras: EMPTY_LORAS,
@@ -238,8 +239,16 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
 
         // Project compressor / indexer signals from `x` if we have
         // the weights. Otherwise fall back to per-token zero rows.
-        // Buffer policy: re-size on demand and reuse across calls so
-        // a sustained decode loop doesn't reallocate.
+        //
+        // Buffer policy: `resize` only zeroes *newly grown* capacity,
+        // so reused tail bytes from a larger prior call could leak in.
+        // Safe because:
+        // (a) the LoRA `Some` branch is overwrite — `matmul_weight_f32`
+        //     writes every `[t × out_dim..(t+1) × out_dim]` slot.
+        // (b) the `None` branch explicitly zeroes the full live slice
+        //     before the cache append reads from it.
+        // (c) all subsequent slices are `[0 .. n_tok × out_dim]`, so
+        //     stale capacity past the live region is never read.
         if compress_ratio > 0 {
             self.scratch_compress_score.resize(n_tok * head_dim, 0.0);
             if let Some(c) = layer_loras.compressor {
@@ -627,6 +636,100 @@ mod tests {
             err,
             Error::ShapeMismatch { key, .. } if key == "ThreeTierAttention.loras.len"
         ));
+    }
+
+    #[test]
+    fn loras_path_writes_real_indexer_score_into_pool() {
+        // Mirror of the compressor test, but exercises the indexer
+        // write side. With a non-zero `attn_indexer_kv` weight, the
+        // 4-token boundary emission on a ratio-4 layer must produce
+        // a non-zero row inside the indexer's compressed pool.
+        let n_embd = crate::dsv4::shape::DSV4_N_EMBD;
+        // Compressor: zero (path is exercised but inert).
+        let comp_w = vec![0.0_f32; DSV4_HEAD_DIM * n_embd];
+        let compressor = CompressorWeights {
+            attn_compressor: crate::dsv4::weight::WeightBlob::F32(&comp_w),
+        };
+        // Indexer write: identity on the first INDEXER_HEAD_DIM lanes
+        // of x; non-zero score so the softmax-aggregate is non-trivial.
+        let mut idx_kv_w = vec![0.0_f32; DSV4_N_INDEXER_HEAD_DIM * n_embd];
+        for o in 0..DSV4_N_INDEXER_HEAD_DIM {
+            idx_kv_w[o * n_embd + o] = 1.0;
+        }
+        let mut idx_score_w = vec![0.0_f32; DSV4_N_INDEXER_HEAD_DIM * n_embd];
+        for o in 0..DSV4_N_INDEXER_HEAD_DIM {
+            idx_score_w[o * n_embd + o] = 0.5;
+        }
+        let q_lanes = crate::dsv4::shape::DSV4_N_INDEXER_HEAD * DSV4_N_INDEXER_HEAD_DIM;
+        let idx_q_w = vec![0.0_f32; q_lanes * n_embd];
+        let idx_head_w = vec![1.0_f32; crate::dsv4::shape::DSV4_N_INDEXER_HEAD];
+        let indexer_write = IndexerWriteWeights {
+            attn_indexer_kv: crate::dsv4::weight::WeightBlob::F32(&idx_kv_w),
+            attn_indexer_kv_score: crate::dsv4::weight::WeightBlob::F32(&idx_score_w),
+        };
+        let indexer_read = IndexerReadWeights {
+            attn_indexer_q: crate::dsv4::weight::WeightBlob::F32(&idx_q_w),
+            attn_indexer_head_weight: &idx_head_w,
+        };
+
+        let mut loras = vec![LayerLoRAs::default(); DSV4_N_LAYER];
+        for (il, slot) in loras.iter_mut().enumerate() {
+            let ratio = rsllm_kvcache::dsv4::shape::layer_compress_ratio(il);
+            if ratio > 0 {
+                slot.compressor = Some(&compressor);
+            }
+            if rsllm_kvcache::dsv4::shape::layer_has_indexer(il) {
+                slot.indexer_write = Some(&indexer_write);
+                slot.indexer_read = Some(&indexer_read);
+            }
+        }
+
+        let mut cache = ThreeTierKvCache::new(64);
+        {
+            let mut attn = ThreeTierAttention::with_loras(&mut cache, &loras);
+            for t in 0..4 {
+                let q = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
+                let kv = vec![1.0_f32; DSV4_HEAD_DIM];
+                let mut x = vec![0.0_f32; n_embd];
+                // Activate lane 0 for token t so the indexer LoRA
+                // produces non-trivial output.
+                x[0] = (t as f32) + 1.0;
+                let mut out = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
+                attn.run_layer(&q, &kv, &x, 2, &mut out).unwrap();
+            }
+        }
+        // 4 tokens through a ratio-4 indexer → exactly one emission.
+        let indexer_pool = cache.layers[2].indexer.as_ref().unwrap();
+        assert_eq!(indexer_pool.len(), 1);
+        // The emitted row's lane 0 should be non-zero — it is a
+        // softmax-weighted aggregate of {1,2,3,4} with non-trivial
+        // per-dim weights from the LoRA. Bit-exact value depends on
+        // the softmax math; we only assert "produced real signal".
+        let emitted = indexer_pool.rows();
+        // First row's lane 0 — see indexer.rs row layout.
+        let lane0 = emitted[0];
+        assert!(
+            lane0.abs() > 1e-6,
+            "indexer pool row 0 lane 0 = {lane0}, expected non-zero",
+        );
+    }
+
+    #[test]
+    fn with_loras_runs_dense_layer_correctly() {
+        // Dense layer (il=0) has compress_ratio=0 and no indexer, so
+        // neither LoRA path runs. with_loras must still produce the
+        // F006-equivalent dense attention output.
+        let loras = vec![LayerLoRAs::default(); DSV4_N_LAYER];
+        let mut cache = ThreeTierKvCache::new(32);
+        let mut attn = ThreeTierAttention::with_loras(&mut cache, &loras);
+        let q = make_q(1, 0.0);
+        let kv = make_kv(1, 1.0);
+        let x = make_x(1);
+        let mut out = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
+        attn.run_layer(&q, &kv, &x, 0, &mut out).unwrap();
+        // Same expectation as run_layer_writes_attn_out_for_dense_layer:
+        // 1 cached KV row of all-ones, Q=0 → softmax = 1.0 → out = KV.
+        assert!(out.iter().all(|&v| (v - 1.0).abs() < 1e-6));
     }
 
     #[test]
