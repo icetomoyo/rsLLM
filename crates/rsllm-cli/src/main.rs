@@ -111,13 +111,19 @@ fn one_shot(run: &RunFlags, prompt: String) -> Result<(), CliError> {
     // the model load — kept in one place so we don't open + truncate
     // the file twice.
 
+    // Banner: status snapshot only. The seed value is intentionally
+    // masked as `<set>` / `<unset>` so a shared terminal / CI log
+    // doesn't leak the RNG seed (an observer with it + the prompt
+    // can replay the exact token sequence). Users that need to
+    // confirm their --seed value can echo it back through their own
+    // shell.
+    let seed_status = if run.seed.is_some() { "<set>" } else { "<unset>" };
     eprintln!(
-        "rsllm one-shot (prompt={} chars, think={}, ctx={}, dump_tokens={}, seed={:?})",
+        "rsllm one-shot (prompt={} chars, think={}, ctx={}, dump_tokens={}, seed={seed_status})",
         prompt.len(),
         run.think.label(),
         run.ctx_size,
         run.dump_tokens,
-        run.seed,
     );
 
     eng::run_one_shot(model_path, &prompt, None, run)

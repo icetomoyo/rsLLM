@@ -63,7 +63,7 @@ pub fn run_one_shot(
 ) -> Result<(), CliError> {
     let _span = tracing::info_span!(
         target: "rsllm_cli::engine",
-        "one_shot",
+        "cli_one_shot",
         ctx_size = flags.ctx_size,
     )
     .entered();
@@ -107,7 +107,7 @@ pub fn run_one_shot(
     }
     tracing::debug!(
         target: "rsllm_cli::engine",
-        prompt_tokens = tokens.len(),
+        n_prompt = tokens.len(),
         think = ?think,
         "prompt encoded",
     );
@@ -156,12 +156,15 @@ pub fn run_one_shot(
     out.flush().map_err(CliError::Io)?;
 
     let elapsed = decode_started.elapsed();
-    let tok_per_sec = tok_per_sec(decoded, elapsed);
+    let tps = tok_per_sec(decoded, elapsed);
+    // `tok_per_sec` is logged as a raw f64 so a JSON subscriber can
+    // index it as a number; consumers that want fixed-precision
+    // formatting (`{:.2}`) apply it at render time.
     tracing::info!(
         target: "rsllm_cli::engine",
-        decoded,
+        n_decoded = decoded,
         elapsed_ms = elapsed.as_millis() as u64,
-        tok_per_sec = format!("{tok_per_sec:.2}").as_str(),
+        tok_per_sec = tps,
         hit_eos,
         cap_hit = !hit_eos && (decoded as usize) == DEFAULT_MAX_DECODE_TOKENS,
         "generation complete",
@@ -220,7 +223,7 @@ impl<'gguf> CliEngine<'gguf> {
     ) -> Result<(), CliError> {
         let _span = tracing::info_span!(
             target: "rsllm_cli::engine",
-            "repl_turn",
+            "cli_repl_turn",
             position_before = session.position(),
         )
         .entered();
@@ -243,7 +246,7 @@ impl<'gguf> CliEngine<'gguf> {
         }
         tracing::debug!(
             target: "rsllm_cli::engine",
-            prompt_tokens = tokens.len(),
+            n_prompt = tokens.len(),
             think = ?tok_think,
             "turn encoded",
         );
@@ -291,9 +294,9 @@ impl<'gguf> CliEngine<'gguf> {
         let tps = tok_per_sec(decoded, elapsed);
         tracing::info!(
             target: "rsllm_cli::engine",
-            decoded,
+            n_decoded = decoded,
             elapsed_ms = elapsed.as_millis() as u64,
-            tok_per_sec = format!("{tps:.2}").as_str(),
+            tok_per_sec = tps,
             hit_eos,
             cap_hit = !hit_eos && (decoded as usize) == DEFAULT_MAX_DECODE_TOKENS,
             "turn complete",

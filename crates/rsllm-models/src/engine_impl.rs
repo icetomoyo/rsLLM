@@ -262,6 +262,13 @@ impl Session for DsV4FlashSession<'_, '_> {
             });
         }
         if self.position + tokens.len() > self.capacity {
+            tracing::warn!(
+                target: "rsllm_models::engine_impl",
+                filled = self.position,
+                needed = tokens.len(),
+                capacity = self.capacity,
+                "context full — prefill rejected",
+            );
             return Err(EngineError::ContextFull {
                 filled: self.position,
                 capacity: self.capacity,
@@ -326,6 +333,12 @@ impl Session for DsV4FlashSession<'_, '_> {
 
     fn decode_one(&mut self, last_token: u32) -> Result<DecodeStep, EngineError> {
         if self.position >= self.capacity {
+            tracing::warn!(
+                target: "rsllm_models::engine_impl",
+                filled = self.position,
+                capacity = self.capacity,
+                "context full — decode_one rejected",
+            );
             return Err(EngineError::ContextFull {
                 filled: self.position,
                 capacity: self.capacity,

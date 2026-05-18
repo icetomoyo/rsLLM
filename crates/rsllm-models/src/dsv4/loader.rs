@@ -667,8 +667,11 @@ pub fn load_dsv4_flash(gguf: &GgufFile) -> Result<DeepSeekV4Flash<'_>, Error> {
     validate_metadata(gguf.metadata())?;
     tracing::info!(
         target: "rsllm_models::dsv4::loader",
-        "metadata validated: arch=deepseek-v4-flash n_layer={} n_vocab={} n_embd={}",
-        DSV4_N_LAYER, DSV4_N_VOCAB, DSV4_N_EMBD,
+        arch = "deepseek-v4-flash",
+        n_layer = DSV4_N_LAYER,
+        n_vocab = DSV4_N_VOCAB,
+        n_embd = DSV4_N_EMBD,
+        "metadata validated",
     );
 
     // HC scale placeholder advisory. Emitted at WARN so any caller
@@ -709,8 +712,8 @@ pub fn load_dsv4_flash(gguf: &GgufFile) -> Result<DeepSeekV4Flash<'_>, Error> {
     };
     tracing::info!(
         target: "rsllm_models::dsv4::loader",
-        "global tensors loaded: token_embd, output_norm, lm_head ({})",
-        if tied_lm_head { "tied" } else { "separate" },
+        tied_lm_head,
+        "global tensors loaded (token_embd, output_norm, lm_head)",
     );
 
     // 3. Per-layer blocks. Per-block DEBUG events are reasonable
@@ -729,13 +732,17 @@ pub fn load_dsv4_flash(gguf: &GgufFile) -> Result<DeepSeekV4Flash<'_>, Error> {
             has_indexer = layer_has_indexer(il),
             "block loaded",
         );
+        // Integer-division midway. For odd N_LAYER this rounds down
+        // (`43/2 == 21`), so the heartbeat fires after block 21, i.e.
+        // 22/43 — within one block of the true center. Close enough
+        // for a progress signal and the math stays obvious.
         if il == DSV4_N_LAYER / 2 {
             tracing::info!(
                 target: "rsllm_models::dsv4::loader",
-                "midway: {}/{} blocks loaded ({} ms elapsed)",
-                il + 1,
-                DSV4_N_LAYER,
-                started.elapsed().as_millis(),
+                blocks_loaded = il + 1,
+                n_layer = DSV4_N_LAYER,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "midway heartbeat",
             );
         }
     }
