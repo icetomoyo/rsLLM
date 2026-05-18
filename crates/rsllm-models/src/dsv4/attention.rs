@@ -642,13 +642,17 @@ mod tests {
     }
 
     #[test]
-    fn loras_path_writes_real_indexer_score_into_pool() {
+    fn loras_indexer_emits_one_pool_entry_per_four_tokens() {
         // Exercises the indexer path end-to-end with an IndexerWeights
         // bundle supplied via slot.indexer. The indexer algorithm itself
         // is deferred to F011, so the scratch buffers are zero-filled
         // regardless of weight content. The structural guarantee tested
         // here is: 4 tokens on a ratio-4 layer triggers exactly one
         // emission into the indexer compressed pool.
+        //
+        // TODO(F011): once `project_indexer_*` is reinstated, add a
+        // non-zero numeric assertion on the emitted pool row to cover
+        // the wiring boundary between the layer-loop and the kernel.
         let n_embd = crate::dsv4::shape::DSV4_N_EMBD;
         // Compressor: all-zero, inert in this test.
         let comp_kv = vec![0.0_f32; DSV4_HEAD_DIM * n_embd];

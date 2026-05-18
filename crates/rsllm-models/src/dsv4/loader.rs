@@ -7,21 +7,19 @@
 //!
 //! ## Tensor naming
 //!
-//! Names follow llama.cpp's DeepSeek convention plus the F008.B
-//! `attn_compressor` / `attn_indexer` extensions. The full mapping
+//! Names follow ds4 upstream (commit `ef0a490`). The full mapping
 //! lives in [`tensor_names`] as a single source of truth — if ds4
 //! upstream renames anything, this is the only file to patch.
 //!
 //! The well-known names (`token_embd.weight`, `output_norm.weight`,
 //! `blk.N.attn_norm.weight`, the MLA q/kv LoRA family, the MoE
 //! `ffn_*_exps.weight` triplet, etc.) are stable across llama.cpp
-//! forks. The F008.B additions (`attn_compressor.weight`,
-//! `attn_indexer_kv.weight`, `attn_indexer_kv_score.weight`,
-//! `attn_indexer_q.weight`, `attn_indexer_head_weight.weight`)
-//! and the HC / shared-expert / hash-router fields are best-guess
-//! names against ds4 commit `ef0a490` — flagged with `// TODO(ds4)`
-//! comments where a checked-against-source confirmation is still
-//! pending. The structural surface (this loader's interface, error
+//! forks. The compressor block (`attn_compressor_{kv,gate,ape,norm}`,
+//! F010.B), the indexer block (`indexer.attn_q_b`, `indexer.proj`,
+//! and the four `indexer_compressor_*` tensors, F010.C), the HC
+//! triple (`hc_{attn,ffn}_{fn,scale,base}`, F010.A), and the
+//! top-level `output_hc_*` (F010.D) are all pinned to ds4.c lines
+//! 2604-2615. The structural surface (this loader's interface, error
 //! shape, per-layer regime dispatch) does not depend on the exact
 //! strings.
 //!
@@ -398,7 +396,12 @@ pub fn load_indexer<'a>(
     let attn_q_b_name = tensor_names::blk(il, tensor_names::INDEXER_ATTN_Q_B);
     let attn_q_b = resolve_blob_opt(gguf, &attn_q_b_name)?
         .ok_or_else(|| Error::MissingTensor(attn_q_b_name.clone()))?;
-    // [N_LORA_Q × (N_INDEXER_HEAD × N_INDEXER_HEAD_DIM)]
+    // Upstream stores `[N_LORA_Q × (N_INDEXER_HEAD * N_INDEXER_HEAD_DIM)]`
+    // (`ds4.c:2326`). Our `check_shape(out_dim, in_dim)` is byte-count
+    // commutative, and the convention across this loader is to pass the
+    // matmul *output* width as `out_dim` — matches the MLA `attn_q_b`
+    // call site (line 633). F011 will verify the orientation when it
+    // wires the matmul.
     attn_q_b.check_shape(
         DSV4_N_INDEXER_HEAD * DSV4_N_INDEXER_HEAD_DIM,
         DSV4_N_LORA_Q,
@@ -414,7 +417,9 @@ pub fn load_indexer<'a>(
     let comp_ape_name = tensor_names::blk(il, tensor_names::INDEXER_COMPRESSOR_APE);
     let comp_ape = resolve_blob_opt(gguf, &comp_ape_name)?
         .ok_or_else(|| Error::MissingTensor(comp_ape_name.clone()))?;
-    // [index_width × ratio]
+    // Upstream stores `[index_width × ratio]` (`ds4.c:2328`). Matches
+    // the main `attn_compressor_ape` convention (line 355) — out_dim
+    // here is `ratio`, in_dim is `index_width`.
     comp_ape.check_shape(ratio, index_width, "loader.indexer.comp_ape")?;
 
     let comp_kv_name = tensor_names::blk(il, tensor_names::INDEXER_COMPRESSOR_KV);
