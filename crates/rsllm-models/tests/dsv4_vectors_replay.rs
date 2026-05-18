@@ -36,7 +36,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rsllm_core::{Engine, Session, SamplingParams};
+use rsllm_core::{Engine, SamplingParams, Session};
 use rsllm_gguf::GgufFile;
 use rsllm_models::DsV4FlashEngine;
 use rsllm_models::dsv4::loader::load_dsv4_flash;
@@ -114,13 +114,38 @@ fn dsv4_vectors_replay_top1_hit_rate_is_100_percent() {
     let mut hits = 0usize;
     let mut failures: Vec<String> = Vec::new();
 
+    let root = vectors_dir();
     for entry in &manifest.prompts {
-        let prompt_path = vectors_dir().join(&entry.prompt_file);
-        let official_path = vectors_dir().join(&entry.official_file);
-        let prompt_text = std::fs::read_to_string(&prompt_path)
-            .unwrap_or_else(|e| panic!("read {prompt_path:?}: {e}"));
-        let official_bytes = std::fs::read(&official_path)
-            .unwrap_or_else(|e| panic!("read {official_path:?}: {e}"));
+        let prompt_path = root.join(&entry.prompt_file);
+        let official_path = root.join(&entry.official_file);
+        // Path-traversal containment: the manifest is git-tracked so
+        // tampering is overt, but a malformed `prompt_file` like
+        // `../../secrets` would silently escape the vectors dir on
+        // Path::join. Refuse anything that doesn't canonicalize back
+        // under `root`.
+        let canon_prompt = prompt_path
+            .canonicalize()
+            .unwrap_or_else(|e| panic!("canonicalize {prompt_path:?}: {e}"));
+        let canon_official = official_path
+            .canonicalize()
+            .unwrap_or_else(|e| panic!("canonicalize {official_path:?}: {e}"));
+        assert!(
+            canon_prompt.starts_with(&root),
+            "prompt_file {:?} escapes vectors dir {:?}",
+            entry.prompt_file,
+            root,
+        );
+        assert!(
+            canon_official.starts_with(&root),
+            "official_file {:?} escapes vectors dir {:?}",
+            entry.official_file,
+            root,
+        );
+
+        let prompt_text = std::fs::read_to_string(&canon_prompt)
+            .unwrap_or_else(|e| panic!("read {canon_prompt:?}: {e}"));
+        let official_bytes = std::fs::read(&canon_official)
+            .unwrap_or_else(|e| panic!("read {canon_official:?}: {e}"));
         let official: OfficialFile =
             serde_json::from_slice(&official_bytes)
                 .unwrap_or_else(|e| panic!("parse {official_path:?}: {e}"));
@@ -144,8 +169,12 @@ fn dsv4_vectors_replay_top1_hit_rate_is_100_percent() {
         let needed_ctx = prompt_tokens.len() + entry.steps + 16;
         let ctx_size = needed_ctx.next_power_of_two().max(2048);
 
+        // Greedy sampling makes `DecodeStep.token_id` == argmax(logits)
+        // deterministically. The replay gate is a top-1 hit test, so
+        // anything that introduces stochasticity (temperature, top-k,
+        // min_p) would muddy the comparison.
         let mut session = engine
-            .start_session(ctx_size, SamplingParams::default())
+            .start_session(ctx_size, SamplingParams::greedy())
             .expect("start_session");
 
         // Prefill the prompt. We discard the returned logits — the
@@ -153,29 +182,14 @@ fn dsv4_vectors_replay_top1_hit_rate_is_100_percent() {
         // prompt token as the seed.
         let _ = session.prefill(&prompt_tokens).expect("prefill");
 
-        // Greedy decode (argmax) for `entry.steps` tokens. We bypass
-        // the session's sampler — DecodeStep.token_id already went
-        // through the sampler chain, but for replay we want the raw
-        // argmax independent of any temperature/top-k drift.
+        // Greedy decode for `entry.steps` tokens. The session is
+        // configured with `SamplingParams::greedy()`, so
+        // `step.token_id` is exactly the argmax of the raw logits.
         let mut last_token = *prompt_tokens.last().expect("non-empty prompt");
         for (i, official_step) in official.steps.iter().enumerate() {
             let step = session.decode_one(last_token).expect("decode_one");
             total_steps += 1;
-
-            // Greedy argmax over the post-sampler probs (probs is the
-            // softmax distribution returned by Sampler). With the
-            // default SamplingParams temperature ≈ 1.0 and top-k/top-p
-            // cuts, argmax(probs) still equals argmax(logits) modulo
-            // ties — sufficient for top-1 comparison.
-            let argmax_id = step
-                .probs
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| {
-                    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .map(|(idx, _)| idx as u32)
-                .expect("non-empty probs");
+            let argmax_id = step.token_id;
 
             // Re-tokenize the official top-1 byte sequence through our
             // vocab. We compare token-id-to-token-id (no string decode)
