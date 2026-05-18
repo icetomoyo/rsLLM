@@ -561,13 +561,24 @@ mod tests {
         // equal to the simple unweighted average).
 
         // Compressor weight: identity on the first HEAD_DIM lanes of x.
+        // F010.B note: the new 4-tensor compressor carries kv + gate +
+        // ape + norm. The legacy `project_compressor_score` path that
+        // this test exercises only consumes `kv` until F011 rewrites
+        // the algorithm — so kv gets the identity, gate/ape stay zero,
+        // norm stays at the all-ones default (no-op rms scale).
         let n_embd = crate::dsv4::shape::DSV4_N_EMBD;
-        let mut comp_w = vec![0.0_f32; DSV4_HEAD_DIM * n_embd];
+        let mut comp_kv = vec![0.0_f32; DSV4_HEAD_DIM * n_embd];
         for o in 0..DSV4_HEAD_DIM {
-            comp_w[o * n_embd + o] = 1.0;
+            comp_kv[o * n_embd + o] = 1.0;
         }
+        let comp_gate = vec![0.0_f32; DSV4_HEAD_DIM * n_embd];
+        let comp_ape = vec![0.0_f32; DSV4_HEAD_DIM * 128];
+        let comp_norm = vec![1.0_f32; DSV4_HEAD_DIM];
         let compressor = CompressorWeights {
-            attn_compressor: crate::dsv4::weight::WeightBlob::F32(&comp_w),
+            kv: crate::dsv4::weight::WeightBlob::F32(&comp_kv),
+            gate: crate::dsv4::weight::WeightBlob::F32(&comp_gate),
+            ape: crate::dsv4::weight::WeightBlob::F32(&comp_ape),
+            norm: &comp_norm,
         };
 
         // Indexer weights: zero (won't fire numerically but the path
@@ -645,10 +656,18 @@ mod tests {
         // 4-token boundary emission on a ratio-4 layer must produce
         // a non-zero row inside the indexer's compressed pool.
         let n_embd = crate::dsv4::shape::DSV4_N_EMBD;
-        // Compressor: zero (path is exercised but inert).
-        let comp_w = vec![0.0_f32; DSV4_HEAD_DIM * n_embd];
+        // Compressor: zero across all four tensors (path is exercised
+        // but inert in this test — the indexer side is what we're
+        // measuring).
+        let comp_kv = vec![0.0_f32; DSV4_HEAD_DIM * n_embd];
+        let comp_gate = vec![0.0_f32; DSV4_HEAD_DIM * n_embd];
+        let comp_ape = vec![0.0_f32; DSV4_HEAD_DIM * 128];
+        let comp_norm = vec![1.0_f32; DSV4_HEAD_DIM];
         let compressor = CompressorWeights {
-            attn_compressor: crate::dsv4::weight::WeightBlob::F32(&comp_w),
+            kv: crate::dsv4::weight::WeightBlob::F32(&comp_kv),
+            gate: crate::dsv4::weight::WeightBlob::F32(&comp_gate),
+            ape: crate::dsv4::weight::WeightBlob::F32(&comp_ape),
+            norm: &comp_norm,
         };
         // Indexer write: identity on the first INDEXER_HEAD_DIM lanes
         // of x; non-zero score so the softmax-aggregate is non-trivial.

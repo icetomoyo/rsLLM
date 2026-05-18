@@ -35,22 +35,52 @@ fn checked_mul_or_err(a: usize, b: usize, tag: &'static str) -> Result<usize, Er
     })
 }
 
-/// Per-layer weights for the compressed-KV scoring path. Present on
-/// every layer with `compress_ratio > 0` (i.e. all but the first
-/// two dense layers, per
-/// [`rsllm_kvcache::dsv4::shape::layer_compress_ratio`]).
+/// Per-layer compressor weights — the 4-tensor bundle that ds4's
+/// `compressor_decode_one` (`ds4.c:6431+`) consumes to produce one
+/// `[HEAD_DIM]` compressed row every `compress_ratio` tokens.
 ///
-/// Logical operation per token:
-/// ```text
-/// compress_score = attn_compressor · x   # [HEAD_DIM] = [HEAD_DIM × N_EMBD] · [N_EMBD]
-/// ```
-/// The result feeds [`rsllm_kvcache::dsv4::compressed::CompressedKvPool::accumulate`]
-/// as the per-dim softmax score that aggregates KV latents at each
-/// `compress_ratio` boundary.
+/// Present on every layer with `compress_ratio > 0` (all but the
+/// first two dense layers).
+///
+/// Tensor shapes (`ds4.c:2316-2321`) depend on the layer's regime:
+///
+/// | Tensor | Shape | dtype | Role |
+/// |---|---|---|---|
+/// | `kv` | `[N_EMBD × comp_width]` | F16 | KV latent projection |
+/// | `gate` | `[N_EMBD × comp_width]` | F16 | Gate-side score projection |
+/// | `ape` | `[comp_width × compress_ratio]` | F16 | Absolute position embed for compression |
+/// | `norm` | `[N_HEAD_DIM]` = `[512]` | F32 | Post-pool RMSNorm scale |
+///
+/// where `comp_width = (compress_ratio == 4 ? 2 : 1) * N_HEAD_DIM` —
+/// ratio-4 layers carry `comp_width = 1024`, ratio-128 layers carry
+/// `comp_width = 512`.
+///
+/// **Algorithmic gap (F011 follow-up).** Loading these tensors lets
+/// the GGUF parse succeed against a real model. The downstream
+/// [`project_compressor_score`] helper, the F006
+/// [`rsllm_kvcache::dsv4::compressed::CompressedKvPool`], and the
+/// F008.C.2 attention compressor path STILL implement the old
+/// per-token single-matmul shortcut — they do not yet model the
+/// stateful per-position pooling, APE bias, gate sigmoid, or
+/// post-pool RMSNorm. dsv4-vectors top-1 cannot pass until that
+/// algorithmic rewrite (F011) lands. Until then, this struct is
+/// loaded with the correct tensors but only `kv` is used.
 #[derive(Debug, Clone, Copy)]
 pub struct CompressorWeights<'a> {
-    /// `[HEAD_DIM × N_EMBD]` = `[512 × 4096]`.
-    pub attn_compressor: WeightBlob<'a>,
+    /// `[N_EMBD × comp_width]` F16. KV latent projection. Used by
+    /// the legacy [`project_compressor_score`] path as the single
+    /// "compressor matrix" until F011 lands.
+    pub kv: WeightBlob<'a>,
+    /// `[N_EMBD × comp_width]` F16. Gate-side score projection
+    /// (combined with `kv` + APE bias in ds4's `compressor_decode_one`).
+    /// Unused until F011.
+    pub gate: WeightBlob<'a>,
+    /// `[comp_width × compress_ratio]` F16. Absolute position embed
+    /// added to `gate(x)` per ds4.c:6473-6475. Unused until F011.
+    pub ape: WeightBlob<'a>,
+    /// `[N_HEAD_DIM = 512]` F32. RMSNorm scale applied after the
+    /// per-ratio pool reduction. Unused until F011.
+    pub norm: &'a [f32],
 }
 
 /// Per-layer **write-side** indexer weights (present only on ratio-4
@@ -117,9 +147,24 @@ pub fn project_compressor_score(
             actual: format!("{}", out.len()),
         });
     }
+    // F010.B: route through `kv` as the single-matrix proxy until
+    // F011 lands the full ds4 stateful compressor (gate sigmoid + APE
+    // bias + per-ratio pool + RMSNorm). The output shape is right
+    // (`[head_dim]` per token) but it's emitted EVERY token rather
+    // than every `compress_ratio` tokens, and without the gate/ape/
+    // norm composition. dsv4-vectors top-1 cannot pass on this path.
+    //
+    // Note that for ratio-4 layers `comp_width = 1024`, so this
+    // matmul actually produces a `[1024]` row rather than `[512]`.
+    // The caller currently passes a `[HEAD_DIM = 512]` slice; for
+    // ratio-4 layers we'd overrun. Until F011 wires the correct
+    // per-regime width, callers must only pass this on ratio-128
+    // layers (`coff = 1`, `comp_width = HEAD_DIM`). The attention
+    // path's compressor branch needs the F011 rewrite to handle
+    // ratio-4 correctly.
     matmul_weight_f32(
         out,
-        &weights.attn_compressor,
+        &weights.kv,
         x,
         n_tok,
         DSV4_N_EMBD,
@@ -257,8 +302,17 @@ mod tests {
     #[test]
     fn compressor_rejects_wrong_x() {
         let w = vec![0.0_f32; DSV4_HEAD_DIM * DSV4_N_EMBD];
+        // F010.B: the test exercises `project_compressor_score`, which
+        // currently routes through `kv` as a single-matrix proxy. The
+        // other three tensors are inert; supply zero/one placeholders.
+        let zero_gate = vec![0.0_f32; w.len()];
+        let zero_ape = vec![0.0_f32; DSV4_HEAD_DIM * 128];
+        let ones_norm = vec![1.0_f32; DSV4_HEAD_DIM];
         let weights = CompressorWeights {
-            attn_compressor: WeightBlob::F32(&w),
+            kv: WeightBlob::F32(&w),
+            gate: WeightBlob::F32(&zero_gate),
+            ape: WeightBlob::F32(&zero_ape),
+            norm: &ones_norm,
         };
         let x = vec![0.0_f32; DSV4_N_EMBD - 1]; // wrong
         let mut out = vec![0.0_f32; DSV4_HEAD_DIM];
@@ -270,8 +324,17 @@ mod tests {
     #[test]
     fn compressor_passes_through_truncating_weight() {
         let w = truncating_weight(DSV4_HEAD_DIM, DSV4_N_EMBD);
+        // F010.B: the test exercises `project_compressor_score`, which
+        // currently routes through `kv` as a single-matrix proxy. The
+        // other three tensors are inert; supply zero/one placeholders.
+        let zero_gate = vec![0.0_f32; w.len()];
+        let zero_ape = vec![0.0_f32; DSV4_HEAD_DIM * 128];
+        let ones_norm = vec![1.0_f32; DSV4_HEAD_DIM];
         let weights = CompressorWeights {
-            attn_compressor: WeightBlob::F32(&w),
+            kv: WeightBlob::F32(&w),
+            gate: WeightBlob::F32(&zero_gate),
+            ape: WeightBlob::F32(&zero_ape),
+            norm: &ones_norm,
         };
         let mut x = vec![0.0_f32; DSV4_N_EMBD];
         for (i, v) in x.iter_mut().enumerate().take(DSV4_HEAD_DIM) {
@@ -358,8 +421,17 @@ mod tests {
         // Exercises the per-token row stride — a 1-token test would
         // pass even if the matmul forgot to advance the output row.
         let w = truncating_weight(DSV4_HEAD_DIM, DSV4_N_EMBD);
+        // F010.B: the test exercises `project_compressor_score`, which
+        // currently routes through `kv` as a single-matrix proxy. The
+        // other three tensors are inert; supply zero/one placeholders.
+        let zero_gate = vec![0.0_f32; w.len()];
+        let zero_ape = vec![0.0_f32; DSV4_HEAD_DIM * 128];
+        let ones_norm = vec![1.0_f32; DSV4_HEAD_DIM];
         let weights = CompressorWeights {
-            attn_compressor: WeightBlob::F32(&w),
+            kv: WeightBlob::F32(&w),
+            gate: WeightBlob::F32(&zero_gate),
+            ape: WeightBlob::F32(&zero_ape),
+            norm: &ones_norm,
         };
         let mut x = vec![0.0_f32; 3 * DSV4_N_EMBD];
         // Token t puts (t+1)*10 at lane t.

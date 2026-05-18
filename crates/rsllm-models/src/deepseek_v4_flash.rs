@@ -191,11 +191,23 @@ impl<'a> DsV4Block<'a> {
         // on layers that actually carry the weights — dense layers
         // already had `compressor.is_none()` enforced above.
         if let Some(c) = self.compressor.as_ref() {
-            c.attn_compressor.check_shape(
-                DSV4_HEAD_DIM,
-                DSV4_N_EMBD,
-                "block.compressor.attn_compressor",
-            )?;
+            // Compute the per-regime `comp_width` once and check all
+            // four tensors against it. ratio-4 → comp_width = 1024,
+            // ratio-128 → comp_width = 512.
+            let ratio_u32 = rsllm_kvcache::dsv4::shape::layer_compress_ratio(layer_idx);
+            let ratio = ratio_u32 as usize;
+            let coff = if ratio_u32 == 4 { 2 } else { 1 };
+            let comp_width = coff * DSV4_HEAD_DIM;
+            c.kv.check_shape(comp_width, DSV4_N_EMBD, "block.compressor.kv")?;
+            c.gate.check_shape(comp_width, DSV4_N_EMBD, "block.compressor.gate")?;
+            c.ape.check_shape(ratio, comp_width, "block.compressor.ape")?;
+            if c.norm.len() != DSV4_HEAD_DIM {
+                return Err(Error::ShapeMismatch {
+                    key: "block.compressor.norm",
+                    expected: format!("{DSV4_HEAD_DIM}"),
+                    actual: format!("{}", c.norm.len()),
+                });
+            }
         }
         if let Some(w) = self.indexer_write.as_ref() {
             w.attn_indexer_kv.check_shape(
@@ -692,9 +704,19 @@ mod tests {
         shared_down: Vec<f32>,
         gate_inp: Vec<f32>,
         tid2eid: Vec<i32>,
-        // F008.B per-layer LoRA backing buffers. All zero — the
+        // F010.B per-layer LoRA backing buffers. All zero — the
         // structural tests check Option-presence only.
-        compressor_w: Vec<f32>,
+        //
+        // Ratio-128 (odd `il >= 2`) sizing: comp_width = HEAD_DIM = 512,
+        // ratio = 128. Stubs use ratio-128 sizing for compressor; ratio-4
+        // layers (`il = 2`) are special-cased in the block() helper.
+        compressor_kv_r128: Vec<f32>,
+        compressor_gate_r128: Vec<f32>,
+        compressor_ape_r128: Vec<f32>,
+        compressor_kv_r4: Vec<f32>,
+        compressor_gate_r4: Vec<f32>,
+        compressor_ape_r4: Vec<f32>,
+        compressor_norm: Vec<f32>,
         indexer_kv_w: Vec<f32>,
         indexer_kv_score_w: Vec<f32>,
         indexer_q_w: Vec<f32>,
@@ -728,7 +750,16 @@ mod tests {
                 shared_down: vec![0.0; DSV4_N_EMBD * DSV4_N_FF_EXP],
                 gate_inp: vec![0.0; DSV4_N_EXPERT * DSV4_N_EMBD],
                 tid2eid: vec![0_i32; DSV4_N_EXPERT_USED * DSV4_N_VOCAB],
-                compressor_w: vec![0.0; DSV4_HEAD_DIM * DSV4_N_EMBD],
+                // Compressor backing buffers, sized per regime:
+                //   ratio-128: comp_width = HEAD_DIM = 512
+                //   ratio-4:   comp_width = 2 * HEAD_DIM = 1024
+                compressor_kv_r128:   vec![0.0; DSV4_HEAD_DIM * DSV4_N_EMBD],
+                compressor_gate_r128: vec![0.0; DSV4_HEAD_DIM * DSV4_N_EMBD],
+                compressor_ape_r128:  vec![0.0; DSV4_HEAD_DIM * 128],
+                compressor_kv_r4:     vec![0.0; 2 * DSV4_HEAD_DIM * DSV4_N_EMBD],
+                compressor_gate_r4:   vec![0.0; 2 * DSV4_HEAD_DIM * DSV4_N_EMBD],
+                compressor_ape_r4:    vec![0.0; 2 * DSV4_HEAD_DIM * 4],
+                compressor_norm:      vec![1.0; DSV4_HEAD_DIM],
                 indexer_kv_w: vec![
                     0.0;
                     crate::dsv4::shape::DSV4_N_INDEXER_HEAD_DIM * DSV4_N_EMBD
@@ -819,12 +850,23 @@ mod tests {
                     None
                 },
                 hc_ffn: hc,
-                compressor: if rsllm_kvcache::dsv4::shape::layer_compress_ratio(layer_idx) > 0 {
-                    Some(CompressorWeights {
-                        attn_compressor: WeightBlob::F32(&self.compressor_w),
-                    })
-                } else {
-                    None
+                compressor: {
+                    let ratio = rsllm_kvcache::dsv4::shape::layer_compress_ratio(layer_idx);
+                    match ratio {
+                        0 => None,
+                        4 => Some(CompressorWeights {
+                            kv: WeightBlob::F32(&self.compressor_kv_r4),
+                            gate: WeightBlob::F32(&self.compressor_gate_r4),
+                            ape: WeightBlob::F32(&self.compressor_ape_r4),
+                            norm: &self.compressor_norm,
+                        }),
+                        _ => Some(CompressorWeights {
+                            kv: WeightBlob::F32(&self.compressor_kv_r128),
+                            gate: WeightBlob::F32(&self.compressor_gate_r128),
+                            ape: WeightBlob::F32(&self.compressor_ape_r128),
+                            norm: &self.compressor_norm,
+                        }),
+                    }
                 },
                 indexer_write: if rsllm_kvcache::dsv4::shape::layer_has_indexer(layer_idx) {
                     Some(IndexerWriteWeights {
@@ -869,10 +911,15 @@ mod tests {
     fn dense_layer_with_compressor_rejected() {
         // Layer 0 is dense — compressor must be `None`. If the GGUF
         // load path accidentally hands one in we want a loud failure.
+        // We don't care which regime sizing the unwanted compressor
+        // has; ratio-128 stubs are fine.
         let storage = StubBlockStorage::new();
         let mut block = storage.block(0);
         block.compressor = Some(CompressorWeights {
-            attn_compressor: WeightBlob::F32(&storage.compressor_w),
+            kv: WeightBlob::F32(&storage.compressor_kv_r128),
+            gate: WeightBlob::F32(&storage.compressor_gate_r128),
+            ape: WeightBlob::F32(&storage.compressor_ape_r128),
+            norm: &storage.compressor_norm,
         });
         let err = block.validate(0).unwrap_err();
         assert!(matches!(err, Error::ShapeMismatch { key, .. } if key == "block.compressor"));
@@ -928,20 +975,24 @@ mod tests {
 
     #[test]
     fn compressor_with_wrong_byte_len_rejected() {
-        // Load-time byte-length check (security-review F008.B fix).
-        // Build a compressed layer (il=3 ratio-128) whose compressor
-        // backing storage is one element short of the expected
-        // HEAD_DIM × N_EMBD.
+        // Load-time byte-length check (security-review F008.B fix,
+        // updated for F010.B's 4-tensor compressor). Build a ratio-128
+        // layer (il=3, comp_width = HEAD_DIM = 512) whose `kv` backing
+        // storage is one element short of the expected
+        // comp_width × N_EMBD.
         let storage = StubBlockStorage::new();
         let wrong = vec![0.0_f32; DSV4_HEAD_DIM * DSV4_N_EMBD - 1];
         let mut block = storage.block(3);
         block.compressor = Some(CompressorWeights {
-            attn_compressor: WeightBlob::F32(&wrong),
+            kv: WeightBlob::F32(&wrong),
+            gate: WeightBlob::F32(&storage.compressor_gate_r128),
+            ape: WeightBlob::F32(&storage.compressor_ape_r128),
+            norm: &storage.compressor_norm,
         });
         let err = block.validate(3).unwrap_err();
         assert!(matches!(
             err,
-            Error::ShapeMismatch { key, .. } if key == "block.compressor.attn_compressor"
+            Error::ShapeMismatch { key, .. } if key == "block.compressor.kv"
         ));
     }
 

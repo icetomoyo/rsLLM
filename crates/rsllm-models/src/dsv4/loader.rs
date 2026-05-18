@@ -109,15 +109,20 @@ pub mod tensor_names {
     /// Hash-router tid → eid table (only layers `< DSV4_HASH_ROUTE_LAYERS`).
     pub const TID2EID: &str = "ffn_hash_tid2eid";
 
-    /// F008.B compressor / indexer LoRAs — TODO(ds4): confirm strings.
-    pub const ATTN_COMPRESSOR: &str = "attn_compressor.weight";
+    /// F010.B compressor tensors — verified against ds4 commit
+    /// `ef0a490` at line 2604-2607. Each compressed layer (ratio > 0)
+    /// carries all four.
+    pub const ATTN_COMPRESSOR_KV: &str = "attn_compressor_kv.weight";
+    pub const ATTN_COMPRESSOR_GATE: &str = "attn_compressor_gate.weight";
+    pub const ATTN_COMPRESSOR_APE: &str = "attn_compressor_ape.weight";
+    pub const ATTN_COMPRESSOR_NORM: &str = "attn_compressor_norm.weight";
+
+    /// F008.B indexer LoRAs — TODO(ds4F010.C): names still under
+    /// audit; F010.C will replace with the upstream `indexer.attn_q_b`
+    /// / `indexer.proj` / `indexer_compressor_*` set.
     pub const ATTN_INDEXER_KV: &str = "attn_indexer_kv.weight";
     pub const ATTN_INDEXER_KV_SCORE: &str = "attn_indexer_kv_score.weight";
     pub const ATTN_INDEXER_Q: &str = "attn_indexer_q.weight";
-    /// TODO(ds4): the `.weight` suffix is conjectural — the head-weight
-    /// vector may be stored without it under the canonical name
-    /// `attn_indexer_head_weight`. Patch when confirmed against
-    /// ds4 upstream.
     pub const ATTN_INDEXER_HEAD_WEIGHT: &str = "attn_indexer_head_weight";
 
     /// Format the per-layer key `"blk.{il}.{suffix}"` once.
@@ -295,29 +300,61 @@ pub fn resolve_i32_slice<'a>(gguf: &'a GgufFile, name: &str) -> Result<&'a [i32]
     reinterpret_as_i32(bytes, name)
 }
 
-/// Build the F008.B `CompressorWeights` for layer `il`, **if** the
+/// Build the per-layer `CompressorWeights` for layer `il`, **if** the
 /// layer regime calls for it. Returns `None` for dense layers
 /// (`compress_ratio == 0`).
 ///
+/// Loads all four ds4 tensors:
+/// - `attn_compressor_kv.weight`    F16 `[N_EMBD × comp_width]`
+/// - `attn_compressor_gate.weight`  F16 `[N_EMBD × comp_width]`
+/// - `attn_compressor_ape.weight`   F16 `[comp_width × compress_ratio]`
+/// - `attn_compressor_norm.weight`  F32 `[N_HEAD_DIM = 512]`
+///
+/// where `comp_width = (compress_ratio == 4 ? 2 : 1) * N_HEAD_DIM`.
+///
 /// # Errors
-/// [`Error::MissingTensor`] if the layer needs a compressor but the
-/// GGUF doesn't have one.
+/// [`Error::MissingTensor`] if any of the four tensors is absent
+/// (names embed the concrete `blk.N` index in the error message).
+/// [`Error::ShapeMismatch`] on a byte-count disagreement.
 pub fn load_compressor<'a>(
     gguf: &'a GgufFile,
     il: usize,
 ) -> Result<Option<CompressorWeights<'a>>, Error> {
-    if layer_compress_ratio(il) == 0 {
+    let ratio = layer_compress_ratio(il) as usize;
+    if ratio == 0 {
         return Ok(None);
     }
-    let name = tensor_names::blk(il, tensor_names::ATTN_COMPRESSOR);
-    let blob = resolve_blob_opt(gguf, &name)?
-        .ok_or_else(|| Error::MissingTensor(name.clone()))?;
-    blob.check_shape(
-        DSV4_HEAD_DIM,
-        DSV4_N_EMBD,
-        "loader.compressor.attn_compressor",
-    )?;
-    Ok(Some(CompressorWeights { attn_compressor: blob }))
+    let coff = if ratio == 4 { 2 } else { 1 };
+    let comp_width = coff * DSV4_HEAD_DIM;
+
+    let kv_name = tensor_names::blk(il, tensor_names::ATTN_COMPRESSOR_KV);
+    let gate_name = tensor_names::blk(il, tensor_names::ATTN_COMPRESSOR_GATE);
+    let ape_name = tensor_names::blk(il, tensor_names::ATTN_COMPRESSOR_APE);
+    let norm_name = tensor_names::blk(il, tensor_names::ATTN_COMPRESSOR_NORM);
+
+    let kv = resolve_blob_opt(gguf, &kv_name)?
+        .ok_or_else(|| Error::MissingTensor(kv_name.clone()))?;
+    kv.check_shape(comp_width, DSV4_N_EMBD, "loader.compressor.kv")?;
+
+    let gate = resolve_blob_opt(gguf, &gate_name)?
+        .ok_or_else(|| Error::MissingTensor(gate_name.clone()))?;
+    gate.check_shape(comp_width, DSV4_N_EMBD, "loader.compressor.gate")?;
+
+    let ape = resolve_blob_opt(gguf, &ape_name)?
+        .ok_or_else(|| Error::MissingTensor(ape_name.clone()))?;
+    // APE is [comp_width × compress_ratio]: out_dim = ratio, in_dim = comp_width.
+    ape.check_shape(ratio, comp_width, "loader.compressor.ape")?;
+
+    let norm = resolve_f32_slice(gguf, &norm_name)?;
+    if norm.len() != DSV4_HEAD_DIM {
+        return Err(Error::ShapeMismatch {
+            key: "loader.compressor.norm",
+            expected: format!("{DSV4_HEAD_DIM}"),
+            actual: format!("{norm_name}: {}", norm.len()),
+        });
+    }
+
+    Ok(Some(CompressorWeights { kv, gate, ape, norm }))
 }
 
 /// Build the F008.B indexer pair for layer `il`. Returns `None` on
@@ -781,8 +818,7 @@ pub fn architecture_name(meta: &Metadata) -> Option<&str> {
 ///                                    23
 ///
 /// Plus per-regime additions:
-///   compressed (ratio > 0): +1 (attn_compressor) — F010.B will
-///                               raise this to +4 (ape/kv/gate/norm)
+///   compressed (ratio > 0): +4 (attn_compressor_{kv, gate, ape, norm})
 ///   ratio-4 only:           +4 (attn_indexer_{kv, kv_score, q, head_weight})
 ///                              — F010.C will adjust this set
 ///   hash-routed (il<3):     +1 (tid2eid)
@@ -792,10 +828,10 @@ pub fn expected_layer_tensor_count(il: usize) -> usize {
     // Baseline = 1+5+1+2+6+1+3+3+1 = 23.
     let mut count = 23;
     if layer_compress_ratio(il) > 0 {
-        count += 1; // compressor
+        count += 4; // compressor kv/gate/ape/norm
     }
     if layer_has_indexer(il) {
-        count += 4; // indexer kv/score/q/head_w
+        count += 4; // indexer kv/score/q/head_w (F010.C will revisit)
     }
     if il < DSV4_HASH_ROUTE_LAYERS {
         count += 1; // tid2eid
@@ -966,24 +1002,52 @@ mod tests {
 
     #[test]
     fn load_compressor_returns_blob_when_present() {
-        // Build a fake compressor with the right shape — HEAD_DIM ×
-        // N_EMBD = 512 × 4096 = 2_097_152 f32 elements = 8 MiB.
-        // Too big for the inline builder, so use a constant-fill
-        // shortcut: byte-fill with zeros.
-        let n_elem = DSV4_HEAD_DIM * DSV4_N_EMBD;
-        let payload = vec![0u8; n_elem * 4];
+        // F010.B: load all four compressor tensors for a ratio-128 layer
+        // (il=3 → coff=1, comp_width = HEAD_DIM = 512). Each tensor
+        // must be byte-size correct or the loader rejects.
+        let comp_width = DSV4_HEAD_DIM; // ratio-128 ⇒ coff = 1
+        let ratio = 128usize;
+
+        let kv_n = comp_width * DSV4_N_EMBD;
+        let gate_n = comp_width * DSV4_N_EMBD;
+        let ape_n = comp_width * ratio;
+        let norm_n = DSV4_HEAD_DIM;
+
         let bytes = build_gguf(
             &[],
-            &[(
-                "blk.3.attn_compressor.weight",
-                GgmlType::F32 as u32,
-                vec![DSV4_N_EMBD as u64, DSV4_HEAD_DIM as u64],
-                payload,
-            )],
+            &[
+                (
+                    "blk.3.attn_compressor_kv.weight",
+                    GgmlType::F32 as u32,
+                    vec![DSV4_N_EMBD as u64, comp_width as u64],
+                    vec![0u8; kv_n * 4],
+                ),
+                (
+                    "blk.3.attn_compressor_gate.weight",
+                    GgmlType::F32 as u32,
+                    vec![DSV4_N_EMBD as u64, comp_width as u64],
+                    vec![0u8; gate_n * 4],
+                ),
+                (
+                    "blk.3.attn_compressor_ape.weight",
+                    GgmlType::F32 as u32,
+                    vec![comp_width as u64, ratio as u64],
+                    vec![0u8; ape_n * 4],
+                ),
+                (
+                    "blk.3.attn_compressor_norm.weight",
+                    GgmlType::F32 as u32,
+                    vec![norm_n as u64],
+                    vec![0u8; norm_n * 4],
+                ),
+            ],
         );
         let file = GgufFile::from_bytes(bytes).unwrap();
         let c = load_compressor(&file, 3).unwrap().expect("Some");
-        let _ = c.attn_compressor.byte_len();
+        let _ = c.kv.byte_len();
+        let _ = c.gate.byte_len();
+        let _ = c.ape.byte_len();
+        assert_eq!(c.norm.len(), norm_n);
     }
 
     #[test]
@@ -1174,14 +1238,15 @@ mod tests {
     #[test]
     fn expected_layer_tensor_count_grows_with_regime() {
         // Reference table: baseline = 23 per the function's doc
-        // (post-F010.A: HC carries 6 tensors per layer, not 8).
+        // (post-F010.A: HC contributes 6 tensors; post-F010.B:
+        // compressor contributes 4 tensors per compressed layer).
         //   il=0: dense + hash router      → 23 +  0 + 1 = 24
-        //   il=2: ratio-4 + hash router    → 23 +  5 + 1 = 29
-        //   il=3: ratio-128 + topk router  → 23 +  1 + 0 = 24
-        //   il=4: ratio-4 + topk router    → 23 +  5 + 0 = 28
+        //   il=2: ratio-4 + hash router    → 23 +  4 + 4 + 1 = 32
+        //   il=3: ratio-128 + topk router  → 23 +  4 + 0 + 0 = 27
+        //   il=4: ratio-4 + topk router    → 23 +  4 + 4 + 0 = 31
         assert_eq!(expected_layer_tensor_count(0), 24);
-        assert_eq!(expected_layer_tensor_count(2), 29);
-        assert_eq!(expected_layer_tensor_count(3), 24);
-        assert_eq!(expected_layer_tensor_count(4), 28);
+        assert_eq!(expected_layer_tensor_count(2), 32);
+        assert_eq!(expected_layer_tensor_count(3), 27);
+        assert_eq!(expected_layer_tensor_count(4), 31);
     }
 }
