@@ -43,9 +43,12 @@ pub enum Error {
         actual: String,
     },
 
-    /// A required tensor (e.g. an MLA projection) was missing from the GGUF.
+    /// A required tensor (e.g. an MLA projection) was missing from the
+    /// GGUF. Owns the name so callers can embed the concrete layer
+    /// index (e.g. `"blk.37.attn_compressor.weight"`) rather than a
+    /// template `"blk.N.attn_compressor.weight"`.
     #[error("required tensor missing from GGUF: {0}")]
-    MissingTensor(&'static str),
+    MissingTensor(String),
 
     /// An underlying GGUF parse / dequant error bubbled up.
     #[error("gguf error: {0}")]

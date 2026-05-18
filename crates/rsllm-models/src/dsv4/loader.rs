@@ -104,7 +104,11 @@ pub mod tensor_names {
     pub const ATTN_INDEXER_KV: &str = "attn_indexer_kv.weight";
     pub const ATTN_INDEXER_KV_SCORE: &str = "attn_indexer_kv_score.weight";
     pub const ATTN_INDEXER_Q: &str = "attn_indexer_q.weight";
-    pub const ATTN_INDEXER_HEAD_WEIGHT: &str = "attn_indexer_head_weight.weight";
+    /// TODO(ds4): the `.weight` suffix is conjectural — the head-weight
+    /// vector may be stored without it under the canonical name
+    /// `attn_indexer_head_weight`. Patch when confirmed against
+    /// ds4 upstream.
+    pub const ATTN_INDEXER_HEAD_WEIGHT: &str = "attn_indexer_head_weight";
 
     /// Format the per-layer key `"blk.{il}.{suffix}"` once.
     #[must_use]
@@ -113,66 +117,75 @@ pub mod tensor_names {
     }
 }
 
+/// Reinterpret a byte slice from the GGUF mmap as `&[f32]` after
+/// validating length and pointer alignment. Shared helper for
+/// [`resolve_blob`] and [`resolve_blob_opt`] so the safety
+/// reasoning lives in one place.
+///
+/// # Errors
+/// - [`Error::ShapeMismatch`] with `key = "{name}.f32.length"` if
+///   the byte length is not a multiple of 4.
+/// - [`Error::ShapeMismatch`] with `key = "{name}.f32.alignment"`
+///   if the start pointer is not 4-byte aligned.
+fn reinterpret_as_f32<'a>(bytes: &'a [u8], name: &str) -> Result<&'a [f32], Error> {
+    if !bytes.len().is_multiple_of(4) {
+        return Err(Error::ShapeMismatch {
+            key: "loader.f32.length",
+            expected: "byte length divisible by 4 (F32)".into(),
+            actual: format!("{name}: {}", bytes.len()),
+        });
+    }
+    if !(bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()) {
+        return Err(Error::ShapeMismatch {
+            key: "loader.f32.alignment",
+            expected: "4-byte aligned F32 tensor".into(),
+            actual: format!(
+                "{name}: alignment offset {}",
+                bytes.as_ptr() as usize % std::mem::align_of::<f32>()
+            ),
+        });
+    }
+    // SAFETY: We just verified
+    //   (a) byte length is a multiple of 4 (matching `size_of::<f32>()`),
+    //   (b) start pointer is 4-byte aligned (matching `align_of::<f32>()`),
+    //   (c) every bit pattern in 4 bytes is a valid f32 (f32 has no
+    //       invalid bit patterns — including NaN — per the Rust
+    //       Reference's "Behavior considered undefined").
+    // The resulting slice's lifetime is the input slice's lifetime,
+    // which is tied to the GGUF mmap via the caller's `'a` parameter.
+    let slice = unsafe {
+        std::slice::from_raw_parts(bytes.as_ptr() as *const f32, bytes.len() / 4)
+    };
+    Ok(slice)
+}
+
 /// Look up a tensor by name. Returns [`Error::MissingTensor`] with
 /// the GGUF key if absent.
-pub fn lookup<'a>(gguf: &'a GgufFile, name: &'static str) -> Result<&'a TensorInfo, Error> {
-    gguf.tensor(name).ok_or(Error::MissingTensor(name))
+pub fn lookup<'a>(gguf: &'a GgufFile, name: &str) -> Result<&'a TensorInfo, Error> {
+    gguf.tensor(name).ok_or_else(|| Error::MissingTensor(name.to_owned()))
 }
 
 /// Resolve a tensor to a borrowed [`WeightBlob`]. Dispatches to the
 /// F32 or Quant variant based on the GGUF declared dtype.
 ///
-/// `tag` is the human-readable label used inside any
-/// [`Error::ShapeMismatch`] produced by downstream validation.
-///
 /// # Errors
 /// - [`Error::MissingTensor`] if the name is absent.
 /// - [`Error::ShapeMismatch`] if the tensor type is unrecognised or
-///   its payload bytes are unreadable.
-pub fn resolve_blob<'a>(
-    gguf: &'a GgufFile,
-    name: &'static str,
-) -> Result<WeightBlob<'a>, Error> {
+///   its payload bytes are unreadable / misaligned.
+pub fn resolve_blob<'a>(gguf: &'a GgufFile, name: &str) -> Result<WeightBlob<'a>, Error> {
     let info = lookup(gguf, name)?;
-    let bytes = gguf.tensor_bytes(info).ok_or(Error::ShapeMismatch {
-        key: name,
+    let bytes = gguf.tensor_bytes(info).ok_or_else(|| Error::ShapeMismatch {
+        key: "loader.tensor_bytes",
         expected: "valid byte range".into(),
-        actual: "out of bounds in GGUF mmap".into(),
+        actual: format!("{name}: out of bounds in GGUF mmap"),
     })?;
-    let dtype = GgmlType::from_u32(info.raw_type).ok_or(Error::ShapeMismatch {
-        key: name,
+    let dtype = GgmlType::from_u32(info.raw_type).ok_or_else(|| Error::ShapeMismatch {
+        key: "loader.dtype",
         expected: "known GgmlType".into(),
-        actual: format!("raw_type={}", info.raw_type),
+        actual: format!("{name}: raw_type={}", info.raw_type),
     })?;
     if dtype == GgmlType::F32 {
-        // Reinterpret the bytes as &[f32]. The mmap is 32-byte aligned
-        // (GGUF v3 default), but a tensor's relative_offset within
-        // can still place the start at any 4-byte boundary. Reject
-        // unaligned starts loudly.
-        if !bytes.len().is_multiple_of(4) {
-            return Err(Error::ShapeMismatch {
-                key: name,
-                expected: "byte length divisible by 4 (F32)".into(),
-                actual: format!("{}", bytes.len()),
-            });
-        }
-        if !(bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()) {
-            return Err(Error::ShapeMismatch {
-                key: name,
-                expected: "4-byte aligned F32 tensor".into(),
-                actual: format!(
-                    "alignment offset {}",
-                    bytes.as_ptr() as usize % std::mem::align_of::<f32>()
-                ),
-            });
-        }
-        // SAFETY: we just verified the byte length is a multiple of
-        // 4 and the start pointer is 4-byte aligned. The lifetime
-        // of the resulting slice is tied to the GGUF mmap via 'a.
-        let slice = unsafe {
-            std::slice::from_raw_parts(bytes.as_ptr() as *const f32, bytes.len() / 4)
-        };
-        Ok(WeightBlob::F32(slice))
+        Ok(WeightBlob::F32(reinterpret_as_f32(bytes, name)?))
     } else {
         Ok(WeightBlob::Quant { data: bytes, dtype })
     }
@@ -184,16 +197,13 @@ pub fn resolve_blob<'a>(
 /// # Errors
 /// Same as [`resolve_blob`], plus [`Error::ShapeMismatch`] if the
 /// declared dtype is not F32.
-pub fn resolve_f32_slice<'a>(
-    gguf: &'a GgufFile,
-    name: &'static str,
-) -> Result<&'a [f32], Error> {
+pub fn resolve_f32_slice<'a>(gguf: &'a GgufFile, name: &str) -> Result<&'a [f32], Error> {
     match resolve_blob(gguf, name)? {
         WeightBlob::F32(s) => Ok(s),
         WeightBlob::Quant { dtype, .. } => Err(Error::ShapeMismatch {
-            key: name,
+            key: "loader.expected_f32",
             expected: "F32".into(),
-            actual: format!("{dtype:?}"),
+            actual: format!("{name}: {dtype:?}"),
         }),
     }
 }
@@ -203,39 +213,12 @@ pub fn resolve_f32_slice<'a>(
 /// depending on the layer's regime (e.g. compressor on dense layers).
 pub fn resolve_blob_opt<'a>(
     gguf: &'a GgufFile,
-    name: String,
+    name: &str,
 ) -> Result<Option<WeightBlob<'a>>, Error> {
-    if gguf.tensor(&name).is_none() {
+    if gguf.tensor(name).is_none() {
         return Ok(None);
     }
-    // Re-key the lifetime so the existing &'static-keyed helpers
-    // work for owned names. We do the lookup ourselves here.
-    let info = gguf.tensor(&name).unwrap(); // confirmed above
-    let bytes = gguf.tensor_bytes(info).ok_or(Error::ShapeMismatch {
-        key: "loader.dyn_lookup",
-        expected: "valid byte range".into(),
-        actual: format!("{name}: out of bounds"),
-    })?;
-    let dtype = GgmlType::from_u32(info.raw_type).ok_or(Error::ShapeMismatch {
-        key: "loader.dyn_lookup",
-        expected: "known GgmlType".into(),
-        actual: format!("{name}: raw_type={}", info.raw_type),
-    })?;
-    if dtype == GgmlType::F32 {
-        if !bytes.len().is_multiple_of(4) || !(bytes.as_ptr() as usize).is_multiple_of(4) {
-            return Err(Error::ShapeMismatch {
-                key: "loader.dyn_lookup",
-                expected: "aligned f32 payload".into(),
-                actual: format!("{name}: misaligned"),
-            });
-        }
-        let slice = unsafe {
-            std::slice::from_raw_parts(bytes.as_ptr() as *const f32, bytes.len() / 4)
-        };
-        Ok(Some(WeightBlob::F32(slice)))
-    } else {
-        Ok(Some(WeightBlob::Quant { data: bytes, dtype }))
-    }
+    Ok(Some(resolve_blob(gguf, name)?))
 }
 
 /// Build the F008.B `CompressorWeights` for layer `il`, **if** the
@@ -253,8 +236,8 @@ pub fn load_compressor<'a>(
         return Ok(None);
     }
     let name = tensor_names::blk(il, tensor_names::ATTN_COMPRESSOR);
-    let blob = resolve_blob_opt(gguf, name.clone())?
-        .ok_or(Error::MissingTensor("blk.N.attn_compressor.weight"))?;
+    let blob = resolve_blob_opt(gguf, &name)?
+        .ok_or_else(|| Error::MissingTensor(name.clone()))?;
     blob.check_shape(
         DSV4_HEAD_DIM,
         DSV4_N_EMBD,
@@ -276,33 +259,25 @@ pub fn load_indexer<'a>(
     if !layer_has_indexer(il) {
         return Ok(None);
     }
-    let kv_blob = resolve_blob_opt(
-        gguf,
-        tensor_names::blk(il, tensor_names::ATTN_INDEXER_KV),
-    )?
-    .ok_or(Error::MissingTensor("blk.N.attn_indexer_kv.weight"))?;
-    let score_blob = resolve_blob_opt(
-        gguf,
-        tensor_names::blk(il, tensor_names::ATTN_INDEXER_KV_SCORE),
-    )?
-    .ok_or(Error::MissingTensor(
-        "blk.N.attn_indexer_kv_score.weight",
-    ))?;
-    let q_blob = resolve_blob_opt(
-        gguf,
-        tensor_names::blk(il, tensor_names::ATTN_INDEXER_Q),
-    )?
-    .ok_or(Error::MissingTensor("blk.N.attn_indexer_q.weight"))?;
+    let kv_name = tensor_names::blk(il, tensor_names::ATTN_INDEXER_KV);
+    let kv_blob = resolve_blob_opt(gguf, &kv_name)?
+        .ok_or_else(|| Error::MissingTensor(kv_name.clone()))?;
+    let score_name = tensor_names::blk(il, tensor_names::ATTN_INDEXER_KV_SCORE);
+    let score_blob = resolve_blob_opt(gguf, &score_name)?
+        .ok_or_else(|| Error::MissingTensor(score_name.clone()))?;
+    let q_name = tensor_names::blk(il, tensor_names::ATTN_INDEXER_Q);
+    let q_blob = resolve_blob_opt(gguf, &q_name)?
+        .ok_or_else(|| Error::MissingTensor(q_name.clone()))?;
     let head_w_name = tensor_names::blk(il, tensor_names::ATTN_INDEXER_HEAD_WEIGHT);
-    let head_w_blob = resolve_blob_opt(gguf, head_w_name.clone())?
-        .ok_or(Error::MissingTensor("blk.N.attn_indexer_head_weight"))?;
+    let head_w_blob = resolve_blob_opt(gguf, &head_w_name)?
+        .ok_or_else(|| Error::MissingTensor(head_w_name.clone()))?;
     let head_w = match head_w_blob {
         WeightBlob::F32(s) => s,
         WeightBlob::Quant { .. } => {
             return Err(Error::ShapeMismatch {
                 key: "loader.indexer.head_weight",
                 expected: "F32".into(),
-                actual: "quantised".into(),
+                actual: format!("{head_w_name}: quantised"),
             });
         }
     };
@@ -432,7 +407,10 @@ mod tests {
         let bytes = build_gguf(&[], &[]);
         let file = GgufFile::from_bytes(bytes).unwrap();
         let err = lookup(&file, "nonexistent").unwrap_err();
-        assert!(matches!(err, Error::MissingTensor("nonexistent")));
+        match err {
+            Error::MissingTensor(name) => assert_eq!(name, "nonexistent"),
+            other => panic!("expected MissingTensor, got {other:?}"),
+        }
     }
 
     #[test]
@@ -468,8 +446,40 @@ mod tests {
     fn resolve_blob_opt_returns_none_when_missing() {
         let bytes = build_gguf(&[], &[]);
         let file = GgufFile::from_bytes(bytes).unwrap();
-        let result = resolve_blob_opt(&file, "blk.0.attn_compressor.weight".into()).unwrap();
+        let result = resolve_blob_opt(&file, "blk.0.attn_compressor.weight").unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_blob_opt_returns_some_with_correct_values_when_present() {
+        let payload = f32s_to_bytes(&[7.5, -3.25, 0.0]);
+        let bytes = build_gguf(
+            &[],
+            &[("present", GgmlType::F32 as u32, vec![3], payload)],
+        );
+        let file = GgufFile::from_bytes(bytes).unwrap();
+        let blob = resolve_blob_opt(&file, "present").unwrap().expect("Some");
+        match blob {
+            WeightBlob::F32(s) => assert_eq!(s, &[7.5, -3.25, 0.0]),
+            other => panic!("expected F32, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_tensor_error_carries_layer_index() {
+        // Regression test for the prior bug where MissingTensor was
+        // a &'static template `"blk.N.attn_compressor.weight"` —
+        // it now carries the concrete layer index.
+        let bytes = build_gguf(&[], &[]);
+        let file = GgufFile::from_bytes(bytes).unwrap();
+        let err = load_compressor(&file, 37).unwrap_err();
+        match err {
+            Error::MissingTensor(name) => {
+                assert!(name.contains("blk.37"), "got {name}");
+                assert!(name.contains("attn_compressor"), "got {name}");
+            }
+            other => panic!("expected MissingTensor, got {other:?}"),
+        }
     }
 
     #[test]
@@ -528,6 +538,51 @@ mod tests {
         let file = GgufFile::from_bytes(bytes).unwrap();
         let err = load_indexer(&file, 2).unwrap_err();
         assert!(matches!(err, Error::MissingTensor(_)));
+    }
+
+    #[test]
+    fn load_indexer_returns_pair_when_all_tensors_present() {
+        // Layer 2: ratio-4. Build the four required tensors at the
+        // correct shapes; verify load_indexer returns Some((write, read)).
+        let kv_elems = DSV4_N_INDEXER_HEAD_DIM * DSV4_N_EMBD;
+        let q_elems = DSV4_N_INDEXER_HEAD * DSV4_N_INDEXER_HEAD_DIM * DSV4_N_EMBD;
+        let head_w_elems = DSV4_N_INDEXER_HEAD;
+        let bytes = build_gguf(
+            &[],
+            &[
+                (
+                    "blk.2.attn_indexer_kv.weight",
+                    GgmlType::F32 as u32,
+                    vec![DSV4_N_EMBD as u64, DSV4_N_INDEXER_HEAD_DIM as u64],
+                    vec![0u8; kv_elems * 4],
+                ),
+                (
+                    "blk.2.attn_indexer_kv_score.weight",
+                    GgmlType::F32 as u32,
+                    vec![DSV4_N_EMBD as u64, DSV4_N_INDEXER_HEAD_DIM as u64],
+                    vec![0u8; kv_elems * 4],
+                ),
+                (
+                    "blk.2.attn_indexer_q.weight",
+                    GgmlType::F32 as u32,
+                    vec![
+                        DSV4_N_EMBD as u64,
+                        (DSV4_N_INDEXER_HEAD * DSV4_N_INDEXER_HEAD_DIM) as u64,
+                    ],
+                    vec![0u8; q_elems * 4],
+                ),
+                (
+                    "blk.2.attn_indexer_head_weight",
+                    GgmlType::F32 as u32,
+                    vec![head_w_elems as u64],
+                    vec![0u8; head_w_elems * 4],
+                ),
+            ],
+        );
+        let file = GgufFile::from_bytes(bytes).unwrap();
+        let (write, read) = load_indexer(&file, 2).unwrap().expect("Some");
+        assert_eq!(read.attn_indexer_head_weight.len(), DSV4_N_INDEXER_HEAD);
+        let _ = write.attn_indexer_kv.byte_len();
     }
 
     #[test]
