@@ -653,8 +653,23 @@ pub fn load_block<'a>(gguf: &'a GgufFile, il: usize) -> Result<DsV4Block<'a>, Er
 /// - [`Error::ShapeMismatch`] when a tensor's byte count disagrees
 ///   with the expected logical shape.
 pub fn load_dsv4_flash(gguf: &GgufFile) -> Result<DeepSeekV4Flash<'_>, Error> {
+    // Top-level INFO span so per-block DEBUG events under a single
+    // load are easy to group when filtering tracing output.
+    let _span = tracing::info_span!(
+        target: "rsllm_models::dsv4::loader",
+        "load_dsv4_flash",
+        n_layer = DSV4_N_LAYER,
+    )
+    .entered();
+    let started = std::time::Instant::now();
+
     // 1. Metadata sanity. Catches arch / shape constant drift early.
     validate_metadata(gguf.metadata())?;
+    tracing::info!(
+        target: "rsllm_models::dsv4::loader",
+        "metadata validated: arch=deepseek-v4-flash n_layer={} n_vocab={} n_embd={}",
+        DSV4_N_LAYER, DSV4_N_VOCAB, DSV4_N_EMBD,
+    );
 
     // HC scale placeholder advisory. Emitted at WARN so any caller
     // running numerics under tracing sees it loudly.
@@ -685,21 +700,53 @@ pub fn load_dsv4_flash(gguf: &GgufFile) -> Result<DeepSeekV4Flash<'_>, Error> {
     // the same mmap region — that's exactly what tied-weight semantics
     // demand. The final `DeepSeekV4Flash::new(embed_tokens, ..., lm_head)`
     // call is therefore well-formed despite the apparent move.
-    let lm_head = match resolve_blob_opt(gguf, tensor_names::OUTPUT)? {
+    let (lm_head, tied_lm_head) = match resolve_blob_opt(gguf, tensor_names::OUTPUT)? {
         Some(blob) => {
             blob.check_shape(DSV4_N_VOCAB, DSV4_N_EMBD, "loader.lm_head")?;
-            blob
+            (blob, false)
         }
-        None => embed_tokens,
+        None => (embed_tokens, true),
     };
+    tracing::info!(
+        target: "rsllm_models::dsv4::loader",
+        "global tensors loaded: token_embd, output_norm, lm_head ({})",
+        if tied_lm_head { "tied" } else { "separate" },
+    );
 
-    // 3. Per-layer blocks.
+    // 3. Per-layer blocks. Per-block DEBUG events are reasonable
+    // signal-to-noise (43 lines) for a multi-minute load; the
+    // wider INFO heartbeat below keeps the default-level operator
+    // informed without flooding.
     let mut blocks = Vec::with_capacity(DSV4_N_LAYER);
     for il in 0..DSV4_N_LAYER {
+        let block_started = std::time::Instant::now();
         blocks.push(load_block(gguf, il)?);
+        tracing::debug!(
+            target: "rsllm_models::dsv4::loader",
+            il,
+            elapsed_ms = block_started.elapsed().as_millis() as u64,
+            compress_ratio = layer_compress_ratio(il),
+            has_indexer = layer_has_indexer(il),
+            "block loaded",
+        );
+        if il == DSV4_N_LAYER / 2 {
+            tracing::info!(
+                target: "rsllm_models::dsv4::loader",
+                "midway: {}/{} blocks loaded ({} ms elapsed)",
+                il + 1,
+                DSV4_N_LAYER,
+                started.elapsed().as_millis(),
+            );
+        }
     }
 
-    DeepSeekV4Flash::new(embed_tokens, blocks, output_norm, lm_head)
+    let model = DeepSeekV4Flash::new(embed_tokens, blocks, output_norm, lm_head)?;
+    tracing::info!(
+        target: "rsllm_models::dsv4::loader",
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "load complete",
+    );
+    Ok(model)
 }
 
 /// Inspect the metadata table directly. Convenience for callers

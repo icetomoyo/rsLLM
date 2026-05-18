@@ -31,8 +31,55 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
 
+    /// Global log level. Overrides nothing if `RUST_LOG` is set;
+    /// otherwise sets the tracing subscriber's level filter. Use
+    /// `trace` for per-step decode timing, `debug` for per-layer
+    /// progress, `info` for the default per-load summary, `warn`
+    /// for placeholders / TODOs, `error` to silence non-fatal
+    /// messages.
+    #[arg(long = "log-level", value_enum, default_value_t = LogLevel::Info, global = true)]
+    pub log_level: LogLevel,
+
     #[command(flatten)]
     pub run: RunFlags,
+}
+
+/// Tracing level filter exposed via `--log-level`. Mirrors
+/// [`tracing::Level`] but adds an explicit `Off` for users who want
+/// to silence everything including warnings.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq, Default)]
+pub enum LogLevel {
+    /// Emit nothing — useful for scripted runs where stderr should
+    /// stay clean.
+    Off,
+    /// Only fatal-class messages (none today; reserved).
+    Error,
+    /// Placeholders, TODOs, and recoverable anomalies.
+    Warn,
+    /// Default — one-shot summary, REPL transitions, model load.
+    #[default]
+    Info,
+    /// Per-layer progress, scratch-resize reasons, sampler choices.
+    Debug,
+    /// Per-step decode timing, per-token logprob, KV-cache state.
+    Trace,
+}
+
+impl LogLevel {
+    /// Map to the equivalent EnvFilter directive string. Returns
+    /// `"off"` for [`LogLevel::Off`]; otherwise the lowercase
+    /// `tracing::Level` name.
+    #[must_use]
+    pub fn as_filter_directive(self) -> &'static str {
+        match self {
+            LogLevel::Off => "off",
+            LogLevel::Error => "error",
+            LogLevel::Warn => "warn",
+            LogLevel::Info => "info",
+            LogLevel::Debug => "debug",
+            LogLevel::Trace => "trace",
+        }
+    }
 }
 
 /// Explicit subcommands. Anything else goes through the root flags.

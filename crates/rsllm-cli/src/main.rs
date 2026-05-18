@@ -14,7 +14,7 @@ use clap::Parser;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
-use rsllm_cli::cli::{Cli, Command, RunFlags};
+use rsllm_cli::cli::{Cli, Command, LogLevel, RunFlags};
 use rsllm_cli::engine::CliEngine;
 use rsllm_cli::repl::{ReplState, SlashCommand, parse_command};
 use rsllm_cli::{CliError, engine as eng, info, inspect};
@@ -22,14 +22,12 @@ use rsllm_core::{Engine, SamplingParams};
 use rsllm_gguf::GgufFile;
 
 fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
+    // clap must parse first so `--log-level` can prime the tracing
+    // subscriber. Clap's own error path (bad flag, --help, --version)
+    // writes directly to stderr before tracing exists — that's the
+    // desired behaviour, those messages should not be filtered.
     let cli = Cli::parse();
+    init_tracing(cli.log_level);
 
     match dispatch(cli) {
         Ok(()) => ExitCode::SUCCESS,
@@ -38,6 +36,27 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Install the tracing subscriber. Precedence:
+///
+/// 1. `RUST_LOG` env var if set — it is module-aware
+///    (`rsllm_models::dsv4=debug,rsllm_kvcache=trace`) and lets
+///    operators target specific subsystems without changing the
+///    CLI invocation.
+/// 2. Otherwise the `--log-level` flag, mapped to a global directive.
+///
+/// Writes to stderr so stdout stays clean for streamed model output
+/// (the one-shot path pipes generated tokens to stdout).
+fn init_tracing(level: LogLevel) {
+    let filter = match tracing_subscriber::EnvFilter::try_from_default_env() {
+        Ok(f) => f,
+        Err(_) => tracing_subscriber::EnvFilter::new(level.as_filter_directive()),
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
 }
 
 fn dispatch(cli: Cli) -> Result<(), CliError> {

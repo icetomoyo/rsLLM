@@ -134,6 +134,12 @@ impl<'gguf> Engine for DsV4FlashEngine<'gguf> {
             });
         }
         let cache = ThreeTierKvCache::new(ctx_size);
+        tracing::info!(
+            target: "rsllm_models::engine_impl",
+            ctx_size,
+            tier = ?self.tier,
+            "session started",
+        );
         Ok(DsV4FlashSession {
             engine: self,
             cache,
@@ -262,6 +268,14 @@ impl Session for DsV4FlashSession<'_, '_> {
             });
         }
         let n_tok = tokens.len();
+        let _span = tracing::debug_span!(
+            target: "rsllm_models::engine_impl",
+            "prefill",
+            n_tok,
+            position_before = self.position,
+        )
+        .entered();
+        let started = std::time::Instant::now();
         self.ensure_scratch_for(n_tok);
 
         // Zero the whole `streams` region before embedding. `Vec::resize`
@@ -300,6 +314,13 @@ impl Session for DsV4FlashSession<'_, '_> {
             tier,
         )
         .map_err(map_model_err)?;
+        tracing::info!(
+            target: "rsllm_models::engine_impl",
+            n_tok,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            position_after = self.position,
+            "prefill complete",
+        );
         Ok(self.logits_buf.clone())
     }
 
@@ -310,6 +331,7 @@ impl Session for DsV4FlashSession<'_, '_> {
                 capacity: self.capacity,
             });
         }
+        let started = std::time::Instant::now();
         self.ensure_scratch_for(1);
         let stream0_len = rsllm_backend_cpu::ops::sinkhorn::N_HC * DSV4_N_EMBD;
         embed_token(
@@ -336,6 +358,14 @@ impl Session for DsV4FlashSession<'_, '_> {
         )
         .map_err(map_model_err)?;
         let token_id = self.sampler.sample(&mut self.logits_buf);
+        tracing::trace!(
+            target: "rsllm_models::engine_impl",
+            last_token,
+            sampled = token_id,
+            position = self.position,
+            elapsed_us = started.elapsed().as_micros() as u64,
+            "decode step",
+        );
         Ok(DecodeStep {
             token_id,
             probs: self.logits_buf.clone(),
@@ -343,6 +373,7 @@ impl Session for DsV4FlashSession<'_, '_> {
     }
 
     fn reset(&mut self) {
+        let prior_position = self.position;
         self.cache.clear();
         self.position = 0;
         // Force the next prefill / decode to resize scratch, which
@@ -352,6 +383,11 @@ impl Session for DsV4FlashSession<'_, '_> {
         // decode after reset, the scratch is still hot from a prior
         // session.
         self.current_n_tok = 0;
+        tracing::debug!(
+            target: "rsllm_models::engine_impl",
+            prior_position,
+            "session reset",
+        );
     }
 }
 

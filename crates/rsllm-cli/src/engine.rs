@@ -61,6 +61,19 @@ pub fn run_one_shot(
     system: Option<&str>,
     flags: &RunFlags,
 ) -> Result<(), CliError> {
+    let _span = tracing::info_span!(
+        target: "rsllm_cli::engine",
+        "one_shot",
+        ctx_size = flags.ctx_size,
+    )
+    .entered();
+    tracing::info!(
+        target: "rsllm_cli::engine",
+        model = %model_path.display(),
+        prompt_chars = prompt.len(),
+        "loading model",
+    );
+
     // Open the dumper BEFORE the model load so a bad --dump-logprobs
     // path errors immediately instead of after a multi-minute mmap.
     let mut dumper = match &flags.dump_logprobs {
@@ -92,6 +105,12 @@ pub fn run_one_shot(
             flags.ctx_size,
         )));
     }
+    tracing::debug!(
+        target: "rsllm_cli::engine",
+        prompt_tokens = tokens.len(),
+        think = ?think,
+        "prompt encoded",
+    );
 
     // Prefill the prompt. The returned logits are discarded — the
     // first decode step is driven by `decode_one` seeded with the
@@ -104,9 +123,13 @@ pub fn run_one_shot(
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 
+    let decode_started = std::time::Instant::now();
+    let mut decoded = 0_u32;
+    let mut hit_eos = false;
     for step_idx in 0..(DEFAULT_MAX_DECODE_TOKENS as u32) {
         let step = session.decode_one(last_token).map_err(map_engine_err)?;
         if step.token_id == tokenizer.eos_id() {
+            hit_eos = true;
             break;
         }
         write_step_outputs(
@@ -120,6 +143,7 @@ pub fn run_one_shot(
             &mut utf8_carry,
         )?;
         last_token = step.token_id;
+        decoded += 1;
     }
     // Drop any trailing partial-UTF-8 carry (the model emitted EOS or
     // hit the cap mid-codepoint). Emit as lossy bytes so the user
@@ -130,7 +154,30 @@ pub fn run_one_shot(
     }
     out.write_all(b"\n").map_err(CliError::Io)?;
     out.flush().map_err(CliError::Io)?;
+
+    let elapsed = decode_started.elapsed();
+    let tok_per_sec = tok_per_sec(decoded, elapsed);
+    tracing::info!(
+        target: "rsllm_cli::engine",
+        decoded,
+        elapsed_ms = elapsed.as_millis() as u64,
+        tok_per_sec = format!("{tok_per_sec:.2}").as_str(),
+        hit_eos,
+        cap_hit = !hit_eos && (decoded as usize) == DEFAULT_MAX_DECODE_TOKENS,
+        "generation complete",
+    );
     Ok(())
+}
+
+/// Wall-clock decode throughput. Returns 0 when fewer than 1 token was
+/// produced or elapsed is zero (e.g. EOS at step 0).
+fn tok_per_sec(decoded: u32, elapsed: std::time::Duration) -> f64 {
+    let sec = elapsed.as_secs_f64();
+    if decoded == 0 || sec <= 0.0 {
+        0.0
+    } else {
+        f64::from(decoded) / sec
+    }
 }
 
 /// Persistent engine handle for the REPL — kept across turns so a
@@ -171,6 +218,12 @@ impl<'gguf> CliEngine<'gguf> {
         think: ThinkMode,
         flags: &RunFlags,
     ) -> Result<(), CliError> {
+        let _span = tracing::info_span!(
+            target: "rsllm_cli::engine",
+            "repl_turn",
+            position_before = session.position(),
+        )
+        .entered();
         let tok_think = map_think(think);
         let tokens =
             self.tokenizer
@@ -188,6 +241,12 @@ impl<'gguf> CliEngine<'gguf> {
                 session.capacity(),
             )));
         }
+        tracing::debug!(
+            target: "rsllm_cli::engine",
+            prompt_tokens = tokens.len(),
+            think = ?tok_think,
+            "turn encoded",
+        );
 
         let _ = session.prefill(&tokens).map_err(map_engine_err)?;
         let mut last_token = *tokens.last().expect("non-empty after empty check");
@@ -199,9 +258,13 @@ impl<'gguf> CliEngine<'gguf> {
         // moving it — we want the same handle alive across steps and
         // returned implicitly to the caller via the borrow ending.
         let mut dumper_opt = dumper;
+        let decode_started = std::time::Instant::now();
+        let mut decoded = 0_u32;
+        let mut hit_eos = false;
         for step_idx in 0..(DEFAULT_MAX_DECODE_TOKENS as u32) {
             let step = session.decode_one(last_token).map_err(map_engine_err)?;
             if step.token_id == self.tokenizer.eos_id() {
+                hit_eos = true;
                 break;
             }
             write_step_outputs(
@@ -215,6 +278,7 @@ impl<'gguf> CliEngine<'gguf> {
                 &mut utf8_carry,
             )?;
             last_token = step.token_id;
+            decoded += 1;
         }
         if !utf8_carry.is_empty() {
             out.write_all(String::from_utf8_lossy(&utf8_carry).as_bytes())
@@ -222,6 +286,18 @@ impl<'gguf> CliEngine<'gguf> {
         }
         out.write_all(b"\n").map_err(CliError::Io)?;
         out.flush().map_err(CliError::Io)?;
+
+        let elapsed = decode_started.elapsed();
+        let tps = tok_per_sec(decoded, elapsed);
+        tracing::info!(
+            target: "rsllm_cli::engine",
+            decoded,
+            elapsed_ms = elapsed.as_millis() as u64,
+            tok_per_sec = format!("{tps:.2}").as_str(),
+            hit_eos,
+            cap_hit = !hit_eos && (decoded as usize) == DEFAULT_MAX_DECODE_TOKENS,
+            "turn complete",
+        );
         Ok(())
     }
 }
@@ -379,6 +455,21 @@ mod tests {
         let probs = vec![0.5_f32];
         let top = top_k_entries(&probs, 1);
         assert!((top[0].logit - 0.5_f32.ln()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn tok_per_sec_handles_zero_paths() {
+        // Empty generation → 0 not NaN.
+        assert!(
+            (tok_per_sec(0, std::time::Duration::from_secs(1)) - 0.0).abs() < f64::EPSILON
+        );
+        // Zero elapsed → 0 (would otherwise divide by zero).
+        assert!(
+            (tok_per_sec(10, std::time::Duration::from_secs(0)) - 0.0).abs() < f64::EPSILON
+        );
+        // 100 tokens / 2s = 50 tok/s.
+        let r = tok_per_sec(100, std::time::Duration::from_secs(2));
+        assert!((r - 50.0).abs() < 1e-9);
     }
 
     #[test]
