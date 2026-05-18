@@ -40,7 +40,7 @@ use rsllm_backend_cpu::ops::{rmsnorm, sinkhorn::N_HC};
 use rsllm_gguf::Metadata;
 
 use crate::Error;
-use crate::dsv4::compressor::{CompressorWeights, IndexerReadWeights, IndexerWriteWeights};
+use crate::dsv4::compressor::{CompressorWeights, IndexerWeights};
 use crate::dsv4::hc::{HcScratch, HcSublayerWeights, hc_post, hc_pre};
 use crate::dsv4::mla::{MlaOutput, MlaScratch, MlaWeights, mla_projections};
 use crate::dsv4::moe::{
@@ -97,13 +97,11 @@ pub struct DsV4Block<'a> {
     /// Consumed by F008.C to replace the zero-placeholder scores in
     /// [`crate::dsv4::attention::ThreeTierAttention`].
     pub compressor: Option<CompressorWeights<'a>>,
-    /// Per-token indexer write-side LoRA pair (produces the indexer
-    /// KV row + per-dim score). Present iff this layer is ratio-4
-    /// (even `il >= 2`).
-    pub indexer_write: Option<IndexerWriteWeights<'a>>,
-    /// Per-token indexer read-side LoRA + per-head scoring weights.
-    /// Present on the same set of layers as `indexer_write`.
-    pub indexer_read: Option<IndexerReadWeights<'a>>,
+    /// Six-tensor indexer weight bundle (ds4.c:2326-2331). Present iff
+    /// this layer is ratio-4 (even `il >= 2`). The algorithm using these
+    /// is deferred to F011; until then `attention.rs` keeps zero-placeholder
+    /// indexer scores.
+    pub indexer: Option<IndexerWeights<'a>>,
 
     /// Pre-FFN RMSNorm scale `[N_EMBD]`.
     pub ffn_norm: &'a [f32],
@@ -127,8 +125,7 @@ impl<'a> DsV4Block<'a> {
     ///   and vice versa;
     /// - dense layers (`il < 2`) must NOT carry compressor/indexer weights;
     /// - compressed layers must carry a `compressor`;
-    /// - ratio-4 layers must carry both `indexer_write` and `indexer_read`,
-    ///   ratio-128 layers must NOT.
+    /// - ratio-4 layers must carry `indexer = Some(_)`, ratio-128 layers must NOT.
     fn validate(&self, layer_idx: usize) -> Result<(), Error> {
         let is_hash = layer_idx < DSV4_HASH_ROUTE_LAYERS;
         match (is_hash, self.hash_router.is_some(), self.topk_router.is_some()) {
@@ -164,24 +161,16 @@ impl<'a> DsV4Block<'a> {
                 actual: format!("{}", self.compressor.is_some()),
             });
         }
-        // Indexer pair: both required iff this is a ratio-4 layer.
-        if has_indexer
-            != (self.indexer_write.is_some() && self.indexer_read.is_some())
-        {
+        // Indexer bundle: required iff this is a ratio-4 layer.
+        if has_indexer != self.indexer.is_some() {
             return Err(Error::ShapeMismatch {
                 key: "block.indexer",
                 expected: if has_indexer {
-                    format!(
-                        "indexer_write=Some, indexer_read=Some (layer {layer_idx} is ratio-4)"
-                    )
+                    format!("Some (layer {layer_idx} is ratio-4)")
                 } else {
-                    format!("both None (layer {layer_idx} is not ratio-4)")
+                    format!("None (layer {layer_idx} is not ratio-4)")
                 },
-                actual: format!(
-                    "indexer_write={}, indexer_read={}",
-                    self.indexer_write.is_some(),
-                    self.indexer_read.is_some(),
-                ),
+                actual: format!("{}", self.indexer.is_some()),
             });
         }
 
@@ -209,30 +198,30 @@ impl<'a> DsV4Block<'a> {
                 });
             }
         }
-        if let Some(w) = self.indexer_write.as_ref() {
-            w.attn_indexer_kv.check_shape(
-                crate::dsv4::shape::DSV4_N_INDEXER_HEAD_DIM,
-                DSV4_N_EMBD,
-                "block.indexer_write.attn_indexer_kv",
-            )?;
-            w.attn_indexer_kv_score.check_shape(
-                crate::dsv4::shape::DSV4_N_INDEXER_HEAD_DIM,
-                DSV4_N_EMBD,
-                "block.indexer_write.attn_indexer_kv_score",
-            )?;
-        }
-        if let Some(r) = self.indexer_read.as_ref() {
-            r.attn_indexer_q.check_shape(
+        // Deep shape checks for the six indexer tensors (F010.C).
+        // index_width = 2 × N_INDEXER_HEAD_DIM, ratio = 4 (ratio-4 layers only).
+        if let Some(iw) = self.indexer.as_ref() {
+            let index_width = 2 * crate::dsv4::shape::DSV4_N_INDEXER_HEAD_DIM;
+            let indexer_ratio = 4usize;
+            iw.attn_q_b.check_shape(
                 crate::dsv4::shape::DSV4_N_INDEXER_HEAD
                     * crate::dsv4::shape::DSV4_N_INDEXER_HEAD_DIM,
-                DSV4_N_EMBD,
-                "block.indexer_read.attn_indexer_q",
+                crate::dsv4::shape::DSV4_N_LORA_Q,
+                "block.indexer.attn_q_b",
             )?;
-            if r.attn_indexer_head_weight.len() != crate::dsv4::shape::DSV4_N_INDEXER_HEAD {
+            iw.proj.check_shape(
+                crate::dsv4::shape::DSV4_N_INDEXER_HEAD,
+                DSV4_N_EMBD,
+                "block.indexer.proj",
+            )?;
+            iw.comp_ape.check_shape(indexer_ratio, index_width, "block.indexer.comp_ape")?;
+            iw.comp_kv.check_shape(index_width, DSV4_N_EMBD, "block.indexer.comp_kv")?;
+            iw.comp_gate.check_shape(index_width, DSV4_N_EMBD, "block.indexer.comp_gate")?;
+            if iw.comp_norm.len() != crate::dsv4::shape::DSV4_N_INDEXER_HEAD_DIM {
                 return Err(Error::ShapeMismatch {
-                    key: "block.indexer_read.attn_indexer_head_weight",
-                    expected: format!("{}", crate::dsv4::shape::DSV4_N_INDEXER_HEAD),
-                    actual: format!("{}", r.attn_indexer_head_weight.len()),
+                    key: "block.indexer.comp_norm",
+                    expected: format!("{}", crate::dsv4::shape::DSV4_N_INDEXER_HEAD_DIM),
+                    actual: format!("{}", iw.comp_norm.len()),
                 });
             }
         }
@@ -764,10 +753,14 @@ mod tests {
         compressor_gate_r4: Vec<f32>,
         compressor_ape_r4: Vec<f32>,
         compressor_norm: Vec<f32>,
-        indexer_kv_w: Vec<f32>,
-        indexer_kv_score_w: Vec<f32>,
-        indexer_q_w: Vec<f32>,
-        indexer_head_weight: Vec<f32>,
+        // F010.C six-tensor indexer backing buffers (ratio-4 only).
+        // index_width = 2 * N_INDEXER_HEAD_DIM = 256, ratio = 4.
+        indexer_attn_q_b: Vec<f32>,
+        indexer_proj: Vec<f32>,
+        indexer_comp_ape: Vec<f32>,
+        indexer_comp_kv: Vec<f32>,
+        indexer_comp_gate: Vec<f32>,
+        indexer_comp_norm: Vec<f32>,
     }
 
     impl StubBlockStorage {
@@ -807,21 +800,30 @@ mod tests {
                 compressor_gate_r4:   vec![0.0; 2 * DSV4_HEAD_DIM * DSV4_N_EMBD],
                 compressor_ape_r4:    vec![0.0; 2 * DSV4_HEAD_DIM * 4],
                 compressor_norm:      vec![1.0; DSV4_HEAD_DIM],
-                indexer_kv_w: vec![
+                // F010.C indexer — index_width = 2 * N_INDEXER_HEAD_DIM = 256
+                indexer_attn_q_b: vec![
                     0.0;
-                    crate::dsv4::shape::DSV4_N_INDEXER_HEAD_DIM * DSV4_N_EMBD
-                ],
-                indexer_kv_score_w: vec![
-                    0.0;
-                    crate::dsv4::shape::DSV4_N_INDEXER_HEAD_DIM * DSV4_N_EMBD
-                ],
-                indexer_q_w: vec![
-                    0.0;
-                    crate::dsv4::shape::DSV4_N_INDEXER_HEAD
+                    crate::dsv4::shape::DSV4_N_LORA_Q
+                        * crate::dsv4::shape::DSV4_N_INDEXER_HEAD
                         * crate::dsv4::shape::DSV4_N_INDEXER_HEAD_DIM
-                        * DSV4_N_EMBD
                 ],
-                indexer_head_weight: vec![1.0; crate::dsv4::shape::DSV4_N_INDEXER_HEAD],
+                indexer_proj: vec![
+                    0.0;
+                    DSV4_N_EMBD * crate::dsv4::shape::DSV4_N_INDEXER_HEAD
+                ],
+                indexer_comp_ape: vec![
+                    0.0;
+                    (2 * crate::dsv4::shape::DSV4_N_INDEXER_HEAD_DIM) * 4
+                ],
+                indexer_comp_kv: vec![
+                    0.0;
+                    DSV4_N_EMBD * (2 * crate::dsv4::shape::DSV4_N_INDEXER_HEAD_DIM)
+                ],
+                indexer_comp_gate: vec![
+                    0.0;
+                    DSV4_N_EMBD * (2 * crate::dsv4::shape::DSV4_N_INDEXER_HEAD_DIM)
+                ],
+                indexer_comp_norm: vec![1.0; crate::dsv4::shape::DSV4_N_INDEXER_HEAD_DIM],
             }
         }
 
@@ -915,18 +917,14 @@ mod tests {
                         }),
                     }
                 },
-                indexer_write: if rsllm_kvcache::dsv4::shape::layer_has_indexer(layer_idx) {
-                    Some(IndexerWriteWeights {
-                        attn_indexer_kv: WeightBlob::F32(&self.indexer_kv_w),
-                        attn_indexer_kv_score: WeightBlob::F32(&self.indexer_kv_score_w),
-                    })
-                } else {
-                    None
-                },
-                indexer_read: if rsllm_kvcache::dsv4::shape::layer_has_indexer(layer_idx) {
-                    Some(IndexerReadWeights {
-                        attn_indexer_q: WeightBlob::F32(&self.indexer_q_w),
-                        attn_indexer_head_weight: &self.indexer_head_weight,
+                indexer: if rsllm_kvcache::dsv4::shape::layer_has_indexer(layer_idx) {
+                    Some(IndexerWeights {
+                        attn_q_b: WeightBlob::F32(&self.indexer_attn_q_b),
+                        proj: WeightBlob::F32(&self.indexer_proj),
+                        comp_ape: WeightBlob::F32(&self.indexer_comp_ape),
+                        comp_kv: WeightBlob::F32(&self.indexer_comp_kv),
+                        comp_gate: WeightBlob::F32(&self.indexer_comp_gate),
+                        comp_norm: &self.indexer_comp_norm,
                     })
                 } else {
                     None
@@ -984,39 +982,28 @@ mod tests {
 
     #[test]
     fn ratio4_layer_without_indexer_rejected() {
-        // Layer 2 is the first ratio-4 layer; indexer_write+read required.
+        // Layer 2 is the first ratio-4 layer; indexer bundle required.
         let storage = StubBlockStorage::new();
         let mut block = storage.block(2);
-        block.indexer_write = None;
+        block.indexer = None;
         let err = block.validate(2).unwrap_err();
         assert!(matches!(err, Error::ShapeMismatch { key, .. } if key == "block.indexer"));
     }
 
     #[test]
     fn ratio128_layer_with_indexer_rejected() {
-        // Layer 3 is ratio-128; carrying an indexer should error.
+        // Layer 3 is ratio-128; carrying an indexer bundle should error.
         let storage = StubBlockStorage::new();
         let mut block = storage.block(3);
-        block.indexer_write = Some(IndexerWriteWeights {
-            attn_indexer_kv: WeightBlob::F32(&storage.indexer_kv_w),
-            attn_indexer_kv_score: WeightBlob::F32(&storage.indexer_kv_score_w),
-        });
-        block.indexer_read = Some(IndexerReadWeights {
-            attn_indexer_q: WeightBlob::F32(&storage.indexer_q_w),
-            attn_indexer_head_weight: &storage.indexer_head_weight,
+        block.indexer = Some(IndexerWeights {
+            attn_q_b: WeightBlob::F32(&storage.indexer_attn_q_b),
+            proj: WeightBlob::F32(&storage.indexer_proj),
+            comp_ape: WeightBlob::F32(&storage.indexer_comp_ape),
+            comp_kv: WeightBlob::F32(&storage.indexer_comp_kv),
+            comp_gate: WeightBlob::F32(&storage.indexer_comp_gate),
+            comp_norm: &storage.indexer_comp_norm,
         });
         let err = block.validate(3).unwrap_err();
-        assert!(matches!(err, Error::ShapeMismatch { key, .. } if key == "block.indexer"));
-    }
-
-    #[test]
-    fn ratio4_layer_with_only_one_indexer_half_rejected() {
-        let storage = StubBlockStorage::new();
-        let mut block = storage.block(2);
-        block.indexer_read = None;
-        // indexer_write is Some but indexer_read is None — neither
-        // half is a usable signal on its own.
-        let err = block.validate(2).unwrap_err();
         assert!(matches!(err, Error::ShapeMismatch { key, .. } if key == "block.indexer"));
     }
 
@@ -1044,20 +1031,27 @@ mod tests {
     }
 
     #[test]
-    fn indexer_q_with_wrong_byte_len_rejected() {
+    fn indexer_attn_q_b_with_wrong_byte_len_rejected() {
+        // Verify the deep shape check on attn_q_b fires when the backing
+        // storage is one element short of [N_LORA_Q × (N_INDEXER_HEAD × N_INDEXER_HEAD_DIM)].
         let storage = StubBlockStorage::new();
-        let q_lanes = crate::dsv4::shape::DSV4_N_INDEXER_HEAD
+        let attn_q_b_lanes = crate::dsv4::shape::DSV4_N_LORA_Q
+            * crate::dsv4::shape::DSV4_N_INDEXER_HEAD
             * crate::dsv4::shape::DSV4_N_INDEXER_HEAD_DIM;
-        let wrong = vec![0.0_f32; q_lanes * DSV4_N_EMBD - 1];
+        let wrong_attn_q_b = vec![0.0_f32; attn_q_b_lanes - 1];
         let mut block = storage.block(2);
-        block.indexer_read = Some(IndexerReadWeights {
-            attn_indexer_q: WeightBlob::F32(&wrong),
-            attn_indexer_head_weight: &storage.indexer_head_weight,
+        block.indexer = Some(IndexerWeights {
+            attn_q_b: WeightBlob::F32(&wrong_attn_q_b),
+            proj: WeightBlob::F32(&storage.indexer_proj),
+            comp_ape: WeightBlob::F32(&storage.indexer_comp_ape),
+            comp_kv: WeightBlob::F32(&storage.indexer_comp_kv),
+            comp_gate: WeightBlob::F32(&storage.indexer_comp_gate),
+            comp_norm: &storage.indexer_comp_norm,
         });
         let err = block.validate(2).unwrap_err();
         assert!(matches!(
             err,
-            Error::ShapeMismatch { key, .. } if key == "block.indexer_read.attn_indexer_q"
+            Error::ShapeMismatch { key, .. } if key == "block.indexer.attn_q_b"
         ));
     }
 

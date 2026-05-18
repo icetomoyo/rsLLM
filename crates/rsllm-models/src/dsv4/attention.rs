@@ -29,10 +29,7 @@ use rsllm_kvcache::dsv4::shape::{
 use rsllm_kvcache::dsv4::three_tier::{LayerAppend, ThreeTierKvCache};
 
 use crate::Error;
-use crate::dsv4::compressor::{
-    CompressorWeights, IndexerReadWeights, IndexerWriteWeights, project_compressor_score,
-    project_indexer_write,
-};
+use crate::dsv4::compressor::{CompressorWeights, IndexerWeights, project_compressor_score};
 use crate::dsv4::shape::{DSV4_HEAD_DIM, DSV4_N_HEAD};
 
 const _: () = assert!(KV_HEAD_DIM == DSV4_HEAD_DIM);
@@ -45,8 +42,7 @@ const _: () = assert!(KV_HEAD_DIM == DSV4_HEAD_DIM);
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LayerLoRAs<'a> {
     pub compressor: Option<&'a CompressorWeights<'a>>,
-    pub indexer_write: Option<&'a IndexerWriteWeights<'a>>,
-    pub indexer_read: Option<&'a IndexerReadWeights<'a>>,
+    pub indexer: Option<&'a IndexerWeights<'a>>,
 }
 
 /// Stateful adapter that satisfies F005's [`crate::AttentionFn`] surface
@@ -273,22 +269,15 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
                 .resize(n_tok * DSV4_N_INDEXER_HEAD_DIM, 0.0);
             self.scratch_indexer_score
                 .resize(n_tok * DSV4_N_INDEXER_HEAD_DIM, 0.0);
-            if let Some(w) = layer_loras.indexer_write {
-                project_indexer_write(
-                    w,
-                    x,
-                    &mut self.scratch_indexer_kv,
-                    &mut self.scratch_indexer_score,
-                    n_tok,
-                    self.tier,
-                )?;
-            } else {
-                for v in self.scratch_indexer_kv.iter_mut() {
-                    *v = 0.0;
-                }
-                for v in self.scratch_indexer_score.iter_mut() {
-                    *v = 0.0;
-                }
+            // TODO(F011): indexer pipeline — project_indexer_* intentionally absent.
+            // F011 will wire the per-position APE bias, gate sigmoid, pool reduction,
+            // and RMSNorm using `layer_loras.indexer`. Until then, zero-fill both
+            // scratch buffers so the cache append is exercised but scores are inert.
+            for v in self.scratch_indexer_kv.iter_mut() {
+                *v = 0.0;
+            }
+            for v in self.scratch_indexer_score.iter_mut() {
+                *v = 0.0;
             }
         }
 
@@ -581,20 +570,24 @@ mod tests {
             norm: &comp_norm,
         };
 
-        // Indexer weights: zero (won't fire numerically but the path
-        // is exercised so the cache append succeeds).
-        let idx_kv_w = vec![0.0_f32; DSV4_N_INDEXER_HEAD_DIM * n_embd];
-        let idx_score_w = vec![0.0_f32; DSV4_N_INDEXER_HEAD_DIM * n_embd];
-        let q_lanes = crate::dsv4::shape::DSV4_N_INDEXER_HEAD * DSV4_N_INDEXER_HEAD_DIM;
-        let idx_q_w = vec![0.0_f32; q_lanes * n_embd];
-        let idx_head_w = vec![1.0_f32; crate::dsv4::shape::DSV4_N_INDEXER_HEAD];
-        let indexer_write = IndexerWriteWeights {
-            attn_indexer_kv: crate::dsv4::weight::WeightBlob::F32(&idx_kv_w),
-            attn_indexer_kv_score: crate::dsv4::weight::WeightBlob::F32(&idx_score_w),
-        };
-        let indexer_read = IndexerReadWeights {
-            attn_indexer_q: crate::dsv4::weight::WeightBlob::F32(&idx_q_w),
-            attn_indexer_head_weight: &idx_head_w,
+        // Indexer weights: all-zero bundle (path is exercised so the cache
+        // append succeeds; real scoring is F011). Six tensors required by
+        // IndexerWeights; shapes match the upstream constants.
+        let index_width = 2 * DSV4_N_INDEXER_HEAD_DIM; // 256
+        let idx_attn_q_b =
+            vec![0.0_f32; crate::dsv4::shape::DSV4_N_LORA_Q * crate::dsv4::shape::DSV4_N_INDEXER_HEAD * DSV4_N_INDEXER_HEAD_DIM];
+        let idx_proj = vec![0.0_f32; n_embd * crate::dsv4::shape::DSV4_N_INDEXER_HEAD];
+        let idx_comp_ape = vec![0.0_f32; index_width * 4];
+        let idx_comp_kv = vec![0.0_f32; n_embd * index_width];
+        let idx_comp_gate = vec![0.0_f32; n_embd * index_width];
+        let idx_comp_norm = vec![1.0_f32; DSV4_N_INDEXER_HEAD_DIM];
+        let indexer_weights_bundle = IndexerWeights {
+            attn_q_b: crate::dsv4::weight::WeightBlob::F32(&idx_attn_q_b),
+            proj: crate::dsv4::weight::WeightBlob::F32(&idx_proj),
+            comp_ape: crate::dsv4::weight::WeightBlob::F32(&idx_comp_ape),
+            comp_kv: crate::dsv4::weight::WeightBlob::F32(&idx_comp_kv),
+            comp_gate: crate::dsv4::weight::WeightBlob::F32(&idx_comp_gate),
+            comp_norm: &idx_comp_norm,
         };
 
         let mut loras = vec![LayerLoRAs::default(); DSV4_N_LAYER];
@@ -604,8 +597,7 @@ mod tests {
                 slot.compressor = Some(&compressor);
             }
             if rsllm_kvcache::dsv4::shape::layer_has_indexer(il) {
-                slot.indexer_write = Some(&indexer_write);
-                slot.indexer_read = Some(&indexer_read);
+                slot.indexer = Some(&indexer_weights_bundle);
             }
         }
 
@@ -651,14 +643,14 @@ mod tests {
 
     #[test]
     fn loras_path_writes_real_indexer_score_into_pool() {
-        // Mirror of the compressor test, but exercises the indexer
-        // write side. With a non-zero `attn_indexer_kv` weight, the
-        // 4-token boundary emission on a ratio-4 layer must produce
-        // a non-zero row inside the indexer's compressed pool.
+        // Exercises the indexer path end-to-end with an IndexerWeights
+        // bundle supplied via slot.indexer. The indexer algorithm itself
+        // is deferred to F011, so the scratch buffers are zero-filled
+        // regardless of weight content. The structural guarantee tested
+        // here is: 4 tokens on a ratio-4 layer triggers exactly one
+        // emission into the indexer compressed pool.
         let n_embd = crate::dsv4::shape::DSV4_N_EMBD;
-        // Compressor: zero across all four tensors (path is exercised
-        // but inert in this test — the indexer side is what we're
-        // measuring).
+        // Compressor: all-zero, inert in this test.
         let comp_kv = vec![0.0_f32; DSV4_HEAD_DIM * n_embd];
         let comp_gate = vec![0.0_f32; DSV4_HEAD_DIM * n_embd];
         let comp_ape = vec![0.0_f32; DSV4_HEAD_DIM * 128];
@@ -669,26 +661,24 @@ mod tests {
             ape: crate::dsv4::weight::WeightBlob::F32(&comp_ape),
             norm: &comp_norm,
         };
-        // Indexer write: identity on the first INDEXER_HEAD_DIM lanes
-        // of x; non-zero score so the softmax-aggregate is non-trivial.
-        let mut idx_kv_w = vec![0.0_f32; DSV4_N_INDEXER_HEAD_DIM * n_embd];
-        for o in 0..DSV4_N_INDEXER_HEAD_DIM {
-            idx_kv_w[o * n_embd + o] = 1.0;
-        }
-        let mut idx_score_w = vec![0.0_f32; DSV4_N_INDEXER_HEAD_DIM * n_embd];
-        for o in 0..DSV4_N_INDEXER_HEAD_DIM {
-            idx_score_w[o * n_embd + o] = 0.5;
-        }
-        let q_lanes = crate::dsv4::shape::DSV4_N_INDEXER_HEAD * DSV4_N_INDEXER_HEAD_DIM;
-        let idx_q_w = vec![0.0_f32; q_lanes * n_embd];
-        let idx_head_w = vec![1.0_f32; crate::dsv4::shape::DSV4_N_INDEXER_HEAD];
-        let indexer_write = IndexerWriteWeights {
-            attn_indexer_kv: crate::dsv4::weight::WeightBlob::F32(&idx_kv_w),
-            attn_indexer_kv_score: crate::dsv4::weight::WeightBlob::F32(&idx_score_w),
-        };
-        let indexer_read = IndexerReadWeights {
-            attn_indexer_q: crate::dsv4::weight::WeightBlob::F32(&idx_q_w),
-            attn_indexer_head_weight: &idx_head_w,
+        // Indexer weights: six-tensor bundle (shapes matching upstream).
+        // All-zero is fine because F011 owns the algorithm; this test
+        // only checks the cache-append plumbing.
+        let index_width = 2 * DSV4_N_INDEXER_HEAD_DIM; // 256
+        let idx_attn_q_b =
+            vec![0.0_f32; crate::dsv4::shape::DSV4_N_LORA_Q * crate::dsv4::shape::DSV4_N_INDEXER_HEAD * DSV4_N_INDEXER_HEAD_DIM];
+        let idx_proj = vec![0.0_f32; n_embd * crate::dsv4::shape::DSV4_N_INDEXER_HEAD];
+        let idx_comp_ape = vec![0.0_f32; index_width * 4];
+        let idx_comp_kv = vec![0.0_f32; n_embd * index_width];
+        let idx_comp_gate = vec![0.0_f32; n_embd * index_width];
+        let idx_comp_norm = vec![1.0_f32; DSV4_N_INDEXER_HEAD_DIM];
+        let indexer_weights_bundle = IndexerWeights {
+            attn_q_b: crate::dsv4::weight::WeightBlob::F32(&idx_attn_q_b),
+            proj: crate::dsv4::weight::WeightBlob::F32(&idx_proj),
+            comp_ape: crate::dsv4::weight::WeightBlob::F32(&idx_comp_ape),
+            comp_kv: crate::dsv4::weight::WeightBlob::F32(&idx_comp_kv),
+            comp_gate: crate::dsv4::weight::WeightBlob::F32(&idx_comp_gate),
+            comp_norm: &idx_comp_norm,
         };
 
         let mut loras = vec![LayerLoRAs::default(); DSV4_N_LAYER];
@@ -698,39 +688,25 @@ mod tests {
                 slot.compressor = Some(&compressor);
             }
             if rsllm_kvcache::dsv4::shape::layer_has_indexer(il) {
-                slot.indexer_write = Some(&indexer_write);
-                slot.indexer_read = Some(&indexer_read);
+                slot.indexer = Some(&indexer_weights_bundle);
             }
         }
 
         let mut cache = ThreeTierKvCache::new(64);
         {
             let mut attn = ThreeTierAttention::with_loras(&mut cache, &loras);
-            for t in 0..4 {
+            for _t in 0..4 {
                 let q = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
                 let kv = vec![1.0_f32; DSV4_HEAD_DIM];
-                let mut x = vec![0.0_f32; n_embd];
-                // Activate lane 0 for token t so the indexer LoRA
-                // produces non-trivial output.
-                x[0] = (t as f32) + 1.0;
+                let x = vec![0.0_f32; n_embd];
                 let mut out = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
                 attn.run_layer(&q, &kv, &x, 2, &mut out).unwrap();
             }
         }
         // 4 tokens through a ratio-4 indexer → exactly one emission.
+        // Numeric content is zero until F011 wires the real algorithm.
         let indexer_pool = cache.layers[2].indexer.as_ref().unwrap();
         assert_eq!(indexer_pool.len(), 1);
-        // The emitted row's lane 0 should be non-zero — it is a
-        // softmax-weighted aggregate of {1,2,3,4} with non-trivial
-        // per-dim weights from the LoRA. Bit-exact value depends on
-        // the softmax math; we only assert "produced real signal".
-        let emitted = indexer_pool.rows();
-        // First row's lane 0 — see indexer.rs row layout.
-        let lane0 = emitted[0];
-        assert!(
-            lane0.abs() > 1e-6,
-            "indexer pool row 0 lane 0 = {lane0}, expected non-zero",
-        );
     }
 
     #[test]

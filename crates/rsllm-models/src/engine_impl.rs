@@ -89,8 +89,7 @@ impl<'gguf> DsV4FlashEngine<'gguf> {
             .iter()
             .map(|block| LayerLoRAs {
                 compressor: block.compressor.as_ref(),
-                indexer_write: block.indexer_write.as_ref(),
-                indexer_read: block.indexer_read.as_ref(),
+                indexer: block.indexer.as_ref(),
             })
             .collect()
     }

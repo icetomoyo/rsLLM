@@ -34,7 +34,7 @@ use rsllm_kvcache::dsv4::shape::{layer_compress_ratio, layer_has_indexer};
 
 use crate::Error;
 use crate::deepseek_v4_flash::{DeepSeekV4Flash, DsV4Block};
-use crate::dsv4::compressor::{CompressorWeights, IndexerReadWeights, IndexerWriteWeights};
+use crate::dsv4::compressor::{CompressorWeights, IndexerWeights};
 use crate::dsv4::hc::{HC_DIM, HC_MIX_DIM, HcSublayerWeights};
 use crate::dsv4::mla::MlaWeights;
 use crate::dsv4::moe::{
@@ -122,13 +122,17 @@ pub mod tensor_names {
     pub const ATTN_COMPRESSOR_APE: &str = "attn_compressor_ape.weight";
     pub const ATTN_COMPRESSOR_NORM: &str = "attn_compressor_norm.weight";
 
-    /// F008.B indexer LoRAs — TODO(ds4F010.C): names still under
-    /// audit; F010.C will replace with the upstream `indexer.attn_q_b`
-    /// / `indexer.proj` / `indexer_compressor_*` set.
-    pub const ATTN_INDEXER_KV: &str = "attn_indexer_kv.weight";
-    pub const ATTN_INDEXER_KV_SCORE: &str = "attn_indexer_kv_score.weight";
-    pub const ATTN_INDEXER_Q: &str = "attn_indexer_q.weight";
-    pub const ATTN_INDEXER_HEAD_WEIGHT: &str = "attn_indexer_head_weight";
+    /// F010.C indexer tensors — verified against ds4 commit `ef0a490`
+    /// at lines 2326-2331 (struct) and 2610-2615 (load). Only ratio-4
+    /// layers carry all six. Note the dot-separated names for the two
+    /// LoRA tensors (`indexer.attn_q_b`, `indexer.proj`) — these are
+    /// exact upstream names, not a typo.
+    pub const INDEXER_ATTN_Q_B: &str = "indexer.attn_q_b.weight";
+    pub const INDEXER_PROJ: &str = "indexer.proj.weight";
+    pub const INDEXER_COMPRESSOR_APE: &str = "indexer_compressor_ape.weight";
+    pub const INDEXER_COMPRESSOR_KV: &str = "indexer_compressor_kv.weight";
+    pub const INDEXER_COMPRESSOR_GATE: &str = "indexer_compressor_gate.weight";
+    pub const INDEXER_COMPRESSOR_NORM: &str = "indexer_compressor_norm.weight";
 
     /// Format the per-layer key `"blk.{il}.{suffix}"` once.
     #[must_use]
@@ -362,76 +366,88 @@ pub fn load_compressor<'a>(
     Ok(Some(CompressorWeights { kv, gate, ape, norm }))
 }
 
-/// Build the F008.B indexer pair for layer `il`. Returns `None` on
-/// non-ratio-4 layers.
+/// Build the [`IndexerWeights`] for layer `il`. Returns `None` on
+/// non-ratio-4 layers (dense or ratio-128).
+///
+/// Loads all six ds4.c tensors (ds4.c:2610-2615, commit `ef0a490`):
+/// - `indexer.attn_q_b.weight`      F16 `[N_LORA_Q × (N_INDEXER_HEAD × N_INDEXER_HEAD_DIM)]`
+/// - `indexer.proj.weight`          F16 `[N_EMBD × N_INDEXER_HEAD]`
+/// - `indexer_compressor_ape.weight` F16 `[index_width × ratio]`
+/// - `indexer_compressor_kv.weight`  F16 `[N_EMBD × index_width]`
+/// - `indexer_compressor_gate.weight` F16 `[N_EMBD × index_width]`
+/// - `indexer_compressor_norm.weight` F32 `[N_INDEXER_HEAD_DIM]`
+///
+/// where `index_width = 2 × N_INDEXER_HEAD_DIM = 256` and `ratio = 4`.
 ///
 /// # Errors
 /// [`Error::MissingTensor`] if the layer needs indexer weights but
-/// the GGUF is missing one of the four expected names.
+/// the GGUF is missing any of the six expected names.
+/// [`Error::ShapeMismatch`] on a byte-count disagreement or if
+/// `comp_norm` is not F32-typed.
 pub fn load_indexer<'a>(
     gguf: &'a GgufFile,
     il: usize,
-) -> Result<Option<(IndexerWriteWeights<'a>, IndexerReadWeights<'a>)>, Error> {
+) -> Result<Option<IndexerWeights<'a>>, Error> {
     if !layer_has_indexer(il) {
         return Ok(None);
     }
-    let kv_name = tensor_names::blk(il, tensor_names::ATTN_INDEXER_KV);
-    let kv_blob = resolve_blob_opt(gguf, &kv_name)?
-        .ok_or_else(|| Error::MissingTensor(kv_name.clone()))?;
-    let score_name = tensor_names::blk(il, tensor_names::ATTN_INDEXER_KV_SCORE);
-    let score_blob = resolve_blob_opt(gguf, &score_name)?
-        .ok_or_else(|| Error::MissingTensor(score_name.clone()))?;
-    let q_name = tensor_names::blk(il, tensor_names::ATTN_INDEXER_Q);
-    let q_blob = resolve_blob_opt(gguf, &q_name)?
-        .ok_or_else(|| Error::MissingTensor(q_name.clone()))?;
-    let head_w_name = tensor_names::blk(il, tensor_names::ATTN_INDEXER_HEAD_WEIGHT);
-    let head_w_blob = resolve_blob_opt(gguf, &head_w_name)?
-        .ok_or_else(|| Error::MissingTensor(head_w_name.clone()))?;
-    let head_w = match head_w_blob {
-        WeightBlob::F32(s) => s,
-        WeightBlob::Quant { .. } => {
-            return Err(Error::ShapeMismatch {
-                key: "loader.indexer.head_weight",
-                expected: "F32".into(),
-                actual: format!("{head_w_name}: quantised"),
-            });
-        }
-    };
+    // ratio-4 only: index_width = 2 × N_INDEXER_HEAD_DIM
+    let index_width = 2 * DSV4_N_INDEXER_HEAD_DIM;
+    let ratio = 4usize;
 
-    // Shape checks (mirrors the in-DsV4Block validation in F008.B).
-    kv_blob.check_shape(
-        DSV4_N_INDEXER_HEAD_DIM,
-        DSV4_N_EMBD,
-        "loader.indexer.kv",
-    )?;
-    score_blob.check_shape(
-        DSV4_N_INDEXER_HEAD_DIM,
-        DSV4_N_EMBD,
-        "loader.indexer.kv_score",
-    )?;
-    q_blob.check_shape(
+    let attn_q_b_name = tensor_names::blk(il, tensor_names::INDEXER_ATTN_Q_B);
+    let attn_q_b = resolve_blob_opt(gguf, &attn_q_b_name)?
+        .ok_or_else(|| Error::MissingTensor(attn_q_b_name.clone()))?;
+    // [N_LORA_Q × (N_INDEXER_HEAD × N_INDEXER_HEAD_DIM)]
+    attn_q_b.check_shape(
         DSV4_N_INDEXER_HEAD * DSV4_N_INDEXER_HEAD_DIM,
-        DSV4_N_EMBD,
-        "loader.indexer.q",
+        DSV4_N_LORA_Q,
+        "loader.indexer.attn_q_b",
     )?;
-    if head_w.len() != DSV4_N_INDEXER_HEAD {
+
+    let proj_name = tensor_names::blk(il, tensor_names::INDEXER_PROJ);
+    let proj = resolve_blob_opt(gguf, &proj_name)?
+        .ok_or_else(|| Error::MissingTensor(proj_name.clone()))?;
+    // [N_EMBD × N_INDEXER_HEAD]
+    proj.check_shape(DSV4_N_INDEXER_HEAD, DSV4_N_EMBD, "loader.indexer.proj")?;
+
+    let comp_ape_name = tensor_names::blk(il, tensor_names::INDEXER_COMPRESSOR_APE);
+    let comp_ape = resolve_blob_opt(gguf, &comp_ape_name)?
+        .ok_or_else(|| Error::MissingTensor(comp_ape_name.clone()))?;
+    // [index_width × ratio]
+    comp_ape.check_shape(ratio, index_width, "loader.indexer.comp_ape")?;
+
+    let comp_kv_name = tensor_names::blk(il, tensor_names::INDEXER_COMPRESSOR_KV);
+    let comp_kv = resolve_blob_opt(gguf, &comp_kv_name)?
+        .ok_or_else(|| Error::MissingTensor(comp_kv_name.clone()))?;
+    // [N_EMBD × index_width]
+    comp_kv.check_shape(index_width, DSV4_N_EMBD, "loader.indexer.comp_kv")?;
+
+    let comp_gate_name = tensor_names::blk(il, tensor_names::INDEXER_COMPRESSOR_GATE);
+    let comp_gate = resolve_blob_opt(gguf, &comp_gate_name)?
+        .ok_or_else(|| Error::MissingTensor(comp_gate_name.clone()))?;
+    // [N_EMBD × index_width]
+    comp_gate.check_shape(index_width, DSV4_N_EMBD, "loader.indexer.comp_gate")?;
+
+    let comp_norm_name = tensor_names::blk(il, tensor_names::INDEXER_COMPRESSOR_NORM);
+    let comp_norm = resolve_f32_slice(gguf, &comp_norm_name)?;
+    // [N_INDEXER_HEAD_DIM]
+    if comp_norm.len() != DSV4_N_INDEXER_HEAD_DIM {
         return Err(Error::ShapeMismatch {
-            key: "loader.indexer.head_weight",
-            expected: format!("{DSV4_N_INDEXER_HEAD}"),
-            actual: format!("{}", head_w.len()),
+            key: "loader.indexer.comp_norm",
+            expected: format!("{DSV4_N_INDEXER_HEAD_DIM}"),
+            actual: format!("{comp_norm_name}: {}", comp_norm.len()),
         });
     }
 
-    Ok(Some((
-        IndexerWriteWeights {
-            attn_indexer_kv: kv_blob,
-            attn_indexer_kv_score: score_blob,
-        },
-        IndexerReadWeights {
-            attn_indexer_q: q_blob,
-            attn_indexer_head_weight: head_w,
-        },
-    )))
+    Ok(Some(IndexerWeights {
+        attn_q_b,
+        proj,
+        comp_ape,
+        comp_kv,
+        comp_gate,
+        comp_norm,
+    }))
 }
 
 /// Build an [`HcSublayerWeights`] for one sublayer (attention or
@@ -658,10 +674,7 @@ pub fn load_block<'a>(gguf: &'a GgufFile, il: usize) -> Result<DsV4Block<'a>, Er
     let (hash_router, topk_router) = load_router(gguf, il)?;
 
     let compressor = load_compressor(gguf, il)?;
-    let (indexer_write, indexer_read) = match load_indexer(gguf, il)? {
-        Some((w, r)) => (Some(w), Some(r)),
-        None => (None, None),
-    };
+    let indexer = load_indexer(gguf, il)?;
 
     Ok(DsV4Block {
         attn_norm,
@@ -677,8 +690,7 @@ pub fn load_block<'a>(gguf: &'a GgufFile, il: usize) -> Result<DsV4Block<'a>, Er
         topk_router,
         hc_ffn,
         compressor,
-        indexer_write,
-        indexer_read,
+        indexer,
     })
 }
 
@@ -837,8 +849,10 @@ pub fn architecture_name(meta: &Metadata) -> Option<&str> {
 ///
 /// Plus per-regime additions:
 ///   compressed (ratio > 0): +4 (attn_compressor_{kv, gate, ape, norm})
-///   ratio-4 only:           +4 (attn_indexer_{kv, kv_score, q, head_weight})
-///                              — F010.C will adjust this set
+///   ratio-4 only:           +6 (indexer.attn_q_b, indexer.proj,
+///                              indexer_compressor_{ape, kv, gate, norm})
+///                              — verified against ds4 commit `ef0a490`
+///                                lines 2326-2331 and 2610-2615 (F010.C)
 ///   hash-routed (il<3):     +1 (tid2eid)
 ///   gate_bias (when shipped): +1 (optional, not counted here)
 #[must_use]
@@ -849,7 +863,7 @@ pub fn expected_layer_tensor_count(il: usize) -> usize {
         count += 4; // compressor kv/gate/ape/norm
     }
     if layer_has_indexer(il) {
-        count += 4; // indexer kv/score/q/head_w (F010.C will revisit)
+        count += 6; // indexer: attn_q_b, proj, comp_ape/kv/gate/norm
     }
     if il < DSV4_HASH_ROUTE_LAYERS {
         count += 1; // tid2eid
@@ -1077,8 +1091,8 @@ mod tests {
     }
 
     #[test]
-    fn load_indexer_ratio4_layer_requires_all_four() {
-        // Layer 2 is the first ratio-4 layer; missing any of the four
+    fn load_indexer_ratio4_layer_requires_all_six() {
+        // Layer 2 is the first ratio-4 layer; missing any of the six
         // expected indexer tensors must produce a clear error.
         let bytes = build_gguf(&[], &[]);
         let file = GgufFile::from_bytes(bytes).unwrap();
@@ -1087,53 +1101,70 @@ mod tests {
     }
 
     #[test]
-    fn load_indexer_returns_pair_when_all_tensors_present() {
-        // Layer 2: ratio-4. Build the four required tensors at the
-        // correct shapes; verify load_indexer returns Some((write, read)).
-        let kv_elems = DSV4_N_INDEXER_HEAD_DIM * DSV4_N_EMBD;
-        let q_elems = DSV4_N_INDEXER_HEAD * DSV4_N_INDEXER_HEAD_DIM * DSV4_N_EMBD;
-        let head_w_elems = DSV4_N_INDEXER_HEAD;
+    fn load_indexer_returns_weights_when_all_six_tensors_present() {
+        // Layer 2: ratio-4. Build all six required tensors at the
+        // correct shapes; verify load_indexer returns Some(IndexerWeights).
+        // Shapes per ds4.c:2326-2331, 2610-2615 (commit ef0a490).
+        let index_width = 2 * DSV4_N_INDEXER_HEAD_DIM; // 256
+        let ratio = 4usize;
+
+        let attn_q_b_elems = DSV4_N_LORA_Q * DSV4_N_INDEXER_HEAD * DSV4_N_INDEXER_HEAD_DIM;
+        let proj_elems = DSV4_N_EMBD * DSV4_N_INDEXER_HEAD;
+        let comp_ape_elems = index_width * ratio;
+        let comp_kv_elems = DSV4_N_EMBD * index_width;
+        let comp_gate_elems = DSV4_N_EMBD * index_width;
+        let comp_norm_elems = DSV4_N_INDEXER_HEAD_DIM;
+
         let bytes = build_gguf(
             &[],
             &[
                 (
-                    "blk.2.attn_indexer_kv.weight",
+                    "blk.2.indexer.attn_q_b.weight",
                     GgmlType::F32 as u32,
-                    vec![DSV4_N_EMBD as u64, DSV4_N_INDEXER_HEAD_DIM as u64],
-                    vec![0u8; kv_elems * 4],
+                    vec![DSV4_N_LORA_Q as u64, (DSV4_N_INDEXER_HEAD * DSV4_N_INDEXER_HEAD_DIM) as u64],
+                    vec![0u8; attn_q_b_elems * 4],
                 ),
                 (
-                    "blk.2.attn_indexer_kv_score.weight",
+                    "blk.2.indexer.proj.weight",
                     GgmlType::F32 as u32,
-                    vec![DSV4_N_EMBD as u64, DSV4_N_INDEXER_HEAD_DIM as u64],
-                    vec![0u8; kv_elems * 4],
+                    vec![DSV4_N_EMBD as u64, DSV4_N_INDEXER_HEAD as u64],
+                    vec![0u8; proj_elems * 4],
                 ),
                 (
-                    "blk.2.attn_indexer_q.weight",
+                    "blk.2.indexer_compressor_ape.weight",
                     GgmlType::F32 as u32,
-                    vec![
-                        DSV4_N_EMBD as u64,
-                        (DSV4_N_INDEXER_HEAD * DSV4_N_INDEXER_HEAD_DIM) as u64,
-                    ],
-                    vec![0u8; q_elems * 4],
+                    vec![index_width as u64, ratio as u64],
+                    vec![0u8; comp_ape_elems * 4],
                 ),
                 (
-                    "blk.2.attn_indexer_head_weight",
+                    "blk.2.indexer_compressor_kv.weight",
                     GgmlType::F32 as u32,
-                    vec![head_w_elems as u64],
-                    vec![0u8; head_w_elems * 4],
+                    vec![DSV4_N_EMBD as u64, index_width as u64],
+                    vec![0u8; comp_kv_elems * 4],
+                ),
+                (
+                    "blk.2.indexer_compressor_gate.weight",
+                    GgmlType::F32 as u32,
+                    vec![DSV4_N_EMBD as u64, index_width as u64],
+                    vec![0u8; comp_gate_elems * 4],
+                ),
+                (
+                    "blk.2.indexer_compressor_norm.weight",
+                    GgmlType::F32 as u32,
+                    vec![comp_norm_elems as u64],
+                    vec![0u8; comp_norm_elems * 4],
                 ),
             ],
         );
         let file = GgufFile::from_bytes(bytes).unwrap();
-        let (write, read) = load_indexer(&file, 2).unwrap().expect("Some");
-        assert_eq!(read.attn_indexer_head_weight.len(), DSV4_N_INDEXER_HEAD);
-        // Numerical shape assertions — make the shape check load-bearing
-        // (a future regression that produces a smaller blob would have
-        // been caught silently before this fix).
-        assert_eq!(write.attn_indexer_kv.byte_len(), kv_elems * 4);
-        assert_eq!(write.attn_indexer_kv_score.byte_len(), kv_elems * 4);
-        assert_eq!(read.attn_indexer_q.byte_len(), q_elems * 4);
+        let iw = load_indexer(&file, 2).unwrap().expect("Some");
+        // Make all shape checks load-bearing.
+        assert_eq!(iw.attn_q_b.byte_len(), attn_q_b_elems * 4);
+        assert_eq!(iw.proj.byte_len(), proj_elems * 4);
+        assert_eq!(iw.comp_ape.byte_len(), comp_ape_elems * 4);
+        assert_eq!(iw.comp_kv.byte_len(), comp_kv_elems * 4);
+        assert_eq!(iw.comp_gate.byte_len(), comp_gate_elems * 4);
+        assert_eq!(iw.comp_norm.len(), comp_norm_elems);
     }
 
     #[test]
@@ -1257,14 +1288,15 @@ mod tests {
     fn expected_layer_tensor_count_grows_with_regime() {
         // Reference table: baseline = 23 per the function's doc
         // (post-F010.A: HC contributes 6 tensors; post-F010.B:
-        // compressor contributes 4 tensors per compressed layer).
-        //   il=0: dense + hash router      → 23 +  0 + 1 = 24
-        //   il=2: ratio-4 + hash router    → 23 +  4 + 4 + 1 = 32
-        //   il=3: ratio-128 + topk router  → 23 +  4 + 0 + 0 = 27
-        //   il=4: ratio-4 + topk router    → 23 +  4 + 4 + 0 = 31
+        // compressor contributes 4 tensors per compressed layer;
+        // post-F010.C: indexer contributes 6 tensors on ratio-4 layers).
+        //   il=0: dense + hash router      → 23 +  0      + 1 = 24
+        //   il=2: ratio-4 + hash router    → 23 +  4 +  6 + 1 = 34
+        //   il=3: ratio-128 + topk router  → 23 +  4 +  0 + 0 = 27
+        //   il=4: ratio-4 + topk router    → 23 +  4 +  6 + 0 = 33
         assert_eq!(expected_layer_tensor_count(0), 24);
-        assert_eq!(expected_layer_tensor_count(2), 32);
+        assert_eq!(expected_layer_tensor_count(2), 34);
         assert_eq!(expected_layer_tensor_count(3), 27);
-        assert_eq!(expected_layer_tensor_count(4), 31);
+        assert_eq!(expected_layer_tensor_count(4), 33);
     }
 }
