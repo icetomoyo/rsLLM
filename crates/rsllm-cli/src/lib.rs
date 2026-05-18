@@ -6,6 +6,7 @@
 
 pub mod cli;
 pub mod dump;
+pub mod engine;
 pub mod info;
 pub mod inspect;
 pub mod repl;

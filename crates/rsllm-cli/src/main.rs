@@ -15,8 +15,11 @@ use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
 use rsllm_cli::cli::{Cli, Command, RunFlags};
-use rsllm_cli::repl::{ReplState, parse_command};
-use rsllm_cli::{CliError, dump, info, inspect};
+use rsllm_cli::engine::CliEngine;
+use rsllm_cli::repl::{ReplState, SlashCommand, parse_command};
+use rsllm_cli::{CliError, dump, engine as eng, info, inspect};
+use rsllm_core::{Engine, SamplingParams};
+use rsllm_gguf::GgufFile;
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -69,28 +72,28 @@ fn dispatch_default(run: RunFlags) -> Result<(), CliError> {
             "rsLLM v{} — no model supplied; not entering REPL.",
             rsllm_core::version()
         );
-        eprintln!("Try `rsllm -m PATH` (F008.C will wire the full decode loop),");
-        eprintln!("or `rsllm info` / `rsllm inspect -m PATH` for read-only inspection.");
+        eprintln!("Try `rsllm -m PATH`, or `rsllm info` / `rsllm inspect -m PATH`");
+        eprintln!("for read-only inspection without loading the model.");
         print_banner();
         return Ok(());
     }
     run_repl(run)
 }
 
-/// One-shot mode: parse args, then bail with `NotImplemented` until
-/// F008.C lands the decode loop. We still validate the dump-logprobs
-/// path so a user-facing typo is caught immediately.
+/// One-shot mode: load the model and stream a single response to
+/// stdout. EOS or [`eng::DEFAULT_MAX_DECODE_TOKENS`] terminates.
 fn one_shot(run: &RunFlags, prompt: String) -> Result<(), CliError> {
-    if run.model.is_none() {
-        return Err(CliError::ModelRequired(
-            "one-shot mode (`-p`) needs `-m PATH`".into(),
-        ));
-    }
+    let model_path = run
+        .model
+        .as_deref()
+        .ok_or_else(|| CliError::ModelRequired("one-shot mode (`-p`) needs `-m PATH`".into()))?;
+
     // Validate `--dump-logprobs` early — opening the file now means
     // a permission error fires before we burn time loading the model.
     if let Some(path) = &run.dump_logprobs {
         let _ = dump::LogprobDumper::create(path, run.logprobs_top_k.max(1))?;
     }
+
     eprintln!(
         "rsllm one-shot (prompt={} chars, think={}, ctx={}, dump_tokens={}, seed={:?})",
         prompt.len(),
@@ -99,17 +102,19 @@ fn one_shot(run: &RunFlags, prompt: String) -> Result<(), CliError> {
         run.dump_tokens,
         run.seed,
     );
-    Err(CliError::NotImplemented(format!(
-        "decode loop lands in F008.C (model={:?}, prompt={} chars)",
-        run.model.as_deref().map(std::path::Path::display),
-        prompt.len(),
-    )))
+
+    eng::run_one_shot(model_path, &prompt, None, run)
 }
 
-/// REPL loop. Uses `rustyline` for line editing + history. The decode
-/// path is stubbed exactly like `one_shot` — slash commands work
-/// today, model invocations land with F008.C.
+/// REPL loop. Uses `rustyline` for line editing + history. Loads the
+/// model once at startup; sessions are rebuilt on `/ctx N` and
+/// `/clear` so the user can roll back without re-mmaping the GGUF.
 fn run_repl(run: RunFlags) -> Result<(), CliError> {
+    let model_path = run
+        .model
+        .as_deref()
+        .ok_or_else(|| CliError::ModelRequired("REPL needs `-m PATH`".into()))?;
+
     let mut state = ReplState::new(run.think, run.ctx_size);
     let mut rl = DefaultEditor::new()
         .map_err(|e| CliError::Io(std::io::Error::other(format!("rustyline init: {e}"))))?;
@@ -121,8 +126,14 @@ fn run_repl(run: RunFlags) -> Result<(), CliError> {
         let _ = rl.load_history(p);
     }
 
-    println!("rsLLM v{}", rsllm_core::version());
-    println!("type /help for command list, /quit to exit.");
+    println!("rsLLM v{} — loading {} ...", rsllm_core::version(), model_path.display());
+    let gguf = GgufFile::open(model_path)?;
+    let cli_engine = CliEngine::load(&gguf)?;
+    let mut session = cli_engine
+        .engine
+        .start_session(state.ctx_size, sampling_params(&run))
+        .map_err(|e| CliError::BadCommand(format!("start_session: {e}")))?;
+    println!("ready. type /help for command list, /quit to exit.");
 
     loop {
         let prompt = format!("[{}]> ", state.think_mode.label());
@@ -151,6 +162,13 @@ fn run_repl(run: RunFlags) -> Result<(), CliError> {
 
         match parse_command(trimmed)? {
             Some(cmd) => {
+                // `/ctx N` and `/clear` need to rebuild the session
+                // *after* state mutation, so capture the variant
+                // before delegating to `state.apply`.
+                let needs_new_session = matches!(
+                    cmd,
+                    SlashCommand::SetCtx(_) | SlashCommand::Clear
+                );
                 let outcome = state.apply(cmd);
                 if !outcome.message.is_empty() {
                     println!("{}", outcome.message);
@@ -158,19 +176,26 @@ fn run_repl(run: RunFlags) -> Result<(), CliError> {
                 if outcome.exit {
                     break;
                 }
+                if needs_new_session {
+                    session = cli_engine
+                        .engine
+                        .start_session(state.ctx_size, sampling_params(&run))
+                        .map_err(|e| {
+                            CliError::BadCommand(format!("start_session: {e}"))
+                        })?;
+                }
             }
             None => {
-                // Regular user message — decode lands in F008.C. We
-                // surface the same `NotImplemented` as one-shot so
-                // future telemetry can grep one string.
-                eprintln!(
-                    "rsllm: {}",
-                    CliError::NotImplemented(format!(
-                        "decode loop lands in F008.C (msg={} chars, think={})",
-                        trimmed.len(),
-                        state.think_mode.label(),
-                    ))
-                );
+                // Regular user message — run a decode turn.
+                if let Err(e) = cli_engine.run_turn(
+                    &mut session,
+                    trimmed,
+                    state.system_prompt.as_deref(),
+                    state.think_mode,
+                    &run,
+                ) {
+                    eprintln!("rsllm: {e}");
+                }
             }
         }
     }
@@ -182,6 +207,10 @@ fn run_repl(run: RunFlags) -> Result<(), CliError> {
         restrict_history_perms(p);
     }
     Ok(())
+}
+
+fn sampling_params(run: &RunFlags) -> SamplingParams {
+    rsllm_cli::engine::sampling_params_from_flags(run)
 }
 
 #[cfg(unix)]
@@ -198,7 +227,7 @@ fn restrict_history_perms(_path: &std::path::Path) {
 fn print_banner() {
     println!("rsLLM v{}", rsllm_core::version());
     println!("Try `rsllm info` for system info, or `rsllm inspect -m MODEL` for a GGUF summary.");
-    println!("Full decode loop lands with F008.C; see docs/features/v0.1.0.md.");
+    println!("`rsllm -m MODEL` enters the REPL; `rsllm -m MODEL -p TEXT` runs a one-shot prompt.");
 }
 
 /// `~/.rsllm_history` — the convention ds4 follows for its REPL

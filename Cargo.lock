@@ -498,6 +498,7 @@ dependencies = [
  "rsllm-core",
  "rsllm-gguf",
  "rsllm-models",
+ "rsllm-tokenizer",
  "rustyline",
  "serde",
  "serde_json",
