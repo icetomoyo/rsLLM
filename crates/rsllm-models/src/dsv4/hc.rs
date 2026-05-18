@@ -4,27 +4,42 @@
 //! streams instead of a single one. Around every sublayer (attention or
 //! MoE FFN) we run two HC operations:
 //!
-//! - `hc_pre` reduces the four streams into a single merged residual
-//!   that the sublayer reads from. The reduction weights come from a
-//!   Sinkhorn-Knopp doubly-stochastic mix matrix learned per-token.
-//! - `hc_post` takes the sublayer's output and scatters it back into
-//!   the four streams using a per-stream sigmoid gate `g[h]` and a
-//!   `2*sigmoid`-shaped post-gate `p[h]` from the same Sinkhorn call.
+//! - [`hc_pre`] reduces the four streams into a single merged residual
+//!   that the sublayer reads from. The mix coefficients come from a
+//!   per-token Sinkhorn-Knopp doubly-stochastic matrix produced by a
+//!   learned projection of the (flattened, RMS-normed) residual.
+//! - [`hc_post`] takes the sublayer's output and scatters it back into
+//!   the four streams using the same Sinkhorn output's `post[h]` lane
+//!   gate plus the doubly-stochastic combine matrix `comb[dst, src]`.
+//!   **hc_post owns no weights of its own** — it consumes the split
+//!   tensor produced by the most recent `hc_pre` for the same sublayer.
 //!
-//! The Sinkhorn kernel itself lives in
-//! [`rsllm_backend_cpu::ops::sinkhorn`]; HC just supplies the per-token
-//! mix logits (from a learned projection of the streams' sum) and
-//! applies the resulting `(g, p, c)` triple.
-//!
-//! Layout of the per-token Sinkhorn buffer (`SINKHORN_BUF_LEN = 24`):
+//! Layout of the per-token Sinkhorn buffer (`HC_MIX_DIM = 24`):
 //!
 //! ```text
-//! [ g[0..4]  | p[0..4]  | c[0..16] (row-major dst*4 + src) ]
+//! [ pre[0..4]  | post[0..4]  | comb[0..16] (row-major dst + src*N_HC) ]
 //! ```
 //!
-//! Ported by reference from `ds4.c:4186-4310` (`hc_split_sinkhorn_one`,
-//! MIT, The ds4.c authors). Line numbers pinned to ds4 commit
-//! `ef0a490` (2026-05-17).
+//! Ported by reference from `ds4.c:4186-4385` (`hc_split_sinkhorn_one`,
+//! `hc_pre_from_state_one`, `hc_post_one`, MIT, The ds4.c authors).
+//! Line numbers pinned to ds4 commit `ef0a490` (2026-05-17).
+//!
+//! ## Weight layout (per sublayer, matches ds4)
+//!
+//! Each transformer block has **two** sublayers (attention + FFN). Each
+//! sublayer carries one [`HcSublayerWeights`] bundle with three tensors:
+//!
+//! | Tensor | Shape | dtype | Role |
+//! |---|---|---|---|
+//! | `mix_fn` | `[HC_DIM × HC_MIX_DIM]` = `[16384 × 24]` | F16 | Project flattened+normed residual to mix logits |
+//! | `scale` | `[3]` | F32 | Channel scales `[pre, post, comb]` for the Sinkhorn split |
+//! | `base`  | `[HC_MIX_DIM]` = `[24]` | F32 | Per-logit bias added before sigmoid/softmax |
+//!
+//! The upstream GGUF tensor names are
+//! `blk.{il}.hc_attn_fn.weight`, `hc_attn_scale.weight`,
+//! `hc_attn_base.weight` (and the `hc_ffn_*` analogues for the FFN
+//! sublayer). v0.1.0's loader maps to those names — see
+//! [`crate::dsv4::loader::load_hc_sublayer_weights`].
 
 use rsllm_backend_cpu::SimdTier;
 use rsllm_backend_cpu::ops::sinkhorn::{N_HC, N_HC_SINKHORN_ITER, hc_split_sinkhorn};
@@ -35,40 +50,58 @@ use crate::Error;
 
 /// Length of the per-token Sinkhorn mix buffer:
 /// `2 * N_HC + N_HC * N_HC = 8 + 16 = 24`.
-pub const HC_SINKHORN_BUF_LEN: usize = 2 * N_HC + N_HC * N_HC;
+pub const HC_MIX_DIM: usize = 2 * N_HC + N_HC * N_HC;
 
-/// Numerical floor passed to [`hc_split_sinkhorn`].
+/// Flattened residual length consumed by the `mix_fn` projection:
+/// `N_HC × DSV4_N_EMBD = 4 × 4096 = 16384`.
+pub const HC_DIM: usize = N_HC * DSV4_N_EMBD;
+
+/// Backwards-compatible alias retained for callers (e.g. F008.B test
+/// builders) that referenced the old name. New code should prefer
+/// [`HC_MIX_DIM`].
+pub const HC_SINKHORN_BUF_LEN: usize = HC_MIX_DIM;
+
+/// Numerical floor passed to [`hc_split_sinkhorn`] and the
+/// no-weight RMSNorm prelude (ds4.c:4301 uses `DS4_RMS_EPS = 1e-6`).
 pub const HC_SINKHORN_EPS: f32 = 1e-6;
 
-/// Weights for one HC pre **or** post operation. Each sublayer has its
-/// own copy: a transformer block stores four sets per layer
-/// (`pre_attn`, `post_attn`, `pre_ffn`, `post_ffn`).
+/// Per-sublayer HC weights (attention or FFN). Each transformer block
+/// holds two of these — `hc_attn` and `hc_ffn`. The post step has no
+/// weights of its own; it reuses the [`HcScratch::split`] tensor that
+/// the matching pre step produced.
 ///
-/// The `mix_w` projection consumes the per-token stream sum
-/// (`[N_EMBD]`) and produces `HC_SINKHORN_BUF_LEN` logits which feed
-/// directly into [`hc_split_sinkhorn`]. `mix_base` is the per-logit
-/// bias (added after the projection, before Sinkhorn).
+/// All three fields come from ds4-format GGUF tensors:
+/// `blk.{il}.hc_{attn,ffn}_fn.weight` / `_scale.weight` / `_base.weight`.
 #[derive(Debug, Clone, Copy)]
-pub struct HcOpWeights<'a> {
-    /// `[HC_SINKHORN_BUF_LEN × N_EMBD]` = `[24 × 4096]`.
-    pub mix_w: WeightBlob<'a>,
-    /// `[HC_SINKHORN_BUF_LEN]` = `[24]` bias.
-    pub mix_base: &'a [f32],
-    /// Three channel scales `[pre_scale, post_scale, comb_scale]` from
-    /// ds4's HC config. Pre / post / comb correspond to the three
-    /// sub-regions of the Sinkhorn buffer.
-    pub scale: [f32; 3],
+pub struct HcSublayerWeights<'a> {
+    /// `[HC_DIM × HC_MIX_DIM]` = `[16384 × 24]` F16 (or F32 in tests):
+    /// projection from the flattened-normed residual to mix logits.
+    pub mix_fn: WeightBlob<'a>,
+    /// `[3]` F32 channel scales `[pre, post, comb]` for the Sinkhorn
+    /// split's three sub-regions.
+    pub scale: &'a [f32],
+    /// `[HC_MIX_DIM]` F32 per-logit bias added before
+    /// sigmoid/softmax inside [`hc_split_sinkhorn`].
+    pub base: &'a [f32],
 }
 
-/// Reusable scratch for HC pre or post over a batch of tokens.
+/// Reusable scratch for one HC pre + matching HC post on a batch.
+///
+/// `split` is sized to hold one full Sinkhorn output per token across
+/// the pre→[sublayer]→post boundary. The post step reads it; the next
+/// pre call overwrites it.
 #[derive(Debug, Default)]
 pub struct HcScratch {
-    /// `[n_tok × N_EMBD]` — per-token sum of the four streams (input to the mix projection).
-    pub stream_sum: Vec<f32>,
-    /// `[n_tok × HC_SINKHORN_BUF_LEN]` — projected mix logits per token.
+    /// `[n_tok × HC_DIM]` flattened + RMS-normed-no-weight residual.
+    pub flat: Vec<f32>,
+    /// `[n_tok × HC_MIX_DIM]` projected mix logits.
     pub mix_logits: Vec<f32>,
-    /// `[HC_SINKHORN_BUF_LEN]` — Sinkhorn output for the current token.
-    pub sinkhorn_out: Vec<f32>,
+    /// `[n_tok × HC_MIX_DIM]` Sinkhorn output split per token, persisted
+    /// from the [`hc_pre`] call to the matching [`hc_post`] call.
+    pub split: Vec<f32>,
+    /// `[N_HC × DSV4_N_EMBD]` per-token residual snapshot used as
+    /// read-side state during the in-place [`hc_post`] update.
+    pub prev_token: Vec<f32>,
 }
 
 impl HcScratch {
@@ -76,92 +109,107 @@ impl HcScratch {
     #[must_use]
     pub fn new(n_tok: usize) -> Self {
         Self {
-            stream_sum: vec![0.0_f32; n_tok * DSV4_N_EMBD],
-            mix_logits: vec![0.0_f32; n_tok * HC_SINKHORN_BUF_LEN],
-            sinkhorn_out: vec![0.0_f32; HC_SINKHORN_BUF_LEN],
+            flat: vec![0.0_f32; n_tok * HC_DIM],
+            mix_logits: vec![0.0_f32; n_tok * HC_MIX_DIM],
+            split: vec![0.0_f32; n_tok * HC_MIX_DIM],
+            prev_token: vec![0.0_f32; N_HC * DSV4_N_EMBD],
         }
     }
 
     /// Resize scratch in place for a new `n_tok`.
     pub fn resize(&mut self, n_tok: usize) {
-        self.stream_sum.resize(n_tok * DSV4_N_EMBD, 0.0);
-        self.mix_logits.resize(n_tok * HC_SINKHORN_BUF_LEN, 0.0);
-        self.sinkhorn_out.resize(HC_SINKHORN_BUF_LEN, 0.0);
+        self.flat.resize(n_tok * HC_DIM, 0.0);
+        self.mix_logits.resize(n_tok * HC_MIX_DIM, 0.0);
+        self.split.resize(n_tok * HC_MIX_DIM, 0.0);
+        self.prev_token.resize(N_HC * DSV4_N_EMBD, 0.0);
     }
 }
 
-/// Pre-merge: reduce four residual streams to one merged token using
-/// the Sinkhorn mix matrix's first row.
+/// HC pre-merge: flatten + RMS-norm the residual, project to mix
+/// logits via `mix_fn`, run Sinkhorn split, and produce the merged
+/// residual via a per-stream weighted sum.
 ///
-/// `streams` is `[n_tok × N_HC × N_EMBD]`. `merged` is `[n_tok × N_EMBD]`.
+/// The `[n_tok × HC_MIX_DIM]` Sinkhorn split is stashed in
+/// [`HcScratch::split`] for the matching [`hc_post`] call.
 ///
-/// Reasoning for using row 0 of `c`: the Sinkhorn output is doubly
-/// stochastic, so every row sums to 1 — picking any fixed row gives a
-/// valid convex combination of streams. Row 0 matches our reading of
-/// `ds4.c:4186+` (`hc_split_sinkhorn_one`).
+/// `streams` is `[n_tok × N_HC × DSV4_N_EMBD]`. `merged` is
+/// `[n_tok × DSV4_N_EMBD]`. Both are row-major.
 ///
-/// **TODO (numerical-parity gate)**: this assumption — that ds4 reads
-/// row 0 unconditionally rather than a per-token learned destination
-/// row — should be verified against the ds4.c reference when running
-/// the 50-token greedy-decode parity test. If ds4 actually picks the
-/// destination row based on some other signal, the merge weights will
-/// differ systematically and the parity gate will fail; that's the
-/// signal to revisit this choice.
+/// Mirrors `ds4.c:4284-4315` `hc_pre_from_state_one_scratch`.
+///
+/// # Errors
+/// - [`Error::ShapeMismatch`] if input slice lengths disagree with
+///   the documented shape.
 pub fn hc_pre(
     streams: &[f32],
     merged: &mut [f32],
-    weights: &HcOpWeights<'_>,
+    weights: &HcSublayerWeights<'_>,
     scratch: &mut HcScratch,
     n_tok: usize,
     tier: SimdTier,
 ) -> Result<(), Error> {
-    let n_embd = DSV4_N_EMBD;
-    if streams.len() != n_tok * N_HC * n_embd {
+    if streams.len() != n_tok * HC_DIM {
         return Err(Error::ShapeMismatch {
             key: "hc_pre.streams",
-            expected: format!("{}", n_tok * N_HC * n_embd),
+            expected: format!("{}", n_tok * HC_DIM),
             actual: format!("{}", streams.len()),
         });
     }
-    if merged.len() != n_tok * n_embd {
+    if merged.len() != n_tok * DSV4_N_EMBD {
         return Err(Error::ShapeMismatch {
             key: "hc_pre.merged",
-            expected: format!("{}", n_tok * n_embd),
+            expected: format!("{}", n_tok * DSV4_N_EMBD),
             actual: format!("{}", merged.len()),
         });
     }
-    if weights.mix_base.len() != HC_SINKHORN_BUF_LEN {
+    if weights.scale.len() != 3 {
         return Err(Error::ShapeMismatch {
-            key: "hc_pre.mix_base",
-            expected: format!("{HC_SINKHORN_BUF_LEN}"),
-            actual: format!("{}", weights.mix_base.len()),
+            key: "hc_pre.scale",
+            expected: "3".to_string(),
+            actual: format!("{}", weights.scale.len()),
+        });
+    }
+    if weights.base.len() != HC_MIX_DIM {
+        return Err(Error::ShapeMismatch {
+            key: "hc_pre.base",
+            expected: format!("{HC_MIX_DIM}"),
+            actual: format!("{}", weights.base.len()),
         });
     }
     scratch.resize(n_tok);
 
-    // 1. Stream sum per token: input to the mix projection.
-    stream_sum(streams, &mut scratch.stream_sum, n_tok);
+    // 1. Per-token flatten + RMS-norm-no-weight (ds4.c:4301
+    //    `rms_norm_no_weight(flat, residual_hc, hc_dim, DS4_RMS_EPS)`).
+    //    The four streams are already contiguous in memory; flattening
+    //    is a copy + in-place normalization on the copy.
+    for t in 0..n_tok {
+        let src = &streams[t * HC_DIM..(t + 1) * HC_DIM];
+        let dst = &mut scratch.flat[t * HC_DIM..(t + 1) * HC_DIM];
+        rms_norm_no_weight_into(src, dst, HC_SINKHORN_EPS);
+    }
 
-    // 2. Project sum → 24 logits per token: mix_logits = mix_w @ stream_sum.
+    // 2. Project flat → mix logits via mix_fn: shape
+    //    `[n_tok × HC_DIM] × [HC_DIM × HC_MIX_DIM] → [n_tok × HC_MIX_DIM]`.
+    let scale: [f32; 3] = [weights.scale[0], weights.scale[1], weights.scale[2]];
     matmul_weight_f32(
         &mut scratch.mix_logits,
-        &weights.mix_w,
-        &scratch.stream_sum,
+        &weights.mix_fn,
+        &scratch.flat,
         n_tok,
-        n_embd,
-        HC_SINKHORN_BUF_LEN,
+        HC_DIM,
+        HC_MIX_DIM,
         tier,
     )?;
 
-    // 3. For each token: Sinkhorn → merge stream lanes with c[0, *].
+    // 3. Per-token Sinkhorn split + weighted sum.
     for t in 0..n_tok {
-        let mix_t =
-            &scratch.mix_logits[t * HC_SINKHORN_BUF_LEN..(t + 1) * HC_SINKHORN_BUF_LEN];
+        let mix_t = &scratch.mix_logits[t * HC_MIX_DIM..(t + 1) * HC_MIX_DIM];
+        let split_t = &mut scratch.split[t * HC_MIX_DIM..(t + 1) * HC_MIX_DIM];
         hc_split_sinkhorn(
-            &mut scratch.sinkhorn_out,
+            split_t,
             mix_t,
-            &weights.scale,
-            weights.mix_base,
+            &scale,
+            weights.base,
             N_HC,
             N_HC_SINKHORN_ITER,
             HC_SINKHORN_EPS,
@@ -169,125 +217,124 @@ pub fn hc_pre(
         )
         .map_err(map_cpu_err("hc_pre.sinkhorn"))?;
 
-        // c is laid out at offset 2*N_HC, row-major (dst * N_HC + src).
-        let c_off = 2 * N_HC;
-        // Row 0 of c: weights c[0,0..N_HC].
-        let merge_w = &scratch.sinkhorn_out[c_off..c_off + N_HC];
-        let merged_t = &mut merged[t * n_embd..(t + 1) * n_embd];
-        for col in merged_t.iter_mut() {
-            *col = 0.0;
-        }
-        for (h, &w) in merge_w.iter().enumerate().take(N_HC) {
-            let stream_h_off = (t * N_HC + h) * n_embd;
-            for i in 0..n_embd {
-                merged_t[i] += w * streams[stream_h_off + i];
+        // `split[0..N_HC]` is the per-stream weight `pre[h]` consumed by
+        // hc_weighted_sum_one (ds4.c:4267-4280). Each output dim d is a
+        // convex combination of streams[t, h, d] weighted by pre[h].
+        let pre_w = &split_t[0..N_HC];
+        let merged_t = &mut merged[t * DSV4_N_EMBD..(t + 1) * DSV4_N_EMBD];
+        merged_t.fill(0.0);
+        for (h, &w) in pre_w.iter().enumerate().take(N_HC) {
+            let stream_h_off = (t * N_HC + h) * DSV4_N_EMBD;
+            let stream_h = &streams[stream_h_off..stream_h_off + DSV4_N_EMBD];
+            for i in 0..DSV4_N_EMBD {
+                merged_t[i] += w * stream_h[i];
             }
         }
     }
     Ok(())
 }
 
-/// Post-scatter: add the sublayer output back to each stream weighted
-/// by a learned per-stream gate.
+/// HC post-scatter: replace each residual stream with a learned
+/// combination of (a) the previous stream state weighted by the
+/// doubly-stochastic combine matrix and (b) the sublayer output
+/// scaled by `post[h]`.
 ///
-/// `streams` carries the `[n_tok × N_HC × N_EMBD]` residual state and
-/// is updated **in place**. `sublayer_out` is the `[n_tok × N_EMBD]`
-/// activation that the wrapped sublayer (attention or MoE FFN)
-/// produced for the merged token.
+/// Per `ds4.c:4366-4385` (`hc_post_one`):
 ///
-/// Update rule per stream `h` and token `t`:
-///   `streams[t, h] = p[h] * streams[t, h] + g[h] * sublayer_out[t]`
+/// ```text
+/// new_streams[t, dst, d] = sublayer_out[t, d] * post[t, dst]
+///                        + Σ_src comb[t, dst + src*N_HC] * old_streams[t, src, d]
+/// ```
 ///
-/// Both `g[h]` and `p[h]` come from the Sinkhorn output buffer; ds4's
-/// `hc_split_post` (`ds4.c:4186+` HC family) uses the same combination.
+/// `streams` is `[n_tok × N_HC × DSV4_N_EMBD]` and is updated in
+/// place. `sublayer_out` is `[n_tok × DSV4_N_EMBD]`. `scratch.split`
+/// must have been filled by the matching [`hc_pre`] call on the same
+/// `n_tok`; this function reads the `post` + `comb` slices out of it.
+///
+/// # Errors
+/// - [`Error::ShapeMismatch`] if input slice lengths disagree.
 pub fn hc_post(
     streams: &mut [f32],
     sublayer_out: &[f32],
-    weights: &HcOpWeights<'_>,
     scratch: &mut HcScratch,
     n_tok: usize,
-    tier: SimdTier,
 ) -> Result<(), Error> {
-    let n_embd = DSV4_N_EMBD;
-    if streams.len() != n_tok * N_HC * n_embd {
+    if streams.len() != n_tok * HC_DIM {
         return Err(Error::ShapeMismatch {
             key: "hc_post.streams",
-            expected: format!("{}", n_tok * N_HC * n_embd),
+            expected: format!("{}", n_tok * HC_DIM),
             actual: format!("{}", streams.len()),
         });
     }
-    if sublayer_out.len() != n_tok * n_embd {
+    if sublayer_out.len() != n_tok * DSV4_N_EMBD {
         return Err(Error::ShapeMismatch {
             key: "hc_post.sublayer_out",
-            expected: format!("{}", n_tok * n_embd),
+            expected: format!("{}", n_tok * DSV4_N_EMBD),
             actual: format!("{}", sublayer_out.len()),
         });
     }
-    if weights.mix_base.len() != HC_SINKHORN_BUF_LEN {
+    if scratch.split.len() != n_tok * HC_MIX_DIM {
         return Err(Error::ShapeMismatch {
-            key: "hc_post.mix_base",
-            expected: format!("{HC_SINKHORN_BUF_LEN}"),
-            actual: format!("{}", weights.mix_base.len()),
+            key: "hc_post.scratch.split",
+            expected: format!("{} (n_tok × HC_MIX_DIM)", n_tok * HC_MIX_DIM),
+            actual: format!("{}", scratch.split.len()),
         });
     }
-    scratch.resize(n_tok);
-
-    stream_sum(streams, &mut scratch.stream_sum, n_tok);
-
-    matmul_weight_f32(
-        &mut scratch.mix_logits,
-        &weights.mix_w,
-        &scratch.stream_sum,
-        n_tok,
-        n_embd,
-        HC_SINKHORN_BUF_LEN,
-        tier,
-    )?;
+    if scratch.prev_token.len() != N_HC * DSV4_N_EMBD {
+        // The matching hc_pre would have sized this to N_HC * N_EMBD;
+        // if we got here with a smaller buffer, the caller paired
+        // hc_post with a mismatched scratch.
+        scratch.prev_token.resize(N_HC * DSV4_N_EMBD, 0.0);
+    }
 
     for t in 0..n_tok {
-        let mix_t =
-            &scratch.mix_logits[t * HC_SINKHORN_BUF_LEN..(t + 1) * HC_SINKHORN_BUF_LEN];
-        hc_split_sinkhorn(
-            &mut scratch.sinkhorn_out,
-            mix_t,
-            &weights.scale,
-            weights.mix_base,
-            N_HC,
-            N_HC_SINKHORN_ITER,
-            HC_SINKHORN_EPS,
-            tier,
-        )
-        .map_err(map_cpu_err("hc_post.sinkhorn"))?;
+        let split_t = &scratch.split[t * HC_MIX_DIM..(t + 1) * HC_MIX_DIM];
+        // Layout from hc_split_sinkhorn: [pre | post | comb (dst-major)].
+        let post = &split_t[N_HC..2 * N_HC];
+        let comb = &split_t[2 * N_HC..2 * N_HC + N_HC * N_HC];
 
-        let g = &scratch.sinkhorn_out[0..N_HC];
-        let p = &scratch.sinkhorn_out[N_HC..2 * N_HC];
-        let sub_t = &sublayer_out[t * n_embd..(t + 1) * n_embd];
+        // Snapshot old streams[t, :, :] before in-place overwrite.
+        let stream_t_off = t * HC_DIM;
+        scratch
+            .prev_token
+            .copy_from_slice(&streams[stream_t_off..stream_t_off + HC_DIM]);
 
-        for h in 0..N_HC {
-            let gh = g[h];
-            let ph = p[h];
-            let stream_h_off = (t * N_HC + h) * n_embd;
-            let stream_h = &mut streams[stream_h_off..stream_h_off + n_embd];
-            for i in 0..n_embd {
-                stream_h[i] = ph * stream_h[i] + gh * sub_t[i];
+        let sub_t = &sublayer_out[t * DSV4_N_EMBD..(t + 1) * DSV4_N_EMBD];
+        for dst in 0..N_HC {
+            let p_dst = post[dst];
+            let stream_dst_off = stream_t_off + dst * DSV4_N_EMBD;
+            let stream_dst = &mut streams[stream_dst_off..stream_dst_off + DSV4_N_EMBD];
+            for d in 0..DSV4_N_EMBD {
+                let mut acc = sub_t[d] * p_dst;
+                for src in 0..N_HC {
+                    // comb is row-major with `dst + src * N_HC` —
+                    // matches ds4.c:4380 exactly.
+                    acc += comb[dst + src * N_HC]
+                        * scratch.prev_token[src * DSV4_N_EMBD + d];
+                }
+                stream_dst[d] = acc;
             }
         }
     }
     Ok(())
 }
 
-/// Compute `out[t, *] = sum_h streams[t, h, *]` per token.
-fn stream_sum(streams: &[f32], out: &mut [f32], n_tok: usize) {
-    let n_embd = DSV4_N_EMBD;
-    out.fill(0.0);
-    for t in 0..n_tok {
-        let dst = &mut out[t * n_embd..(t + 1) * n_embd];
-        for h in 0..N_HC {
-            let src_off = (t * N_HC + h) * n_embd;
-            for i in 0..n_embd {
-                dst[i] += streams[src_off + i];
-            }
-        }
+/// In-place RMS-norm-no-weight: `dst[i] = src[i] / sqrt(mean(src²) +
+/// eps)`. Mirrors ds4's `rms_norm_no_weight` (used at `ds4.c:4301`).
+///
+/// Sum-of-squares accumulates in f64 to match ds4's `double ss`
+/// precision pattern (`ds4.c:rmsnorm_kernel`).
+fn rms_norm_no_weight_into(src: &[f32], dst: &mut [f32], eps: f32) {
+    debug_assert_eq!(src.len(), dst.len());
+    let n = src.len() as f64;
+    let mut sumsq = 0.0_f64;
+    for &v in src {
+        let vd = v as f64;
+        sumsq += vd * vd;
+    }
+    let rms_recip = (1.0_f64 / (sumsq / n + eps as f64).sqrt()) as f32;
+    for (d, &s) in dst.iter_mut().zip(src.iter()) {
+        *d = s * rms_recip;
     }
 }
 
@@ -303,81 +350,98 @@ fn map_cpu_err(stage: &'static str) -> impl FnOnce(rsllm_backend_cpu::Error) -> 
 mod tests {
     use super::*;
 
-    fn zero_op_weights<'a>(base: &'a [f32], w: &'a [f32]) -> HcOpWeights<'a> {
-        HcOpWeights {
-            mix_w: WeightBlob::F32(w),
-            mix_base: base,
-            scale: [1.0, 1.0, 1.0],
+    /// Build a zero-valued `HcSublayerWeights` for a given `mix_fn`
+    /// matrix + base bias slice. `scale` is `[1.0, 1.0, 1.0]` —
+    /// neutral mix scaling.
+    fn zero_op_weights<'a>(
+        mix_fn: WeightBlob<'a>,
+        base: &'a [f32],
+        scale: &'a [f32; 3],
+    ) -> HcSublayerWeights<'a> {
+        HcSublayerWeights {
+            mix_fn,
+            scale: scale.as_slice(),
+            base,
         }
+    }
+
+    /// Build a `[HC_DIM × HC_MIX_DIM]` F32 matrix initialized to zeros.
+    /// Use this when you want hc_pre's projection to feed all-zero
+    /// logits into Sinkhorn → uniform `pre[h] ≈ 1/N_HC` mix.
+    fn zero_mix_fn_storage() -> Vec<f32> {
+        vec![0.0_f32; HC_DIM * HC_MIX_DIM]
     }
 
     #[test]
     fn hc_pre_merged_is_finite_and_shape_correct() {
         let n_tok = 2;
-        // Mix projection that always outputs ones; this exercises every
-        // dim of the projection and forces a uniform Sinkhorn input —
-        // expected result: c is doubly stochastic ≈ uniform, p, g positive.
-        let mix_w = vec![1.0_f32 / DSV4_N_EMBD as f32; HC_SINKHORN_BUF_LEN * DSV4_N_EMBD];
-        let mix_base = vec![0.0_f32; HC_SINKHORN_BUF_LEN];
-        let weights = zero_op_weights(&mix_base, &mix_w);
-
-        let streams: Vec<f32> = (0..n_tok * N_HC * DSV4_N_EMBD)
-            .map(|i| ((i as f32) * 0.001).sin())
-            .collect();
+        let mix_storage = zero_mix_fn_storage();
+        let base = vec![0.0_f32; HC_MIX_DIM];
+        let scale = [1.0_f32, 1.0, 1.0];
+        let mut streams = vec![0.1_f32; n_tok * HC_DIM];
         let mut merged = vec![0.0_f32; n_tok * DSV4_N_EMBD];
         let mut scratch = HcScratch::new(n_tok);
 
+        let w = zero_op_weights(WeightBlob::F32(&mix_storage), &base, &scale);
         hc_pre(
             &streams,
             &mut merged,
-            &weights,
+            &w,
             &mut scratch,
             n_tok,
             SimdTier::Scalar,
         )
         .unwrap();
-
-        assert!(merged.iter().all(|v| v.is_finite()));
+        for &v in &merged {
+            assert!(v.is_finite(), "merged contains non-finite value");
+        }
+        // Mark `streams` as used to avoid a clippy warning.
+        streams[0] = 0.1;
     }
 
     #[test]
     fn hc_post_preserves_finite_invariant() {
-        let n_tok = 1;
-        let mix_w = vec![0.01_f32; HC_SINKHORN_BUF_LEN * DSV4_N_EMBD];
-        let mix_base = vec![0.0_f32; HC_SINKHORN_BUF_LEN];
-        let weights = zero_op_weights(&mix_base, &mix_w);
-
-        let mut streams = vec![0.5_f32; n_tok * N_HC * DSV4_N_EMBD];
-        let sublayer_out = vec![1.0_f32; n_tok * DSV4_N_EMBD];
+        let n_tok = 2;
+        let mix_storage = zero_mix_fn_storage();
+        let base = vec![0.0_f32; HC_MIX_DIM];
+        let scale = [1.0_f32, 1.0, 1.0];
+        let mut streams = vec![0.1_f32; n_tok * HC_DIM];
+        let mut merged = vec![0.0_f32; n_tok * DSV4_N_EMBD];
+        let sublayer_out = vec![0.05_f32; n_tok * DSV4_N_EMBD];
         let mut scratch = HcScratch::new(n_tok);
-
-        hc_post(
-            &mut streams,
-            &sublayer_out,
-            &weights,
+        let w = zero_op_weights(WeightBlob::F32(&mix_storage), &base, &scale);
+        // hc_pre populates scratch.split; hc_post then reads it.
+        hc_pre(
+            &streams,
+            &mut merged,
+            &w,
             &mut scratch,
             n_tok,
             SimdTier::Scalar,
         )
         .unwrap();
-
-        assert!(streams.iter().all(|v| v.is_finite()));
+        hc_post(&mut streams, &sublayer_out, &mut scratch, n_tok).unwrap();
+        for &v in &streams {
+            assert!(v.is_finite());
+        }
     }
 
     #[test]
     fn hc_pre_rejects_wrong_streams_shape() {
-        let mix_w = vec![0.0_f32; HC_SINKHORN_BUF_LEN * DSV4_N_EMBD];
-        let mix_base = vec![0.0_f32; HC_SINKHORN_BUF_LEN];
-        let weights = zero_op_weights(&mix_base, &mix_w);
-        let streams = vec![0.0_f32; 17]; // wrong
-        let mut merged = vec![0.0_f32; DSV4_N_EMBD];
-        let mut scratch = HcScratch::new(1);
+        let n_tok = 1;
+        let mix_storage = zero_mix_fn_storage();
+        let base = vec![0.0_f32; HC_MIX_DIM];
+        let scale = [1.0_f32, 1.0, 1.0];
+        let streams = vec![0.0_f32; HC_DIM - 1]; // wrong size
+        let mut merged = vec![0.0_f32; n_tok * DSV4_N_EMBD];
+        let mut scratch = HcScratch::new(n_tok);
+        let w = zero_op_weights(WeightBlob::F32(&mix_storage), &base, &scale);
         let err = hc_pre(
             &streams,
             &mut merged,
-            &weights,
+            &w,
             &mut scratch,
-            1,
+            n_tok,
             SimdTier::Scalar,
         )
         .unwrap_err();
@@ -386,30 +450,80 @@ mod tests {
 
     #[test]
     fn hc_pre_uniform_mix_yields_average_of_streams() {
-        // If every stream carries identical values, the merged result
-        // must equal one of them (a convex combination of equal numbers
-        // is the number itself), regardless of the Sinkhorn weights.
+        // All-zero mix_fn + all-zero base → mix=0 → sigmoid(0)=0.5 →
+        // pre[h] = 0.5 + eps for all h, sum ≈ 4·0.5 = 2. With
+        // streams identical across h, merged ≈ sum_h pre[h] * stream[h]
+        // = 2 * stream (single stream value). So if we set stream[h, :]
+        // = h+1 for all d, merged[d] should be 0.5 * (1+2+3+4) = 5
+        // (plus small eps drift).
         let n_tok = 1;
-        let mix_w = vec![0.0_f32; HC_SINKHORN_BUF_LEN * DSV4_N_EMBD];
-        let mix_base = vec![0.0_f32; HC_SINKHORN_BUF_LEN];
-        let weights = zero_op_weights(&mix_base, &mix_w);
-
-        // All four streams carry value 0.25.
-        let streams = vec![0.25_f32; n_tok * N_HC * DSV4_N_EMBD];
+        let mix_storage = zero_mix_fn_storage();
+        let base = vec![0.0_f32; HC_MIX_DIM];
+        let scale = [1.0_f32, 1.0, 1.0];
+        let mut streams = vec![0.0_f32; HC_DIM];
+        for h in 0..N_HC {
+            let off = h * DSV4_N_EMBD;
+            for d in 0..DSV4_N_EMBD {
+                streams[off + d] = (h + 1) as f32;
+            }
+        }
         let mut merged = vec![0.0_f32; n_tok * DSV4_N_EMBD];
         let mut scratch = HcScratch::new(n_tok);
+        let w = zero_op_weights(WeightBlob::F32(&mix_storage), &base, &scale);
         hc_pre(
             &streams,
             &mut merged,
-            &weights,
+            &w,
             &mut scratch,
             n_tok,
             SimdTier::Scalar,
         )
         .unwrap();
-        // Convex combo of 0.25, 0.25, 0.25, 0.25 = 0.25 exactly.
-        for &v in &merged[..16] {
-            assert!((v - 0.25).abs() < 1e-5, "merged != 0.25: {v}");
+        // Expected: 0.5 * (1+2+3+4) = 5.0; allow some slack for
+        // sigmoid(0)+eps vs 0.5 exact.
+        for &v in merged.iter().take(8) {
+            assert!(
+                (v - 5.0).abs() < 0.01,
+                "expected merged ≈ 5.0, got {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn hc_post_in_place_uses_pre_split() {
+        // Confirm that hc_post reads scratch.split (filled by hc_pre)
+        // rather than reaching for any external state. With zero mix_fn,
+        // post[h] = 2 * sigmoid(0) = 1.0 and comb is doubly stochastic
+        // with row-sum 1, so each new stream[dst, d] ≈ sublayer_out[d]
+        // + avg(old_streams[*, d]).
+        let n_tok = 1;
+        let mix_storage = zero_mix_fn_storage();
+        let base = vec![0.0_f32; HC_MIX_DIM];
+        let scale = [1.0_f32, 1.0, 1.0];
+        let mut streams = vec![2.0_f32; HC_DIM];
+        let mut merged = vec![0.0_f32; n_tok * DSV4_N_EMBD];
+        let sublayer_out = vec![3.0_f32; n_tok * DSV4_N_EMBD];
+        let mut scratch = HcScratch::new(n_tok);
+        let w = zero_op_weights(WeightBlob::F32(&mix_storage), &base, &scale);
+
+        hc_pre(
+            &streams,
+            &mut merged,
+            &w,
+            &mut scratch,
+            n_tok,
+            SimdTier::Scalar,
+        )
+        .unwrap();
+        hc_post(&mut streams, &sublayer_out, &mut scratch, n_tok).unwrap();
+
+        // Each stream lane should now hold ≈ 3.0 (sub_out * post) +
+        // 2.0 (old residual * row-sum of comb ≈ 1) = 5.0.
+        for &v in streams.iter().take(8) {
+            assert!(
+                (v - 5.0).abs() < 0.1,
+                "expected stream ≈ 5.0, got {v}"
+            );
         }
     }
 }

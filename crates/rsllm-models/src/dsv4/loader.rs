@@ -35,7 +35,7 @@ use rsllm_kvcache::dsv4::shape::{layer_compress_ratio, layer_has_indexer};
 use crate::Error;
 use crate::deepseek_v4_flash::{DeepSeekV4Flash, DsV4Block};
 use crate::dsv4::compressor::{CompressorWeights, IndexerReadWeights, IndexerWriteWeights};
-use crate::dsv4::hc::{HC_SINKHORN_BUF_LEN, HcOpWeights};
+use crate::dsv4::hc::{HC_DIM, HC_MIX_DIM, HcSublayerWeights};
 use crate::dsv4::mla::MlaWeights;
 use crate::dsv4::moe::{
     MoeExpertWeights, MoeHashRouter, MoeTopkRouter, SharedExpertWeights, StackedExperts,
@@ -78,15 +78,17 @@ pub mod tensor_names {
     pub const ATTN_OUTPUT_A: &str = "attn_output_a.weight";
     pub const ATTN_OUTPUT_B: &str = "attn_output_b.weight";
 
-    /// HC pre/post weights — TODO(ds4): confirm exact strings.
-    pub const HC_PRE_ATTN_W: &str = "hc_pre_attn.weight";
-    pub const HC_PRE_ATTN_BASE: &str = "hc_pre_attn.base";
-    pub const HC_POST_ATTN_W: &str = "hc_post_attn.weight";
-    pub const HC_POST_ATTN_BASE: &str = "hc_post_attn.base";
-    pub const HC_PRE_FFN_W: &str = "hc_pre_ffn.weight";
-    pub const HC_PRE_FFN_BASE: &str = "hc_pre_ffn.base";
-    pub const HC_POST_FFN_W: &str = "hc_post_ffn.weight";
-    pub const HC_POST_FFN_BASE: &str = "hc_post_ffn.base";
+    /// HC sublayer weights — verified against ds4 commit `ef0a490`
+    /// (line 2591-2620). Each transformer block has TWO sublayers
+    /// (attn + ffn), each carrying a `(fn, scale, base)` triplet.
+    /// The post step has no weights of its own; it reads the
+    /// Sinkhorn split from the matching pre call.
+    pub const HC_ATTN_FN: &str = "hc_attn_fn.weight";
+    pub const HC_ATTN_SCALE: &str = "hc_attn_scale.weight";
+    pub const HC_ATTN_BASE: &str = "hc_attn_base.weight";
+    pub const HC_FFN_FN: &str = "hc_ffn_fn.weight";
+    pub const HC_FFN_SCALE: &str = "hc_ffn_scale.weight";
+    pub const HC_FFN_BASE: &str = "hc_ffn_base.weight";
 
     pub const FFN_NORM: &str = "ffn_norm.weight";
 
@@ -390,45 +392,56 @@ pub fn load_indexer<'a>(
     )))
 }
 
-/// Build an [`HcOpWeights`] for one of the four HC slots on layer
-/// `il`. `prefix` is the suffix family — `"hc_pre_attn"`,
-/// `"hc_post_attn"`, `"hc_pre_ffn"`, or `"hc_post_ffn"`.
+/// Build an [`HcSublayerWeights`] for one sublayer (attention or
+/// FFN) on layer `il`. `family` is `"hc_attn"` or `"hc_ffn"`.
 ///
-/// HC scales (`[pre, post, comb]`) are not stored per-tensor in
-/// llama.cpp DeepSeek GGUFs — they come from a per-layer metadata
-/// triplet. v0.1.0 hard-codes `[1.0, 1.0, 1.0]` until ds4 upstream
-/// confirms the exact metadata key names (TODO(ds4)).
+/// Verified against ds4 commit `ef0a490`:
+///
+/// - `blk.{il}.{family}_fn.weight`: F16, `[HC_DIM × HC_MIX_DIM]`
+///   (`ds4.c:2302 / 2334 tensor_expect_layout`).
+/// - `blk.{il}.{family}_scale.weight`: F32, `[3]`.
+/// - `blk.{il}.{family}_base.weight`: F32, `[HC_MIX_DIM = 24]`.
 ///
 /// # Errors
-/// - [`Error::MissingTensor`] if either the `.weight` or `.base`
-///   tensor for this HC slot is absent.
-/// - [`Error::ShapeMismatch`] if any backing storage byte count is
-///   inconsistent with the expected `[24 × N_EMBD]` / `[24]` shape.
-pub fn load_hc_op_weights<'a>(
+/// - [`Error::MissingTensor`] if any of the three tensors is absent.
+/// - [`Error::ShapeMismatch`] if a backing storage byte count
+///   disagrees with the expected shape.
+pub fn load_hc_sublayer_weights<'a>(
     gguf: &'a GgufFile,
     il: usize,
-    prefix: &str,
-) -> Result<HcOpWeights<'a>, Error> {
-    let mix_w_name = tensor_names::blk(il, &format!("{prefix}.weight"));
-    let mix_base_name = tensor_names::blk(il, &format!("{prefix}.base"));
-    let mix_w = resolve_blob(gguf, &mix_w_name)?;
-    mix_w.check_shape(HC_SINKHORN_BUF_LEN, DSV4_N_EMBD, "loader.hc.mix_w")?;
-    let mix_base = resolve_f32_slice(gguf, &mix_base_name)?;
-    if mix_base.len() != HC_SINKHORN_BUF_LEN {
+    family: &str,
+) -> Result<HcSublayerWeights<'a>, Error> {
+    let fn_name = tensor_names::blk(il, &format!("{family}_fn.weight"));
+    let scale_name = tensor_names::blk(il, &format!("{family}_scale.weight"));
+    let base_name = tensor_names::blk(il, &format!("{family}_base.weight"));
+
+    let mix_fn = resolve_blob(gguf, &fn_name)?;
+    // mix_fn is `[HC_DIM × HC_MIX_DIM]` — flat residual in, 24 mix
+    // logits out. Matches ds4's matvec_f16(mix_fn, flat) shape.
+    mix_fn.check_shape(HC_MIX_DIM, HC_DIM, "loader.hc.mix_fn")?;
+
+    let scale = resolve_f32_slice(gguf, &scale_name)?;
+    if scale.len() != 3 {
         return Err(Error::ShapeMismatch {
-            key: "loader.hc.mix_base",
-            expected: format!("{HC_SINKHORN_BUF_LEN}"),
-            actual: format!("{mix_base_name}: {}", mix_base.len()),
+            key: "loader.hc.scale",
+            expected: "3".to_string(),
+            actual: format!("{scale_name}: {}", scale.len()),
         });
     }
-    Ok(HcOpWeights {
-        mix_w,
-        mix_base,
-        // TODO(ds4): pull from metadata once the canonical key names
-        // are confirmed (`deepseek.hc.{pre,post,comb}_scale` is the
-        // most likely convention based on the surrounding metadata
-        // schema validated in `dsv4::shape::validate_metadata`).
-        scale: [1.0, 1.0, 1.0],
+
+    let base = resolve_f32_slice(gguf, &base_name)?;
+    if base.len() != HC_MIX_DIM {
+        return Err(Error::ShapeMismatch {
+            key: "loader.hc.base",
+            expected: format!("{HC_MIX_DIM}"),
+            actual: format!("{base_name}: {}", base.len()),
+        });
+    }
+
+    Ok(HcSublayerWeights {
+        mix_fn,
+        scale,
+        base,
     })
 }
 
@@ -594,10 +607,8 @@ pub fn load_block<'a>(gguf: &'a GgufFile, il: usize) -> Result<DsV4Block<'a>, Er
     let attn_output_a = resolve_blob(gguf, &tensor_names::blk(il, tensor_names::ATTN_OUTPUT_A))?;
     let attn_output_b = resolve_blob(gguf, &tensor_names::blk(il, tensor_names::ATTN_OUTPUT_B))?;
 
-    let hc_pre_attn = load_hc_op_weights(gguf, il, "hc_pre_attn")?;
-    let hc_post_attn = load_hc_op_weights(gguf, il, "hc_post_attn")?;
-    let hc_pre_ffn = load_hc_op_weights(gguf, il, "hc_pre_ffn")?;
-    let hc_post_ffn = load_hc_op_weights(gguf, il, "hc_post_ffn")?;
+    let hc_attn = load_hc_sublayer_weights(gguf, il, "hc_attn")?;
+    let hc_ffn = load_hc_sublayer_weights(gguf, il, "hc_ffn")?;
 
     let ffn_norm = resolve_f32_slice(gguf, &tensor_names::blk(il, tensor_names::FFN_NORM))?;
     let moe_experts = load_moe_experts(gguf, il)?;
@@ -616,15 +627,13 @@ pub fn load_block<'a>(gguf: &'a GgufFile, il: usize) -> Result<DsV4Block<'a>, Er
         attn_sinks,
         attn_output_a,
         attn_output_b,
-        hc_pre_attn,
-        hc_post_attn,
+        hc_attn,
         ffn_norm,
         moe_experts,
         shared_expert,
         hash_router,
         topk_router,
-        hc_pre_ffn,
-        hc_post_ffn,
+        hc_ffn,
         compressor,
         indexer_write,
         indexer_read,
@@ -635,15 +644,14 @@ pub fn load_block<'a>(gguf: &'a GgufFile, il: usize) -> Result<DsV4Block<'a>, Er
 /// per-layer tensor, and constructs a [`DeepSeekV4Flash`] borrowing
 /// the GGUF mmap for its weight views.
 ///
-/// ## Caveat: HC scales are placeholders
+/// ## HC scales now come from GGUF
 ///
-/// Until ds4 upstream confirms the per-layer HC `[pre, post, comb]`
-/// scale metadata keys (TODO(ds4)), every loaded [`HcOpWeights`]
-/// carries `scale: [1.0, 1.0, 1.0]`. Forward passes will still run,
-/// but the Sinkhorn merge weights will be numerically off vs ds4 —
-/// a clear `tracing::warn!` is emitted once on every load so any
-/// numerical-parity test sees the placeholder situation in its
-/// trace output.
+/// Per-layer HC `[pre, post, comb]` scales are loaded from the
+/// `blk.{il}.hc_{attn,ffn}_scale.weight` tensors (verified against
+/// ds4 commit `ef0a490` at `ds4.c:2592, 2618`). The previous
+/// `[1.0, 1.0, 1.0]` placeholder is gone; if any of those tensors
+/// is missing in a GGUF file, the loader fails with
+/// [`Error::MissingTensor`] naming the concrete blk index.
 ///
 /// # Errors
 /// - [`Error::MissingMetadata`] / [`Error::ShapeMismatch`] for any
@@ -672,15 +680,6 @@ pub fn load_dsv4_flash(gguf: &GgufFile) -> Result<DeepSeekV4Flash<'_>, Error> {
         n_vocab = DSV4_N_VOCAB,
         n_embd = DSV4_N_EMBD,
         "metadata validated",
-    );
-
-    // HC scale placeholder advisory. Emitted at WARN so any caller
-    // running numerics under tracing sees it loudly.
-    tracing::warn!(
-        target: "rsllm_models::dsv4::loader",
-        "HC scales are placeholders [1.0, 1.0, 1.0] — TODO(ds4): wire \
-         per-layer scale metadata once upstream keys are confirmed. \
-         Forward outputs will diverge from ds4 by the Sinkhorn merge."
     );
 
     // 2. Global tensors.

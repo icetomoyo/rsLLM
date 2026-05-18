@@ -41,7 +41,7 @@ use rsllm_gguf::Metadata;
 
 use crate::Error;
 use crate::dsv4::compressor::{CompressorWeights, IndexerReadWeights, IndexerWriteWeights};
-use crate::dsv4::hc::{HcOpWeights, HcScratch, hc_post, hc_pre};
+use crate::dsv4::hc::{HcScratch, HcSublayerWeights, hc_post, hc_pre};
 use crate::dsv4::mla::{MlaOutput, MlaScratch, MlaWeights, mla_projections};
 use crate::dsv4::moe::{
     MoeExpertWeights, MoeHashRouter, MoeScratch, MoeTopkRouter, SharedExpertWeights,
@@ -83,10 +83,12 @@ pub struct DsV4Block<'a> {
     /// Shape `[out_low_dim × N_EMBD]` = `[8192 × 4096]`.
     /// (`ds4.c:2313`, `ds4.c:4962`.)
     pub attn_output_b: WeightBlob<'a>,
-    /// HC pre-attn mix weights.
-    pub hc_pre_attn: HcOpWeights<'a>,
-    /// HC post-attn mix weights.
-    pub hc_post_attn: HcOpWeights<'a>,
+    /// HC weights for the attention sublayer (`fn` + `scale` + `base`).
+    /// The matching `hc_post` step has no weights of its own — it
+    /// reuses the per-token Sinkhorn split produced by `hc_pre` and
+    /// stored on [`HcScratch::split`] across the `pre → sublayer → post`
+    /// boundary.
+    pub hc_attn: HcSublayerWeights<'a>,
 
     /// Per-dim compressed-KV score LoRA. Present iff this layer has
     /// `compress_ratio > 0` (i.e. all layers except the first two
@@ -113,10 +115,10 @@ pub struct DsV4Block<'a> {
     pub hash_router: Option<MoeHashRouter<'a>>,
     /// Top-k router for layers `[3, 43)`; `None` for hash layers.
     pub topk_router: Option<MoeTopkRouter<'a>>,
-    /// HC pre-FFN mix weights.
-    pub hc_pre_ffn: HcOpWeights<'a>,
-    /// HC post-FFN mix weights.
-    pub hc_post_ffn: HcOpWeights<'a>,
+    /// HC weights for the FFN sublayer. Same shape semantics as
+    /// [`Self::hc_attn`]; the post step is weightless and consumes
+    /// the matching `hc_pre`'s Sinkhorn split.
+    pub hc_ffn: HcSublayerWeights<'a>,
 }
 
 impl<'a> DsV4Block<'a> {
@@ -431,10 +433,13 @@ pub fn forward_block(
     tier: SimdTier,
 ) -> Result<(), Error> {
     // === Attention sub-layer ===
+    // hc_pre fills `scratch.merged` (input to the sublayer) AND
+    // `scratch.hc.split` (per-token Sinkhorn output used by the
+    // matching hc_post below).
     hc_pre(
         &scratch.streams,
         &mut scratch.merged,
-        &block.hc_pre_attn,
+        &block.hc_attn,
         &mut scratch.hc,
         n_tok,
         tier,
@@ -492,20 +497,22 @@ pub fn forward_block(
         DSV4_N_EMBD,
         tier,
     )?;
+    // hc_post owns no weights — it reads the `post` + `comb` slices
+    // out of `scratch.hc.split` populated by the attention hc_pre call.
     hc_post(
         &mut scratch.streams,
         &scratch.attn_proj,
-        &block.hc_post_attn,
         &mut scratch.hc,
         n_tok,
-        tier,
     )?;
 
     // === FFN sub-layer ===
+    // FFN's hc_pre overwrites `scratch.hc.split` with its own Sinkhorn
+    // output; the next hc_post will consume that.
     hc_pre(
         &scratch.streams,
         &mut scratch.merged,
-        &block.hc_pre_ffn,
+        &block.hc_ffn,
         &mut scratch.hc,
         n_tok,
         tier,
@@ -557,10 +564,8 @@ pub fn forward_block(
     hc_post(
         &mut scratch.streams,
         &scratch.ffn_out,
-        &block.hc_post_ffn,
         &mut scratch.hc,
         n_tok,
-        tier,
     )?;
 
     Ok(())
@@ -651,7 +656,7 @@ pub fn lm_head_logits(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dsv4::hc::HC_SINKHORN_BUF_LEN;
+    use crate::dsv4::hc::{HC_DIM, HC_MIX_DIM};
     use crate::dsv4::moe::StackedExperts;
     use crate::dsv4::shape::{DSV4_N_EXPERT, DSV4_N_EXPERT_USED, DSV4_N_FF_EXP, DSV4_N_LORA_Q};
 
@@ -674,7 +679,8 @@ mod tests {
         attn_sinks: Vec<f32>,
         attn_output_a: Vec<u8>,
         attn_output_b: Vec<u8>,
-        hc_w: Vec<f32>,
+        hc_mix_fn: Vec<f32>,
+        hc_scale: Vec<f32>,
         hc_base: Vec<f32>,
         ffn_norm: Vec<f32>,
         // Empty bytes: not exercised by structural tests.
@@ -710,8 +716,9 @@ mod tests {
                 // because structural tests don't run any matmul.
                 attn_output_a: vec![],
                 attn_output_b: vec![],
-                hc_w: vec![0.0; HC_SINKHORN_BUF_LEN * DSV4_N_EMBD],
-                hc_base: vec![0.0; HC_SINKHORN_BUF_LEN],
+                hc_mix_fn: vec![0.0; HC_DIM * HC_MIX_DIM],
+                hc_scale: vec![1.0, 1.0, 1.0],
+                hc_base: vec![0.0; HC_MIX_DIM],
                 ffn_norm: vec![1.0; DSV4_N_EMBD],
                 moe_gate: vec![],
                 moe_up: vec![],
@@ -741,10 +748,10 @@ mod tests {
         }
 
         fn block(&self, layer_idx: usize) -> DsV4Block<'_> {
-            let hc = HcOpWeights {
-                mix_w: WeightBlob::F32(&self.hc_w),
-                mix_base: &self.hc_base,
-                scale: [1.0, 1.0, 1.0],
+            let hc = HcSublayerWeights {
+                mix_fn: WeightBlob::F32(&self.hc_mix_fn),
+                scale: &self.hc_scale,
+                base: &self.hc_base,
             };
             DsV4Block {
                 attn_norm: &self.attn_norm,
@@ -764,8 +771,7 @@ mod tests {
                     data: &self.attn_output_b,
                     dtype: rsllm_gguf::GgmlType::Q8_0,
                 },
-                hc_pre_attn: hc,
-                hc_post_attn: hc,
+                hc_attn: hc,
                 ffn_norm: &self.ffn_norm,
                 moe_experts: MoeExpertWeights {
                     gate: StackedExperts {
@@ -812,8 +818,7 @@ mod tests {
                 } else {
                     None
                 },
-                hc_pre_ffn: hc,
-                hc_post_ffn: hc,
+                hc_ffn: hc,
                 compressor: if rsllm_kvcache::dsv4::shape::layer_compress_ratio(layer_idx) > 0 {
                     Some(CompressorWeights {
                         attn_compressor: WeightBlob::F32(&self.compressor_w),
