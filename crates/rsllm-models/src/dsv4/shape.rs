@@ -1,6 +1,6 @@
 //! Fixed shape constants for DeepSeek V4 Flash.
 //!
-//! Every value here is **hard-coded** from `ds4.c:87-108` (MIT, The ds4.c
+//! Every value here is **hard-coded** from `ds4.c:85-108` (MIT, The ds4.c
 //! authors). The DS V4 Flash architecture is not a tunable family: there
 //! is only one set of dimensions, and we fail-fast at GGUF load time on
 //! any mismatch. This matches ds4's tensor-layout validation behavior
@@ -34,8 +34,14 @@ pub const DSV4_N_HEAD: usize = 64;
 /// projected to a per-head latent, so `n_head_kv == 1` at the GGUF level.
 pub const DSV4_N_HEAD_KV: usize = 1;
 
-/// Per-head Q/K/V latent dimension (after LoRA up-projection).
+/// Per-head Q/K latent dimension (after LoRA up-projection).
 pub const DSV4_HEAD_DIM: usize = 512;
+
+/// Per-head V latent dimension. Same value as [`DSV4_HEAD_DIM`] for
+/// DS V4 Flash, but the upstream metadata exposes the two independently
+/// (`attention.key_length` and `attention.value_length`) so we validate
+/// both. Ref: `ds4.c:93`.
+pub const DSV4_N_VALUE_DIM: usize = 512;
 
 /// RoPE-rotated tail length per Q/K head. Only the last `N_ROT` lanes
 /// of each `HEAD_DIM` head get the YaRN-scaled RoPE rotation.
@@ -62,7 +68,7 @@ pub const DSV4_N_EXPERT_SHARED: usize = 1;
 /// post-attention projection is grouped into `N_OUT_GROUP` chunks of
 /// `HEAD_DIM * (N_HEAD / N_OUT_GROUP) = 4096`-dim input, each projected
 /// to a per-group `N_LORA_O`-rank latent before a final dense up.
-/// Ref: `ds4.c:95`.
+/// Ref: `ds4.c:94`.
 pub const DSV4_N_OUT_GROUP: usize = 8;
 
 /// Hyper-connection residual stream count.
@@ -82,19 +88,58 @@ pub const DSV4_N_INDEXER_HEAD: usize = 64;
 /// Per-head dimension for the indexer. Ref: `ds4.c:105`.
 pub const DSV4_N_INDEXER_HEAD_DIM: usize = 128;
 
-/// RoPE frequency base. Sized for the long-context YaRN scaling regime.
-pub const DSV4_ROPE_FREQ_BASE: f32 = 160_000.0;
+/// Sinkhorn-Knopp iteration count for the HC split. Upstream pins this
+/// at 20 (`ds4.c:108`) and bakes it into every Sinkhorn call site
+/// (`ds4.c:4310`, `9057`, `11119`, ...). We validate the GGUF carries
+/// the same value so a mis-trained checkpoint can't silently drift the
+/// projection toward a different fixed point.
+pub const DSV4_N_HC_SINKHORN_ITER: u32 = 20;
+
+/// RoPE frequency base for the standard MLA attention rotation.
+/// Ref: `ds4.c:56` (`DS4_ROPE_FREQ_BASE = 10000.0f`). The 160_000.0
+/// value used elsewhere is the *compress*-path RoPE base, see
+/// [`DSV4_COMPRESS_ROPE_FREQ_BASE`].
+pub const DSV4_ROPE_FREQ_BASE: f32 = 10_000.0;
+
+/// RoPE frequency base used by the indexer/compressor path.
+/// Ref: `ds4.c:60` (`DS4_COMPRESS_ROPE_FREQ_BASE = 160000.0f`).
+pub const DSV4_COMPRESS_ROPE_FREQ_BASE: f32 = 160_000.0;
+
+/// YaRN linear-extrapolation scale factor. Ref: `ds4.c:57`.
+pub const DSV4_ROPE_SCALE_FACTOR: f32 = 16.0;
+
+/// YaRN ramp upper bound (fast end). Ref: `ds4.c:58`.
+pub const DSV4_ROPE_YARN_BETA_FAST: f32 = 32.0;
+
+/// YaRN ramp lower bound (slow end). Ref: `ds4.c:59`.
+pub const DSV4_ROPE_YARN_BETA_SLOW: f32 = 1.0;
+
+/// Original (un-extrapolated) context length the model was trained on,
+/// used by YaRN to compute the ramp. Ref: `ds4.c:61`
+/// (`DS4_ROPE_ORIG_CTX = 65536`). Encoded as `u64` in GGUF, matching
+/// upstream `required_u64` (`ds4.c:2549`).
+pub const DSV4_ROPE_ORIG_CTX: u64 = 65_536;
+
+/// MoE expert-weights scale applied to the routed mixture pre-softmax
+/// in the post-hash regime. Ref: `ds4.c:54`.
+pub const DSV4_EXPERT_WEIGHT_SCALE: f32 = 1.5;
 
 /// RMSNorm epsilon. Same value at every layer.
 pub const DSV4_RMS_EPS: f32 = 1e-6;
+
+/// HC RMSNorm epsilon. Numerically identical to [`DSV4_RMS_EPS`] at
+/// present but exposed as a separate metadata key by upstream so we
+/// validate it independently. Ref: `ds4.c:53`.
+pub const DSV4_HC_EPS: f32 = 1e-6;
 
 /// Number of leading layers that use **hash routing** for MoE instead
 /// of top-k softmax routing (`ds4.c:5002-5050`). Layers `[0, 3)` use
 /// the `ffn_gate_tid2eid` lookup table indexed by token id.
 pub const DSV4_HASH_ROUTE_LAYERS: usize = 3;
 
-/// Expected GGUF `general.architecture` value.
-pub const DSV4_ARCH_NAME: &str = "deepseek-v4-flash";
+/// Expected GGUF `general.architecture` value. Matches the upstream
+/// metadata-key prefix (`deepseek4.*`).
+pub const DSV4_ARCH_NAME: &str = "deepseek4";
 
 /// FFN hidden-dim per *expert* in the MoE. Each layer has 256 routed
 /// experts plus one shared expert; this is the per-expert FFN width.
@@ -110,6 +155,9 @@ pub const DSV4_N_FF_EXP: usize = 2048;
 /// loudly — it would silently feed bad activations through every
 /// subsequent kernel, often producing plausible-looking but corrupt
 /// output. Better to refuse early.
+///
+/// Metadata key names follow upstream `ds4.c:2493-2573` (commit
+/// `ef0a490`). All keys share the `deepseek4.*` prefix.
 ///
 /// # Errors
 /// Returns [`Error::MissingMetadata`] if a required key is absent and
@@ -129,95 +177,182 @@ pub fn validate_metadata(meta: &Metadata) -> Result<(), Error> {
     }
 
     // 2. Layer count.
-    expect_u32(meta, "deepseek-v4-flash.block_count", DSV4_N_LAYER as u32)?;
+    expect_u32(meta, "deepseek4.block_count", DSV4_N_LAYER as u32)?;
 
     // 3. Embedding dim.
-    expect_u32(
-        meta,
-        "deepseek-v4-flash.embedding_length",
-        DSV4_N_EMBD as u32,
-    )?;
+    expect_u32(meta, "deepseek4.embedding_length", DSV4_N_EMBD as u32)?;
 
     // 4. Vocab size.
-    expect_u32(meta, "deepseek-v4-flash.vocab_size", DSV4_N_VOCAB as u32)?;
+    expect_u32(meta, "deepseek4.vocab_size", DSV4_N_VOCAB as u32)?;
 
     // 5. Head counts.
+    expect_u32(meta, "deepseek4.attention.head_count", DSV4_N_HEAD as u32)?;
     expect_u32(
         meta,
-        "deepseek-v4-flash.attention.head_count",
-        DSV4_N_HEAD as u32,
-    )?;
-    expect_u32(
-        meta,
-        "deepseek-v4-flash.attention.head_count_kv",
+        "deepseek4.attention.head_count_kv",
         DSV4_N_HEAD_KV as u32,
     )?;
 
-    // 6. Per-head latent dim.
-    expect_u32(meta, "deepseek-v4-flash.head_dim", DSV4_HEAD_DIM as u32)?;
-    expect_u32(meta, "deepseek-v4-flash.n_rot", DSV4_N_ROT as u32)?;
-
-    // 7. LoRA ranks.
-    expect_u32(meta, "deepseek-v4-flash.q_lora_rank", DSV4_N_LORA_Q as u32)?;
-    expect_u32(meta, "deepseek-v4-flash.o_lora_rank", DSV4_N_LORA_O as u32)?;
-
-    // 8. MoE shape.
-    expect_u32(meta, "deepseek-v4-flash.expert_count", DSV4_N_EXPERT as u32)?;
+    // 6. Per-head latent dims (K and V exposed separately upstream).
     expect_u32(
         meta,
-        "deepseek-v4-flash.expert_used_count",
+        "deepseek4.attention.key_length",
+        DSV4_HEAD_DIM as u32,
+    )?;
+    expect_u32(
+        meta,
+        "deepseek4.attention.value_length",
+        DSV4_N_VALUE_DIM as u32,
+    )?;
+    expect_u32(meta, "deepseek4.rope.dimension_count", DSV4_N_ROT as u32)?;
+
+    // 7. LoRA ranks.
+    expect_u32(
+        meta,
+        "deepseek4.attention.q_lora_rank",
+        DSV4_N_LORA_Q as u32,
+    )?;
+    expect_u32(
+        meta,
+        "deepseek4.attention.output_lora_rank",
+        DSV4_N_LORA_O as u32,
+    )?;
+    expect_u32(
+        meta,
+        "deepseek4.attention.output_group_count",
+        DSV4_N_OUT_GROUP as u32,
+    )?;
+
+    // 8. MoE shape.
+    expect_u32(meta, "deepseek4.expert_count", DSV4_N_EXPERT as u32)?;
+    expect_u32(
+        meta,
+        "deepseek4.expert_used_count",
         DSV4_N_EXPERT_USED as u32,
     )?;
     expect_u32(
         meta,
-        "deepseek-v4-flash.expert_feed_forward_length",
+        "deepseek4.expert_feed_forward_length",
         DSV4_N_FF_EXP as u32,
     )?;
     expect_u32(
         meta,
-        "deepseek-v4-flash.expert_shared_count",
+        "deepseek4.expert_shared_count",
         DSV4_N_EXPERT_SHARED as u32,
     )?;
-    expect_u32(meta, "deepseek-v4-flash.n_hc", DSV4_N_HC as u32)?;
-
-    // Attention output LoRA grouping (`ds4.c:2520`).
     expect_u32(
         meta,
-        "deepseek-v4-flash.attention.output_group_count",
-        DSV4_N_OUT_GROUP as u32,
+        "deepseek4.hash_layer_count",
+        DSV4_HASH_ROUTE_LAYERS as u32,
     )?;
 
-    // Indexer shape (`ds4.c:2536-2537`); used by F006 KV cache.
+    // 9. Sliding window.
     expect_u32(
         meta,
-        "deepseek-v4-flash.attention.indexer.head_count",
+        "deepseek4.attention.sliding_window",
+        DSV4_N_SWA as u32,
+    )?;
+
+    // 10. Indexer (`ds4.c:2533-2537`); used by F006 KV cache.
+    expect_u32(
+        meta,
+        "deepseek4.attention.indexer.head_count",
         DSV4_N_INDEXER_HEAD as u32,
     )?;
     expect_u32(
         meta,
-        "deepseek-v4-flash.attention.indexer.key_length",
+        "deepseek4.attention.indexer.key_length",
         DSV4_N_INDEXER_HEAD_DIM as u32,
     )?;
-
-    // 9. RoPE base — float, exact match.
-    expect_f32_close(
+    expect_u32(
         meta,
-        "deepseek-v4-flash.rope.freq_base",
-        DSV4_ROPE_FREQ_BASE,
+        "deepseek4.attention.indexer.top_k",
+        DSV4_N_INDEXER_TOP_K as u32,
     )?;
 
-    // 10. RMSNorm eps.
+    // 11. Hyper-connection (`ds4.c:2539-2542`).
+    expect_u32(meta, "deepseek4.hyper_connection.count", DSV4_N_HC as u32)?;
+    expect_u32(
+        meta,
+        "deepseek4.hyper_connection.sinkhorn_iterations",
+        DSV4_N_HC_SINKHORN_ITER,
+    )?;
+
+    // 12. RoPE / YaRN (`ds4.c:2549-2562`).
+    expect_u64(
+        meta,
+        "deepseek4.rope.scaling.original_context_length",
+        DSV4_ROPE_ORIG_CTX,
+    )?;
+    expect_f32_close(meta, "deepseek4.rope.freq_base", DSV4_ROPE_FREQ_BASE)?;
     expect_f32_close(
         meta,
-        "deepseek-v4-flash.attention.layer_norm_rms_epsilon",
+        "deepseek4.rope.scaling.factor",
+        DSV4_ROPE_SCALE_FACTOR,
+    )?;
+    expect_f32_close(
+        meta,
+        "deepseek4.rope.scaling.yarn_beta_fast",
+        DSV4_ROPE_YARN_BETA_FAST,
+    )?;
+    expect_f32_close(
+        meta,
+        "deepseek4.rope.scaling.yarn_beta_slow",
+        DSV4_ROPE_YARN_BETA_SLOW,
+    )?;
+    expect_f32_close(
+        meta,
+        "deepseek4.attention.compress_rope_freq_base",
+        DSV4_COMPRESS_ROPE_FREQ_BASE,
+    )?;
+
+    // 13. MoE expert-weights scaling and norm flag (`ds4.c:2566-2572`).
+    expect_f32_close(
+        meta,
+        "deepseek4.expert_weights_scale",
+        DSV4_EXPERT_WEIGHT_SCALE,
+    )?;
+    expect_bool(meta, "deepseek4.expert_weights_norm", true)?;
+
+    // 14. RMS / HC epsilons (`ds4.c:2568, 2570`).
+    expect_f32_close(
+        meta,
+        "deepseek4.attention.layer_norm_rms_epsilon",
         DSV4_RMS_EPS,
     )?;
+    expect_f32_close(meta, "deepseek4.hyper_connection.epsilon", DSV4_HC_EPS)?;
 
     Ok(())
 }
 
 fn expect_u32(meta: &Metadata, key: &'static str, want: u32) -> Result<(), Error> {
     let got = meta.get_u32(key).ok_or(Error::MissingMetadata(key))?;
+    if got == want {
+        Ok(())
+    } else {
+        Err(Error::ShapeMismatch {
+            key,
+            expected: want.to_string(),
+            actual: got.to_string(),
+        })
+    }
+}
+
+fn expect_u64(meta: &Metadata, key: &'static str, want: u64) -> Result<(), Error> {
+    let got = meta.get_u64(key).ok_or(Error::MissingMetadata(key))?;
+    if got == want {
+        Ok(())
+    } else {
+        Err(Error::ShapeMismatch {
+            key,
+            expected: want.to_string(),
+            actual: got.to_string(),
+        })
+    }
+}
+
+fn expect_bool(meta: &Metadata, key: &'static str, want: bool) -> Result<(), Error> {
+    let got = meta.get_bool(key).ok_or(Error::MissingMetadata(key))?;
     if got == want {
         Ok(())
     } else {
@@ -257,75 +392,115 @@ mod tests {
             "general.architecture",
             Value::String(DSV4_ARCH_NAME.to_string()),
         );
+        m.insert("deepseek4.block_count", Value::U32(DSV4_N_LAYER as u32));
+        m.insert("deepseek4.embedding_length", Value::U32(DSV4_N_EMBD as u32));
+        m.insert("deepseek4.vocab_size", Value::U32(DSV4_N_VOCAB as u32));
         m.insert(
-            "deepseek-v4-flash.block_count",
-            Value::U32(DSV4_N_LAYER as u32),
-        );
-        m.insert(
-            "deepseek-v4-flash.embedding_length",
-            Value::U32(DSV4_N_EMBD as u32),
-        );
-        m.insert(
-            "deepseek-v4-flash.vocab_size",
-            Value::U32(DSV4_N_VOCAB as u32),
-        );
-        m.insert(
-            "deepseek-v4-flash.attention.head_count",
+            "deepseek4.attention.head_count",
             Value::U32(DSV4_N_HEAD as u32),
         );
         m.insert(
-            "deepseek-v4-flash.attention.head_count_kv",
+            "deepseek4.attention.head_count_kv",
             Value::U32(DSV4_N_HEAD_KV as u32),
         );
         m.insert(
-            "deepseek-v4-flash.head_dim",
+            "deepseek4.attention.key_length",
             Value::U32(DSV4_HEAD_DIM as u32),
         );
-        m.insert("deepseek-v4-flash.n_rot", Value::U32(DSV4_N_ROT as u32));
         m.insert(
-            "deepseek-v4-flash.q_lora_rank",
+            "deepseek4.attention.value_length",
+            Value::U32(DSV4_N_VALUE_DIM as u32),
+        );
+        m.insert(
+            "deepseek4.rope.dimension_count",
+            Value::U32(DSV4_N_ROT as u32),
+        );
+        m.insert(
+            "deepseek4.attention.q_lora_rank",
             Value::U32(DSV4_N_LORA_Q as u32),
         );
         m.insert(
-            "deepseek-v4-flash.o_lora_rank",
+            "deepseek4.attention.output_lora_rank",
             Value::U32(DSV4_N_LORA_O as u32),
         );
         m.insert(
-            "deepseek-v4-flash.expert_count",
-            Value::U32(DSV4_N_EXPERT as u32),
+            "deepseek4.attention.output_group_count",
+            Value::U32(DSV4_N_OUT_GROUP as u32),
         );
+        m.insert("deepseek4.expert_count", Value::U32(DSV4_N_EXPERT as u32));
         m.insert(
-            "deepseek-v4-flash.expert_used_count",
+            "deepseek4.expert_used_count",
             Value::U32(DSV4_N_EXPERT_USED as u32),
         );
         m.insert(
-            "deepseek-v4-flash.expert_feed_forward_length",
+            "deepseek4.expert_feed_forward_length",
             Value::U32(DSV4_N_FF_EXP as u32),
         );
         m.insert(
-            "deepseek-v4-flash.expert_shared_count",
+            "deepseek4.expert_shared_count",
             Value::U32(DSV4_N_EXPERT_SHARED as u32),
         );
-        m.insert("deepseek-v4-flash.n_hc", Value::U32(DSV4_N_HC as u32));
         m.insert(
-            "deepseek-v4-flash.attention.output_group_count",
-            Value::U32(DSV4_N_OUT_GROUP as u32),
+            "deepseek4.hash_layer_count",
+            Value::U32(DSV4_HASH_ROUTE_LAYERS as u32),
         );
         m.insert(
-            "deepseek-v4-flash.attention.indexer.head_count",
+            "deepseek4.attention.sliding_window",
+            Value::U32(DSV4_N_SWA as u32),
+        );
+        m.insert(
+            "deepseek4.attention.indexer.head_count",
             Value::U32(DSV4_N_INDEXER_HEAD as u32),
         );
         m.insert(
-            "deepseek-v4-flash.attention.indexer.key_length",
+            "deepseek4.attention.indexer.key_length",
             Value::U32(DSV4_N_INDEXER_HEAD_DIM as u32),
         );
         m.insert(
-            "deepseek-v4-flash.rope.freq_base",
+            "deepseek4.attention.indexer.top_k",
+            Value::U32(DSV4_N_INDEXER_TOP_K as u32),
+        );
+        m.insert("deepseek4.hyper_connection.count", Value::U32(DSV4_N_HC as u32));
+        m.insert(
+            "deepseek4.hyper_connection.sinkhorn_iterations",
+            Value::U32(DSV4_N_HC_SINKHORN_ITER),
+        );
+        m.insert(
+            "deepseek4.rope.scaling.original_context_length",
+            Value::U64(DSV4_ROPE_ORIG_CTX),
+        );
+        m.insert(
+            "deepseek4.rope.freq_base",
             Value::F32(DSV4_ROPE_FREQ_BASE),
         );
         m.insert(
-            "deepseek-v4-flash.attention.layer_norm_rms_epsilon",
+            "deepseek4.rope.scaling.factor",
+            Value::F32(DSV4_ROPE_SCALE_FACTOR),
+        );
+        m.insert(
+            "deepseek4.rope.scaling.yarn_beta_fast",
+            Value::F32(DSV4_ROPE_YARN_BETA_FAST),
+        );
+        m.insert(
+            "deepseek4.rope.scaling.yarn_beta_slow",
+            Value::F32(DSV4_ROPE_YARN_BETA_SLOW),
+        );
+        m.insert(
+            "deepseek4.attention.compress_rope_freq_base",
+            Value::F32(DSV4_COMPRESS_ROPE_FREQ_BASE),
+        );
+        m.insert(
+            "deepseek4.expert_weights_scale",
+            Value::F32(DSV4_EXPERT_WEIGHT_SCALE),
+        );
+        m.insert("deepseek4.expert_weights_norm", Value::Bool(true));
+        m.insert(
+            "deepseek4.attention.layer_norm_rms_epsilon",
             Value::F32(DSV4_RMS_EPS),
+        );
+        m.insert(
+            "deepseek4.hyper_connection.epsilon",
+            Value::F32(DSV4_HC_EPS),
         );
         m
     }
@@ -344,12 +519,25 @@ mod tests {
     }
 
     #[test]
+    fn rejects_legacy_arch_prefix() {
+        // Catches accidental regression to the old `deepseek-v4-flash`
+        // architecture string we used before the F010.E prefix migration.
+        let mut m = good_meta();
+        m.insert(
+            "general.architecture",
+            Value::String("deepseek-v4-flash".to_string()),
+        );
+        let err = validate_metadata(&m).unwrap_err();
+        assert!(matches!(err, Error::ShapeMismatch { .. }));
+    }
+
+    #[test]
     fn rejects_wrong_layer_count() {
         let mut m = good_meta();
-        m.insert("deepseek-v4-flash.block_count", Value::U32(42));
+        m.insert("deepseek4.block_count", Value::U32(42));
         let err = validate_metadata(&m).unwrap_err();
         match err {
-            Error::ShapeMismatch { key, .. } => assert_eq!(key, "deepseek-v4-flash.block_count"),
+            Error::ShapeMismatch { key, .. } => assert_eq!(key, "deepseek4.block_count"),
             other => panic!("expected ShapeMismatch, got {other:?}"),
         }
     }
@@ -361,7 +549,7 @@ mod tests {
         // Simulate by inserting a wrong-typed value (still triggers MissingMetadata
         // because get_u32 returns None on String).
         m.insert(
-            "deepseek-v4-flash.embedding_length",
+            "deepseek4.embedding_length",
             Value::String("oops".to_string()),
         );
         let err = validate_metadata(&m).unwrap_err();
@@ -371,10 +559,10 @@ mod tests {
     #[test]
     fn accepts_rope_base_within_tolerance() {
         let mut m = good_meta();
-        // 1e-4 relative drift on a 160000 base = 16, well under the 1e-3 gate.
+        // 1e-4 relative drift on a 10000 base = 1, well under the 1e-3 gate.
         m.insert(
-            "deepseek-v4-flash.rope.freq_base",
-            Value::F32(DSV4_ROPE_FREQ_BASE + 10.0),
+            "deepseek4.rope.freq_base",
+            Value::F32(DSV4_ROPE_FREQ_BASE + 1.0),
         );
         validate_metadata(&m).unwrap();
     }
@@ -383,10 +571,68 @@ mod tests {
     fn rejects_rope_base_far_off() {
         let mut m = good_meta();
         m.insert(
-            "deepseek-v4-flash.rope.freq_base",
-            Value::F32(10_000.0), // Llama-style base, way off.
+            "deepseek4.rope.freq_base",
+            Value::F32(160_000.0), // Compress-path base, way off from standard MLA base.
         );
         let err = validate_metadata(&m).unwrap_err();
         assert!(matches!(err, Error::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn rejects_wrong_sinkhorn_iterations() {
+        let mut m = good_meta();
+        m.insert(
+            "deepseek4.hyper_connection.sinkhorn_iterations",
+            Value::U32(15),
+        );
+        let err = validate_metadata(&m).unwrap_err();
+        match err {
+            Error::ShapeMismatch { key, .. } => {
+                assert_eq!(key, "deepseek4.hyper_connection.sinkhorn_iterations");
+            }
+            other => panic!("expected ShapeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_wrong_value_length() {
+        let mut m = good_meta();
+        m.insert("deepseek4.attention.value_length", Value::U32(256));
+        let err = validate_metadata(&m).unwrap_err();
+        match err {
+            Error::ShapeMismatch { key, .. } => {
+                assert_eq!(key, "deepseek4.attention.value_length");
+            }
+            other => panic!("expected ShapeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_wrong_expert_weights_norm() {
+        let mut m = good_meta();
+        m.insert("deepseek4.expert_weights_norm", Value::Bool(false));
+        let err = validate_metadata(&m).unwrap_err();
+        match err {
+            Error::ShapeMismatch { key, .. } => {
+                assert_eq!(key, "deepseek4.expert_weights_norm");
+            }
+            other => panic!("expected ShapeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_wrong_rope_orig_ctx() {
+        let mut m = good_meta();
+        m.insert(
+            "deepseek4.rope.scaling.original_context_length",
+            Value::U64(32_768),
+        );
+        let err = validate_metadata(&m).unwrap_err();
+        match err {
+            Error::ShapeMismatch { key, .. } => {
+                assert_eq!(key, "deepseek4.rope.scaling.original_context_length");
+            }
+            other => panic!("expected ShapeMismatch, got {other:?}"),
+        }
     }
 }

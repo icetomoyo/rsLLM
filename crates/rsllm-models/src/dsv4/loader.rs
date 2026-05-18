@@ -717,7 +717,7 @@ pub fn load_dsv4_flash(gguf: &GgufFile) -> Result<DeepSeekV4Flash<'_>, Error> {
     validate_metadata(gguf.metadata())?;
     tracing::info!(
         target: "rsllm_models::dsv4::loader",
-        arch = "deepseek-v4-flash",
+        arch = "deepseek4",
         n_layer = DSV4_N_LAYER,
         n_vocab = DSV4_N_VOCAB,
         n_embd = DSV4_N_EMBD,
