@@ -123,10 +123,12 @@ pub mod tensor_names {
 /// reasoning lives in one place.
 ///
 /// # Errors
-/// - [`Error::ShapeMismatch`] with `key = "{name}.f32.length"` if
-///   the byte length is not a multiple of 4.
-/// - [`Error::ShapeMismatch`] with `key = "{name}.f32.alignment"`
-///   if the start pointer is not 4-byte aligned.
+/// - [`Error::ShapeMismatch`] with `key = "loader.f32.length"` if
+///   the byte length is not a multiple of 4 (tensor name carried
+///   in the `actual` field).
+/// - [`Error::ShapeMismatch`] with `key = "loader.f32.alignment"`
+///   if the start pointer is not 4-byte aligned (tensor name
+///   carried in the `actual` field).
 fn reinterpret_as_f32<'a>(bytes: &'a [u8], name: &str) -> Result<&'a [f32], Error> {
     if !bytes.len().is_multiple_of(4) {
         return Err(Error::ShapeMismatch {
@@ -211,14 +213,18 @@ pub fn resolve_f32_slice<'a>(gguf: &'a GgufFile, name: &str) -> Result<&'a [f32]
 /// Optional lookup — returns `None` if the tensor is absent (instead
 /// of erroring). Used for tensors that may or may not be present
 /// depending on the layer's regime (e.g. compressor on dense layers).
+///
+/// Implementation note: maps `MissingTensor` to `Ok(None)` rather
+/// than pre-checking with a second linear scan over `gguf.tensors()`.
 pub fn resolve_blob_opt<'a>(
     gguf: &'a GgufFile,
     name: &str,
 ) -> Result<Option<WeightBlob<'a>>, Error> {
-    if gguf.tensor(name).is_none() {
-        return Ok(None);
+    match resolve_blob(gguf, name) {
+        Ok(blob) => Ok(Some(blob)),
+        Err(Error::MissingTensor(_)) => Ok(None),
+        Err(e) => Err(e),
     }
-    Ok(Some(resolve_blob(gguf, name)?))
 }
 
 /// Build the F008.B `CompressorWeights` for layer `il`, **if** the
@@ -582,7 +588,12 @@ mod tests {
         let file = GgufFile::from_bytes(bytes).unwrap();
         let (write, read) = load_indexer(&file, 2).unwrap().expect("Some");
         assert_eq!(read.attn_indexer_head_weight.len(), DSV4_N_INDEXER_HEAD);
-        let _ = write.attn_indexer_kv.byte_len();
+        // Numerical shape assertions — make the shape check load-bearing
+        // (a future regression that produces a smaller blob would have
+        // been caught silently before this fix).
+        assert_eq!(write.attn_indexer_kv.byte_len(), kv_elems * 4);
+        assert_eq!(write.attn_indexer_kv_score.byte_len(), kv_elems * 4);
+        assert_eq!(read.attn_indexer_q.byte_len(), q_elems * 4);
     }
 
     #[test]
