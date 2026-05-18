@@ -13,10 +13,12 @@
 
 pub mod deepseek_v4_flash;
 pub mod dsv4;
+pub mod engine_impl;
 
 pub use deepseek_v4_flash::{
     AttentionFn, DeepSeekV4Flash, DsV4Block, ForwardScratch, forward_block, lm_head_logits,
 };
+pub use engine_impl::{DsV4FlashEngine, DsV4FlashSession};
 
 /// Identifier of the model architecture family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

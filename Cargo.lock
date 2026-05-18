@@ -540,9 +540,11 @@ version = "0.0.1"
 dependencies = [
  "rsllm-backend-cpu",
  "rsllm-cal",
+ "rsllm-core",
  "rsllm-gguf",
  "rsllm-kvcache",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]
