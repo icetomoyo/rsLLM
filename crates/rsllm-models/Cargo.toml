@@ -19,3 +19,8 @@ rsllm-kvcache = { workspace = true }
 rsllm-backend-cpu = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+rsllm-tokenizer = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

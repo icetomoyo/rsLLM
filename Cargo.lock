@@ -543,6 +543,9 @@ dependencies = [
  "rsllm-core",
  "rsllm-gguf",
  "rsllm-kvcache",
+ "rsllm-tokenizer",
+ "serde",
+ "serde_json",
  "thiserror",
  "tracing",
 ]
