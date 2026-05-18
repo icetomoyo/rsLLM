@@ -264,9 +264,16 @@ impl Session for DsV4FlashSession<'_, '_> {
         let n_tok = tokens.len();
         self.ensure_scratch_for(n_tok);
 
-        // Embed every token into stream 0 of `scratch.streams`. The
-        // other 3 HC streams stay at zero — they are *outputs* of the
-        // hyper-connection ops, not inputs.
+        // Zero the whole `streams` region before embedding. `Vec::resize`
+        // only zero-fills *newly grown* elements, so when a second prefill
+        // has `n_tok <= current_n_tok` the resize is a no-op and HC
+        // streams 1..3 still hold the previous pass's outputs. Those are
+        // *outputs* of the hyper-connection ops, not inputs, so they
+        // must be zero on entry to forward_block.
+        let total = n_tok * rsllm_backend_cpu::ops::sinkhorn::N_HC * DSV4_N_EMBD;
+        self.scratch.streams[..total].fill(0.0);
+
+        // Embed every token into stream 0. Streams 1..3 stay zero.
         for (t, &id) in tokens.iter().enumerate() {
             let stream0_off = t * rsllm_backend_cpu::ops::sinkhorn::N_HC * DSV4_N_EMBD;
             embed_token(
@@ -280,6 +287,10 @@ impl Session for DsV4FlashSession<'_, '_> {
         let mut last_hidden = vec![0.0_f32; DSV4_N_EMBD];
         self.forward_pass(n_tok, position_offset, &mut last_hidden)?;
         self.position += n_tok;
+        // Normalize per-layer compressor state so the next decode_one
+        // resumes from the same partial-window state a streaming run
+        // would produce (ds4.c:6353-6371 — see ThreeTierKvCache docs).
+        self.cache.finish_prefill(self.position);
 
         let tier = self.engine.tier;
         lm_head_logits(
@@ -334,6 +345,13 @@ impl Session for DsV4FlashSession<'_, '_> {
     fn reset(&mut self) {
         self.cache.clear();
         self.position = 0;
+        // Force the next prefill / decode to resize scratch, which
+        // zero-fills any newly grown elements. This is belt-and-
+        // suspenders alongside the explicit `streams[..].fill(0.0)` in
+        // `prefill` — if a caller skips prefill and goes straight to
+        // decode after reset, the scratch is still hot from a prior
+        // session.
+        self.current_n_tok = 0;
     }
 }
 
@@ -361,22 +379,73 @@ fn embed_token(
     }
     match embed {
         WeightBlob::F32(s) => {
-            let start = tid * DSV4_N_EMBD;
-            out.copy_from_slice(&s[start..start + DSV4_N_EMBD]);
+            // checked_mul guards 32-bit targets (v0.1.0 ships 64-bit
+            // only, but adding the check is free and protects fuzz /
+            // future ports). On 64-bit the product fits trivially:
+            // DSV4_N_VOCAB * DSV4_N_EMBD ≈ 9.3e8 << usize::MAX.
+            let start = tid.checked_mul(DSV4_N_EMBD).ok_or_else(|| {
+                EngineError::ShapeMismatch {
+                    what: "embed_token.f32_start".into(),
+                    expected: "tid * N_EMBD fits in usize".into(),
+                    actual: format!("tid={tid} N_EMBD={DSV4_N_EMBD}"),
+                }
+            })?;
+            let end = start
+                .checked_add(DSV4_N_EMBD)
+                .ok_or_else(|| EngineError::ShapeMismatch {
+                    what: "embed_token.f32_end".into(),
+                    expected: "start + N_EMBD fits in usize".into(),
+                    actual: format!("start={start} N_EMBD={DSV4_N_EMBD}"),
+                })?;
+            // Use `.get(...)` rather than `&s[..]` so an undersized
+            // F32 blob (e.g. constructed in a test or by a future
+            // API that bypasses the loader's check_shape guard)
+            // returns Err instead of panicking.
+            let row = s.get(start..end).ok_or_else(|| EngineError::ShapeMismatch {
+                what: "embed_token.f32_row".into(),
+                expected: format!("F32 storage >= {end} elements"),
+                actual: format!("{}", s.len()),
+            })?;
+            out.copy_from_slice(row);
             Ok(())
         }
         WeightBlob::Quant { data, dtype } => {
             // Per-row dequant. ds4 typically ships embeddings as
             // F16 or Q4_K; either case has a fixed row-byte stride.
-            let row_bytes = (dtype.byte_size(DSV4_N_EMBD as u64).ok_or_else(|| {
+            //
+            // `byte_size` returns u64 to express on-disk sizes that
+            // could exceed 32-bit on 32-bit targets; we explicitly
+            // catch that overflow via TryFrom rather than `as usize`
+            // (which silently truncates).
+            let row_bytes_u64 =
+                dtype.byte_size(DSV4_N_EMBD as u64).ok_or_else(|| {
+                    EngineError::ShapeMismatch {
+                        what: "embed_token.row_bytes".into(),
+                        expected: "byte_size computable".into(),
+                        actual: format!("{dtype:?}"),
+                    }
+                })?;
+            let row_bytes =
+                usize::try_from(row_bytes_u64).map_err(|_| EngineError::ShapeMismatch {
+                    what: "embed_token.row_bytes_fit".into(),
+                    expected: "row_bytes fits in usize".into(),
+                    actual: format!("{row_bytes_u64}"),
+                })?;
+            let row_start = tid.checked_mul(row_bytes).ok_or_else(|| {
                 EngineError::ShapeMismatch {
-                    what: "embed_token.row_bytes".into(),
-                    expected: "byte_size computable".into(),
-                    actual: format!("{dtype:?}"),
+                    what: "embed_token.quant_row_start".into(),
+                    expected: "tid * row_bytes fits in usize".into(),
+                    actual: format!("tid={tid} row_bytes={row_bytes}"),
                 }
-            })?) as usize;
-            let row_start = tid * row_bytes;
-            let row_end = row_start + row_bytes;
+            })?;
+            let row_end =
+                row_start
+                    .checked_add(row_bytes)
+                    .ok_or_else(|| EngineError::ShapeMismatch {
+                        what: "embed_token.quant_row_end".into(),
+                        expected: "row_start + row_bytes fits in usize".into(),
+                        actual: format!("row_start={row_start} row_bytes={row_bytes}"),
+                    })?;
             let src = data.get(row_start..row_end).ok_or_else(|| {
                 EngineError::ShapeMismatch {
                     what: "embed_token.row_slice".into(),
@@ -404,6 +473,12 @@ fn map_model_err(e: crate::Error) -> EngineError {
             expected,
             actual,
         },
+        // NOTE: a GGUF parse error is semantically a parse failure, not
+        // a shape mismatch. EngineError has no generic Parse / Io
+        // variant covering it today; using ShapeMismatch here keeps the
+        // mapping total at the cost of a slightly misleading CLI error
+        // message ("shape mismatch: gguf expected valid, got ..."). A
+        // follow-up that adds EngineError::Parse can clean this up.
         crate::Error::Gguf(e) => EngineError::ShapeMismatch {
             what: "gguf".into(),
             expected: "valid".into(),
@@ -455,6 +530,27 @@ mod tests {
         match mapped {
             EngineError::Missing(s) => assert!(s.contains("blk.0")),
             other => panic!("expected Missing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn embed_token_f32_rejects_undersized_storage() {
+        // Storage holds *fewer* than DSV4_N_VOCAB rows; the token-id
+        // bounds check passes (we ask for row 0), but the F32 slice
+        // is too short. The fix in F008.C.3.d review guards this with
+        // `.get(start..end)` instead of a panicking index.
+        let storage = vec![0.0_f32; DSV4_N_EMBD / 2];
+        let embed = WeightBlob::F32(&storage);
+        let mut out = vec![0.0_f32; DSV4_N_EMBD];
+        let err = embed_token(&embed, 0, &mut out).unwrap_err();
+        match err {
+            EngineError::ShapeMismatch { what, .. } => {
+                assert!(
+                    what.contains("f32_row"),
+                    "expected 'f32_row' guard, got `what` = {what:?}"
+                );
+            }
+            other => panic!("expected ShapeMismatch::f32_row, got {other:?}"),
         }
     }
 }
