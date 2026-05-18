@@ -34,18 +34,59 @@ fn map_think(mode: ThinkMode) -> TokThinkMode {
     }
 }
 
-/// Derive [`SamplingParams`] from the CLI flags. Today the only
-/// knob exposed is `--seed`; the rest of the chain stays on the
-/// `SamplingParams::default()` (temperature 0.7 + min_p 0.05).
-/// Adding `--temperature`, `--top-k`, `--top-p`, `--min-p` flags is a
-/// follow-up to F008.C.3.f — kept out of this commit so the surface
-/// stays minimal and the test matrix doesn't explode.
-#[must_use]
-pub fn sampling_params_from_flags(flags: &RunFlags) -> SamplingParams {
-    SamplingParams {
+/// Derive [`SamplingParams`] from the CLI flags. Each
+/// `--temperature` / `--top-k` / `--top-p` / `--min-p` flag, when
+/// set, overrides the corresponding field of
+/// [`SamplingParams::default()`]; unset flags pass through the
+/// default. Validation enforces sane ranges:
+///
+/// - `temperature ≥ 0.0` and finite (0.0 = greedy short-circuit).
+/// - `top_k ≥ 1` (Some(0) is rejected — disabling the filter is
+///   expressed by omitting the flag).
+/// - `top_p ∈ (0.0, 1.0]`.
+/// - `min_p ∈ [0.0, 1.0)`.
+///
+/// Returns [`CliError::BadCommand`] for any out-of-range value
+/// before the engine even constructs a sampler, so the operator
+/// gets a clear message instead of a downstream NaN.
+pub fn sampling_params_from_flags(flags: &RunFlags) -> Result<SamplingParams, CliError> {
+    let mut params = SamplingParams {
         seed: flags.seed,
         ..SamplingParams::default()
+    };
+    if let Some(t) = flags.temperature {
+        if !t.is_finite() || t < 0.0 {
+            return Err(CliError::BadCommand(format!(
+                "--temperature must be a non-negative finite number, got {t}"
+            )));
+        }
+        params.temperature = t;
     }
+    if let Some(k) = flags.top_k {
+        if k == 0 {
+            return Err(CliError::BadCommand(
+                "--top-k must be ≥ 1; omit the flag to disable the filter".into(),
+            ));
+        }
+        params.top_k = Some(k);
+    }
+    if let Some(p) = flags.top_p {
+        if !p.is_finite() || p <= 0.0 || p > 1.0 {
+            return Err(CliError::BadCommand(format!(
+                "--top-p must lie in (0.0, 1.0], got {p}"
+            )));
+        }
+        params.top_p = Some(p);
+    }
+    if let Some(p) = flags.min_p {
+        if !p.is_finite() || !(0.0..1.0).contains(&p) {
+            return Err(CliError::BadCommand(format!(
+                "--min-p must lie in [0.0, 1.0), got {p}"
+            )));
+        }
+        params.min_p = Some(p);
+    }
+    Ok(params)
 }
 
 /// One-shot decode: open the GGUF at `model_path`, tokenize `prompt`
@@ -81,12 +122,16 @@ pub fn run_one_shot(
         None => None,
     };
 
+    // Validate sampler flags BEFORE the model load so a bad
+    // `--top-p 1.5` surfaces immediately, not after a multi-minute
+    // mmap.
+    let params = sampling_params_from_flags(flags)?;
+
     let gguf = GgufFile::open(model_path)?;
     let tokenizer = Tokenizer::from_gguf(&gguf).map_err(map_tokenizer_err)?;
     let model = load_dsv4_flash(&gguf).map_err(map_model_err)?;
     let engine = DsV4FlashEngine::new(model);
 
-    let params = sampling_params_from_flags(flags);
     let mut session = engine
         .start_session(flags.ctx_size, params)
         .map_err(map_engine_err)?;
@@ -423,15 +468,107 @@ mod tests {
             seed: Some(0xC0FFEE),
             ..RunFlags::default()
         };
-        let p = sampling_params_from_flags(&flags);
+        let p = sampling_params_from_flags(&flags).unwrap();
         assert_eq!(p.seed, Some(0xC0FFEE));
     }
 
     #[test]
     fn sampling_params_seed_none_passes_through() {
         let flags = RunFlags::default();
-        let p = sampling_params_from_flags(&flags);
+        let p = sampling_params_from_flags(&flags).unwrap();
         assert_eq!(p.seed, None);
+    }
+
+    #[test]
+    fn sampling_params_honor_all_sampler_flags() {
+        let flags = RunFlags {
+            temperature: Some(0.3),
+            top_k: Some(50),
+            top_p: Some(0.9),
+            min_p: Some(0.1),
+            ..RunFlags::default()
+        };
+        let p = sampling_params_from_flags(&flags).unwrap();
+        assert!((p.temperature - 0.3).abs() < 1e-6);
+        assert_eq!(p.top_k, Some(50));
+        assert_eq!(p.top_p, Some(0.9));
+        assert_eq!(p.min_p, Some(0.1));
+    }
+
+    #[test]
+    fn sampling_params_reject_negative_temperature() {
+        let flags = RunFlags {
+            temperature: Some(-1.0),
+            ..RunFlags::default()
+        };
+        let err = sampling_params_from_flags(&flags).unwrap_err();
+        assert!(matches!(err, CliError::BadCommand(_)));
+    }
+
+    #[test]
+    fn sampling_params_reject_nan_temperature() {
+        let flags = RunFlags {
+            temperature: Some(f32::NAN),
+            ..RunFlags::default()
+        };
+        let err = sampling_params_from_flags(&flags).unwrap_err();
+        assert!(matches!(err, CliError::BadCommand(_)));
+    }
+
+    #[test]
+    fn sampling_params_reject_zero_top_k() {
+        let flags = RunFlags {
+            top_k: Some(0),
+            ..RunFlags::default()
+        };
+        let err = sampling_params_from_flags(&flags).unwrap_err();
+        assert!(matches!(err, CliError::BadCommand(_)));
+    }
+
+    #[test]
+    fn sampling_params_reject_top_p_out_of_range() {
+        for bad in [0.0_f32, -0.1, 1.5, f32::INFINITY] {
+            let flags = RunFlags {
+                top_p: Some(bad),
+                ..RunFlags::default()
+            };
+            let err = sampling_params_from_flags(&flags).unwrap_err();
+            assert!(matches!(err, CliError::BadCommand(_)), "expected reject for top_p = {bad}");
+        }
+    }
+
+    #[test]
+    fn sampling_params_reject_min_p_out_of_range() {
+        for bad in [-0.1_f32, 1.0, 1.5, f32::INFINITY] {
+            let flags = RunFlags {
+                min_p: Some(bad),
+                ..RunFlags::default()
+            };
+            let err = sampling_params_from_flags(&flags).unwrap_err();
+            assert!(matches!(err, CliError::BadCommand(_)), "expected reject for min_p = {bad}");
+        }
+    }
+
+    #[test]
+    fn sampling_params_accept_zero_temperature_for_greedy() {
+        let flags = RunFlags {
+            temperature: Some(0.0),
+            ..RunFlags::default()
+        };
+        let p = sampling_params_from_flags(&flags).unwrap();
+        assert_eq!(p.temperature, 0.0);
+    }
+
+    #[test]
+    fn sampling_params_accept_min_p_zero() {
+        // 0.0 is the boundary that effectively disables the filter
+        // but is still in range; must not be rejected.
+        let flags = RunFlags {
+            min_p: Some(0.0),
+            ..RunFlags::default()
+        };
+        let p = sampling_params_from_flags(&flags).unwrap();
+        assert_eq!(p.min_p, Some(0.0));
     }
 
     #[test]

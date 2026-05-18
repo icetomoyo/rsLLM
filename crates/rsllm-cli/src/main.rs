@@ -163,11 +163,16 @@ fn run_repl(run: RunFlags) -> Result<(), CliError> {
         None => None,
     };
 
+    // Validate `--temperature / --top-k / --top-p / --min-p` once,
+    // up-front. The validated value is reused for the initial
+    // session and any `/ctx N` rebuild later in the loop.
+    let params = sampling_params(&run)?;
+
     let gguf = GgufFile::open(model_path)?;
     let cli_engine = CliEngine::load(&gguf)?;
     let mut session = cli_engine
         .engine
-        .start_session(state.ctx_size, sampling_params(&run))
+        .start_session(state.ctx_size, params)
         .map_err(|e| CliError::BadCommand(format!("start_session: {e}")))?;
     println!("ready. type /help for command list, /quit to exit.");
 
@@ -214,7 +219,7 @@ fn run_repl(run: RunFlags) -> Result<(), CliError> {
                     SessionAction::Rebuild => {
                         session = cli_engine
                             .engine
-                            .start_session(state.ctx_size, sampling_params(&run))
+                            .start_session(state.ctx_size, params)
                             .map_err(|e| {
                                 CliError::BadCommand(format!("start_session: {e}"))
                             })?;
@@ -251,7 +256,7 @@ fn run_repl(run: RunFlags) -> Result<(), CliError> {
     Ok(())
 }
 
-fn sampling_params(run: &RunFlags) -> SamplingParams {
+fn sampling_params(run: &RunFlags) -> Result<SamplingParams, CliError> {
     rsllm_cli::engine::sampling_params_from_flags(run)
 }
 

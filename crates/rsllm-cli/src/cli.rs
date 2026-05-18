@@ -133,6 +133,30 @@ pub struct RunFlags {
     /// sampler uses its built-in fallback seed.
     #[arg(long = "seed")]
     pub seed: Option<u64>,
+
+    /// Softmax temperature. `0.0` selects greedy / argmax decoding
+    /// (no draw). When omitted, falls back to `SamplingParams::default()`
+    /// (the v0.1.0 default = 0.7).
+    #[arg(long = "temperature")]
+    pub temperature: Option<f32>,
+
+    /// Keep only the top-K logits before normalizing. Disabled when
+    /// omitted (the default). Must be ≥ 1 when set.
+    #[arg(long = "top-k")]
+    pub top_k: Option<usize>,
+
+    /// Nucleus (cumulative-probability) filter. Keep the smallest
+    /// prefix of the sorted distribution whose cumulative mass ≥
+    /// `top_p`. Must lie in `(0.0, 1.0]`. When omitted, falls back
+    /// to `SamplingParams::default()` (= 1.0, i.e. effectively off).
+    #[arg(long = "top-p")]
+    pub top_p: Option<f32>,
+
+    /// Relative-probability cutoff — drop tokens whose probability
+    /// is below `min_p × max_prob`. Must lie in `[0.0, 1.0)`. When
+    /// omitted, falls back to `SamplingParams::default()` (= 0.05).
+    #[arg(long = "min-p")]
+    pub min_p: Option<f32>,
 }
 
 /// `inspect` arguments. Matches ds4 `model_summary()`.
