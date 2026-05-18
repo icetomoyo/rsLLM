@@ -155,6 +155,9 @@ pub struct RunFlags {
     /// Relative-probability cutoff — drop tokens whose probability
     /// is below `min_p × max_prob`. Must lie in `[0.0, 1.0)`. When
     /// omitted, falls back to `SamplingParams::default()` (= 0.05).
+    /// Pass `--min-p 0.0` to disable the filter while keeping every
+    /// other default in place — the sampler short-circuits when
+    /// `min_p == 0.0`.
     #[arg(long = "min-p")]
     pub min_p: Option<f32>,
 }

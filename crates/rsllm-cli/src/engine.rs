@@ -86,6 +86,19 @@ pub fn sampling_params_from_flags(flags: &RunFlags) -> Result<SamplingParams, Cl
         }
         params.min_p = Some(p);
     }
+    // Debuggability note: when seed is unset but the sampler is
+    // stochastic (T > 0), the sampler still uses a *fixed* fallback
+    // seed (see SamplingParams docs). All runs of the same prompt
+    // are therefore reproducible. Logged at DEBUG so operators
+    // diagnosing "why do I get the same output every time" can find
+    // it; INFO would be too noisy on every load.
+    if params.seed.is_none() && params.temperature > 0.0 {
+        tracing::debug!(
+            target: "rsllm_cli::engine",
+            temperature = params.temperature,
+            "no --seed set + temperature > 0: runs are deterministic via the sampler's fixed fallback seed",
+        );
+    }
     Ok(params)
 }
 
@@ -569,6 +582,25 @@ mod tests {
         };
         let p = sampling_params_from_flags(&flags).unwrap();
         assert_eq!(p.min_p, Some(0.0));
+    }
+
+    #[test]
+    fn sampling_params_partial_override_preserves_defaults() {
+        // Set ONLY temperature — assert the other three fields keep
+        // their SamplingParams::default() values. This catches a
+        // future refactor that replaces the `..default()` spread
+        // with field-by-field copies and accidentally drops one.
+        let flags = RunFlags {
+            temperature: Some(0.5),
+            ..RunFlags::default()
+        };
+        let p = sampling_params_from_flags(&flags).unwrap();
+        let baseline = SamplingParams::default();
+        assert!((p.temperature - 0.5).abs() < 1e-6);
+        assert_eq!(p.top_k, baseline.top_k);
+        assert_eq!(p.top_p, baseline.top_p);
+        assert_eq!(p.min_p, baseline.min_p);
+        assert_eq!(p.seed, baseline.seed);
     }
 
     #[test]
