@@ -17,7 +17,7 @@ use rustyline::error::ReadlineError;
 use rsllm_cli::cli::{Cli, Command, RunFlags};
 use rsllm_cli::engine::CliEngine;
 use rsllm_cli::repl::{ReplState, SlashCommand, parse_command};
-use rsllm_cli::{CliError, dump, engine as eng, info, inspect};
+use rsllm_cli::{CliError, engine as eng, info, inspect};
 use rsllm_core::{Engine, SamplingParams};
 use rsllm_gguf::GgufFile;
 
@@ -88,11 +88,9 @@ fn one_shot(run: &RunFlags, prompt: String) -> Result<(), CliError> {
         .as_deref()
         .ok_or_else(|| CliError::ModelRequired("one-shot mode (`-p`) needs `-m PATH`".into()))?;
 
-    // Validate `--dump-logprobs` early — opening the file now means
-    // a permission error fires before we burn time loading the model.
-    if let Some(path) = &run.dump_logprobs {
-        let _ = dump::LogprobDumper::create(path, run.logprobs_top_k.max(1))?;
-    }
+    // Dumper validation now happens inside `eng::run_one_shot` *before*
+    // the model load — kept in one place so we don't open + truncate
+    // the file twice.
 
     eprintln!(
         "rsllm one-shot (prompt={} chars, think={}, ctx={}, dump_tokens={}, seed={:?})",
@@ -127,6 +125,19 @@ fn run_repl(run: RunFlags) -> Result<(), CliError> {
     }
 
     println!("rsLLM v{} — loading {} ...", rsllm_core::version(), model_path.display());
+
+    // Open the dumper FIRST so a bad --dump-logprobs path errors
+    // before the multi-minute GGUF mmap. The dumper outlives every
+    // turn so multi-turn REPL output appends rather than truncating
+    // per turn.
+    let mut dumper = match &run.dump_logprobs {
+        Some(p) => Some(rsllm_cli::dump::LogprobDumper::create(
+            p,
+            run.logprobs_top_k.max(1),
+        )?),
+        None => None,
+    };
+
     let gguf = GgufFile::open(model_path)?;
     let cli_engine = CliEngine::load(&gguf)?;
     let mut session = cli_engine
@@ -162,13 +173,11 @@ fn run_repl(run: RunFlags) -> Result<(), CliError> {
 
         match parse_command(trimmed)? {
             Some(cmd) => {
-                // `/ctx N` and `/clear` need to rebuild the session
-                // *after* state mutation, so capture the variant
-                // before delegating to `state.apply`.
-                let needs_new_session = matches!(
-                    cmd,
-                    SlashCommand::SetCtx(_) | SlashCommand::Clear
-                );
+                // `/ctx N`, `/clear`, and `/system` all change a
+                // condition the KV cache depends on (cache shape or
+                // the leading system-prompt prefix). Capture *which*
+                // variant before `state.apply` consumes the command.
+                let action = decide_session_action(&cmd);
                 let outcome = state.apply(cmd);
                 if !outcome.message.is_empty() {
                     println!("{}", outcome.message);
@@ -176,19 +185,27 @@ fn run_repl(run: RunFlags) -> Result<(), CliError> {
                 if outcome.exit {
                     break;
                 }
-                if needs_new_session {
-                    session = cli_engine
-                        .engine
-                        .start_session(state.ctx_size, sampling_params(&run))
-                        .map_err(|e| {
-                            CliError::BadCommand(format!("start_session: {e}"))
-                        })?;
+                match action {
+                    SessionAction::Rebuild => {
+                        session = cli_engine
+                            .engine
+                            .start_session(state.ctx_size, sampling_params(&run))
+                            .map_err(|e| {
+                                CliError::BadCommand(format!("start_session: {e}"))
+                            })?;
+                    }
+                    SessionAction::Reset => {
+                        use rsllm_core::Session as _;
+                        session.reset();
+                    }
+                    SessionAction::None => {}
                 }
             }
             None => {
                 // Regular user message — run a decode turn.
                 if let Err(e) = cli_engine.run_turn(
                     &mut session,
+                    dumper.as_mut(),
                     trimmed,
                     state.system_prompt.as_deref(),
                     state.think_mode,
@@ -211,6 +228,33 @@ fn run_repl(run: RunFlags) -> Result<(), CliError> {
 
 fn sampling_params(run: &RunFlags) -> SamplingParams {
     rsllm_cli::engine::sampling_params_from_flags(run)
+}
+
+/// What the REPL should do with the active session after a slash
+/// command. `Rebuild` allocates fresh KV storage (used for
+/// `/ctx N` where the cache shape changes). `Reset` keeps the
+/// allocation but wipes state (used for `/clear` and `/system`,
+/// which both invalidate the cached prefix without changing its
+/// size). `None` leaves the session untouched.
+enum SessionAction {
+    Rebuild,
+    Reset,
+    None,
+}
+
+fn decide_session_action(cmd: &SlashCommand) -> SessionAction {
+    match cmd {
+        // ctx_size change requires a new KV cache; old allocation is
+        // released so the new size can be honored.
+        SlashCommand::SetCtx(_) => SessionAction::Rebuild,
+        // Clear AND SetSystem both invalidate the cached prefix.
+        // Without a reset, encode_prompt for the next turn would
+        // glue new tokens onto stale KV state and produce silently
+        // wrong output. Use Session::reset() to preserve the
+        // pre-allocated KV buffer and the sampler RNG continuity.
+        SlashCommand::Clear | SlashCommand::SetSystem(_) => SessionAction::Reset,
+        _ => SessionAction::None,
+    }
 }
 
 #[cfg(unix)]

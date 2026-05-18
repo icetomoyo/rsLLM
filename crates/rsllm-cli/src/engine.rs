@@ -61,6 +61,13 @@ pub fn run_one_shot(
     system: Option<&str>,
     flags: &RunFlags,
 ) -> Result<(), CliError> {
+    // Open the dumper BEFORE the model load so a bad --dump-logprobs
+    // path errors immediately instead of after a multi-minute mmap.
+    let mut dumper = match &flags.dump_logprobs {
+        Some(p) => Some(LogprobDumper::create(p, flags.logprobs_top_k.max(1))?),
+        None => None,
+    };
+
     let gguf = GgufFile::open(model_path)?;
     let tokenizer = Tokenizer::from_gguf(&gguf).map_err(map_tokenizer_err)?;
     let model = load_dsv4_flash(&gguf).map_err(map_model_err)?;
@@ -86,11 +93,6 @@ pub fn run_one_shot(
         )));
     }
 
-    let mut dumper = match &flags.dump_logprobs {
-        Some(p) => Some(LogprobDumper::create(p, flags.logprobs_top_k.max(1))?),
-        None => None,
-    };
-
     // Prefill the prompt. The returned logits are discarded — the
     // first decode step is driven by `decode_one` seeded with the
     // last prompt token.
@@ -98,6 +100,7 @@ pub fn run_one_shot(
 
     let mut last_token = *tokens.last().expect("non-empty after empty check");
     let mut emitted_buf: Vec<u8> = Vec::with_capacity(64);
+    let mut utf8_carry: Vec<u8> = Vec::with_capacity(4);
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 
@@ -114,8 +117,16 @@ pub fn run_one_shot(
             flags,
             dumper.as_mut(),
             &mut emitted_buf,
+            &mut utf8_carry,
         )?;
         last_token = step.token_id;
+    }
+    // Drop any trailing partial-UTF-8 carry (the model emitted EOS or
+    // hit the cap mid-codepoint). Emit as lossy bytes so the user
+    // sees what came through, rather than silently swallowing it.
+    if !utf8_carry.is_empty() {
+        out.write_all(String::from_utf8_lossy(&utf8_carry).as_bytes())
+            .map_err(CliError::Io)?;
     }
     out.write_all(b"\n").map_err(CliError::Io)?;
     out.flush().map_err(CliError::Io)?;
@@ -147,10 +158,14 @@ impl<'gguf> CliEngine<'gguf> {
     /// Drive one REPL turn: tokenize `user_msg` under `system` +
     /// `think`, prefill, then decode-stream to stdout until EOS or
     /// [`DEFAULT_MAX_DECODE_TOKENS`]. The session is constructed by
-    /// the caller (so `/ctx N` and `/clear` can recreate it).
+    /// the caller (so `/ctx N` and `/clear` can recreate it). The
+    /// `dumper` is also caller-owned so a multi-turn REPL appends
+    /// one JSONL stream rather than truncating the file each turn.
+    #[allow(clippy::too_many_arguments)]
     pub fn run_turn(
         &self,
         session: &mut <DsV4FlashEngine<'gguf> as Engine>::Session<'_>,
+        dumper: Option<&mut LogprobDumper>,
         user_msg: &str,
         system: Option<&str>,
         think: ThinkMode,
@@ -174,16 +189,16 @@ impl<'gguf> CliEngine<'gguf> {
             )));
         }
 
-        let mut dumper = match &flags.dump_logprobs {
-            Some(p) => Some(LogprobDumper::create(p, flags.logprobs_top_k.max(1))?),
-            None => None,
-        };
-
         let _ = session.prefill(&tokens).map_err(map_engine_err)?;
         let mut last_token = *tokens.last().expect("non-empty after empty check");
         let mut emitted_buf: Vec<u8> = Vec::with_capacity(64);
+        let mut utf8_carry: Vec<u8> = Vec::with_capacity(4);
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
+        // Re-borrow `dumper` as Option<&mut> per step rather than
+        // moving it — we want the same handle alive across steps and
+        // returned implicitly to the caller via the borrow ending.
+        let mut dumper_opt = dumper;
         for step_idx in 0..(DEFAULT_MAX_DECODE_TOKENS as u32) {
             let step = session.decode_one(last_token).map_err(map_engine_err)?;
             if step.token_id == self.tokenizer.eos_id() {
@@ -195,10 +210,15 @@ impl<'gguf> CliEngine<'gguf> {
                 step_idx,
                 &step,
                 flags,
-                dumper.as_mut(),
+                dumper_opt.as_deref_mut(),
                 &mut emitted_buf,
+                &mut utf8_carry,
             )?;
             last_token = step.token_id;
+        }
+        if !utf8_carry.is_empty() {
+            out.write_all(String::from_utf8_lossy(&utf8_carry).as_bytes())
+                .map_err(CliError::Io)?;
         }
         out.write_all(b"\n").map_err(CliError::Io)?;
         out.flush().map_err(CliError::Io)?;
@@ -209,6 +229,13 @@ impl<'gguf> CliEngine<'gguf> {
 /// Common per-step writer used by both one-shot and REPL paths.
 /// Decodes the token to text, streams it to stdout, and feeds the
 /// optional `--dump-tokens` / `--dump-logprobs` taps.
+///
+/// `utf8_carry` is a per-call carry buffer that preserves any
+/// trailing partial UTF-8 bytes across decode steps. Byte-level BPE
+/// can split a multibyte codepoint across two adjacent tokens; we
+/// flush the longest valid UTF-8 prefix and stash the rest for the
+/// next call. The Tokenizer crate's own docstring recommends this
+/// pattern.
 #[allow(clippy::too_many_arguments)]
 fn write_step_outputs(
     tokenizer: &Tokenizer,
@@ -218,26 +245,48 @@ fn write_step_outputs(
     flags: &RunFlags,
     dumper: Option<&mut LogprobDumper>,
     emitted_buf: &mut Vec<u8>,
+    utf8_carry: &mut Vec<u8>,
 ) -> Result<(), CliError> {
     emitted_buf.clear();
     tokenizer.decode_into(step.token_id, emitted_buf);
-    // Decoded bytes can be partial UTF-8 (byte-level BPE). Use
-    // from_utf8_lossy so a half-multibyte chunk emits the replacement
-    // char rather than panicking — the next decode call usually
-    // completes the codepoint.
-    let text = String::from_utf8_lossy(emitted_buf);
 
+    // Combine carry + this step's bytes, then emit only the longest
+    // valid UTF-8 prefix. Anything left over is partial and carried
+    // forward for the next call.
+    utf8_carry.extend_from_slice(emitted_buf);
+    let valid_end = longest_valid_utf8_prefix(utf8_carry);
+    // Safe: `valid_end` is the byte length of a known-valid UTF-8 prefix.
+    let text =
+        std::str::from_utf8(&utf8_carry[..valid_end]).expect("valid prefix");
     out.write_all(text.as_bytes()).map_err(CliError::Io)?;
     out.flush().map_err(CliError::Io)?;
 
     if flags.dump_tokens {
-        emit_token_line(step_idx, step.token_id, &text);
+        // For `--dump-tokens` we report the per-token raw bytes
+        // (lossy-decoded) regardless of the carry state — so the
+        // operator sees one line per *model token*, not per codepoint.
+        let token_text = String::from_utf8_lossy(emitted_buf);
+        emit_token_line(step_idx, step.token_id, &token_text);
     }
     if let Some(d) = dumper {
         let top = top_k_entries(&step.probs, flags.logprobs_top_k.max(1));
         d.write_step(step.token_id, &top)?;
     }
+
+    // Drop the emitted prefix from the carry; keep the trailing
+    // partial bytes for the next call.
+    utf8_carry.drain(..valid_end);
     Ok(())
+}
+
+/// Byte length of the longest UTF-8 prefix of `buf` that decodes
+/// cleanly. `std::str::from_utf8` reports either Ok (the whole buf
+/// is valid) or Err with `valid_up_to()` giving the cut point.
+fn longest_valid_utf8_prefix(buf: &[u8]) -> usize {
+    match std::str::from_utf8(buf) {
+        Ok(_) => buf.len(),
+        Err(e) => e.valid_up_to(),
+    }
 }
 
 /// Pick the top-K (token_id, prob) entries from `probs`, sorted by
@@ -330,5 +379,27 @@ mod tests {
         let probs = vec![0.5_f32];
         let top = top_k_entries(&probs, 1);
         assert!((top[0].logit - 0.5_f32.ln()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn longest_valid_utf8_prefix_handles_full_and_partial() {
+        // Fully valid → whole length.
+        assert_eq!(longest_valid_utf8_prefix(b"hello"), 5);
+        // Empty → 0.
+        assert_eq!(longest_valid_utf8_prefix(b""), 0);
+        // Half of a 2-byte sequence (`é` = 0xC3 0xA9) at the end:
+        // "abc" + 0xC3 → cut at 3.
+        let mut buf = b"abc".to_vec();
+        buf.push(0xC3);
+        assert_eq!(longest_valid_utf8_prefix(&buf), 3);
+        // Two-thirds of a 3-byte sequence at the end ("ab" + 0xE3 + 0x81):
+        // cut at 2.
+        let mut buf = b"ab".to_vec();
+        buf.extend_from_slice(&[0xE3, 0x81]);
+        assert_eq!(longest_valid_utf8_prefix(&buf), 2);
+        // Full 3-byte CJK codepoint following ASCII: whole length.
+        let mut buf = b"ab".to_vec();
+        buf.extend_from_slice("中".as_bytes());
+        assert_eq!(longest_valid_utf8_prefix(&buf), buf.len());
     }
 }

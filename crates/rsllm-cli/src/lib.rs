@@ -30,6 +30,12 @@ pub enum CliError {
     ModelRequired(String),
     /// Sub-feature is parked behind a future commit. Owns its message
     /// so call sites can embed paths / token counts / config snippets.
+    ///
+    /// Currently unused after F008.C.3.f wired the engine — kept so
+    /// in-progress features (e.g. `--temperature` / `--top-k` flags
+    /// that will land between v0.1.0 and v0.2.0) can resurface it
+    /// without a CliError breaking change.
+    #[allow(dead_code)]
     #[error("not yet implemented: {0}")]
     NotImplemented(String),
 }
