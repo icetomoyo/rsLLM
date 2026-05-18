@@ -772,23 +772,25 @@ pub fn architecture_name(meta: &Metadata) -> Option<&str> {
 ///   MLA: q_a, q_a_norm, q_b, kv_a, kv_a_norm   5
 ///   attn_sinks                        1
 ///   attn_output_a, attn_output_b      2
-///   HC: 4 ops × 2 tensors each (.weight + .base)   8
+///   HC: 2 sublayers × 3 tensors each (fn + scale + base)   6
 ///   ffn_norm                          1
 ///   MoE routed: gate_exps, up_exps, down_exps      3
 ///   shared expert: gate, up, down     3
 ///   router: gate_inp                  1
 ///                                    --
-///                                    25
+///                                    23
 ///
 /// Plus per-regime additions:
-///   compressed (ratio > 0): +1 (attn_compressor)
+///   compressed (ratio > 0): +1 (attn_compressor) — F010.B will
+///                               raise this to +4 (ape/kv/gate/norm)
 ///   ratio-4 only:           +4 (attn_indexer_{kv, kv_score, q, head_weight})
+///                              — F010.C will adjust this set
 ///   hash-routed (il<3):     +1 (tid2eid)
 ///   gate_bias (when shipped): +1 (optional, not counted here)
 #[must_use]
 pub fn expected_layer_tensor_count(il: usize) -> usize {
-    // Baseline = 1+5+1+2+8+1+3+3+1 = 25.
-    let mut count = 25;
+    // Baseline = 1+5+1+2+6+1+3+3+1 = 23.
+    let mut count = 23;
     if layer_compress_ratio(il) > 0 {
         count += 1; // compressor
     }
@@ -1171,14 +1173,15 @@ mod tests {
 
     #[test]
     fn expected_layer_tensor_count_grows_with_regime() {
-        // Reference table: baseline = 25 per the function's doc.
-        //   il=0: dense + hash router      → 25 +  0 + 1 = 26
-        //   il=2: ratio-4 + hash router    → 25 +  5 + 1 = 31
-        //   il=3: ratio-128 + topk router  → 25 +  1 + 0 = 26
-        //   il=4: ratio-4 + topk router    → 25 +  5 + 0 = 30
-        assert_eq!(expected_layer_tensor_count(0), 26);
-        assert_eq!(expected_layer_tensor_count(2), 31);
-        assert_eq!(expected_layer_tensor_count(3), 26);
-        assert_eq!(expected_layer_tensor_count(4), 30);
+        // Reference table: baseline = 23 per the function's doc
+        // (post-F010.A: HC carries 6 tensors per layer, not 8).
+        //   il=0: dense + hash router      → 23 +  0 + 1 = 24
+        //   il=2: ratio-4 + hash router    → 23 +  5 + 1 = 29
+        //   il=3: ratio-128 + topk router  → 23 +  1 + 0 = 24
+        //   il=4: ratio-4 + topk router    → 23 +  5 + 0 = 28
+        assert_eq!(expected_layer_tensor_count(0), 24);
+        assert_eq!(expected_layer_tensor_count(2), 29);
+        assert_eq!(expected_layer_tensor_count(3), 24);
+        assert_eq!(expected_layer_tensor_count(4), 28);
     }
 }

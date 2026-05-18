@@ -324,8 +324,19 @@ pub fn hc_post(
 ///
 /// Sum-of-squares accumulates in f64 to match ds4's `double ss`
 /// precision pattern (`ds4.c:rmsnorm_kernel`).
+///
+/// Uses `assert_eq!` (not `debug_assert_eq!`) so a mismatched
+/// `src`/`dst` length is loud in release builds too — a silent
+/// `zip().take(min)` would produce wrong-but-non-panicking output
+/// for any future caller that wires up the wrong scratch buffer.
 fn rms_norm_no_weight_into(src: &[f32], dst: &mut [f32], eps: f32) {
-    debug_assert_eq!(src.len(), dst.len());
+    assert_eq!(
+        src.len(),
+        dst.len(),
+        "rms_norm_no_weight_into: src.len ({}) != dst.len ({})",
+        src.len(),
+        dst.len()
+    );
     let n = src.len() as f64;
     let mut sumsq = 0.0_f64;
     for &v in src {
@@ -485,6 +496,87 @@ mod tests {
             assert!(
                 (v - 5.0).abs() < 0.01,
                 "expected merged ≈ 5.0, got {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn hc_pre_post_multi_token_offsets_are_independent() {
+        // Multi-token regression: confirm that `t * HC_DIM` offset
+        // arithmetic in hc_pre / hc_post stays consistent across the
+        // batch. Different tokens get different stream values, so any
+        // off-by-one in the per-token indexing would surface as one
+        // token contaminating another's state.
+        let n_tok = 4;
+        let mix_storage = zero_mix_fn_storage();
+        let base = vec![0.0_f32; HC_MIX_DIM];
+        let scale = [1.0_f32, 1.0, 1.0];
+
+        // Per-token sentinel: token t's streams hold (t+1)*10, so
+        // expected merged ≈ 0.5 * 4 * (t+1)*10 = 20*(t+1).
+        let mut streams = vec![0.0_f32; n_tok * HC_DIM];
+        for t in 0..n_tok {
+            let v = (t + 1) as f32 * 10.0;
+            for h in 0..N_HC {
+                let off = (t * N_HC + h) * DSV4_N_EMBD;
+                for d in 0..DSV4_N_EMBD {
+                    streams[off + d] = v;
+                }
+            }
+        }
+        let mut merged = vec![0.0_f32; n_tok * DSV4_N_EMBD];
+        let mut scratch = HcScratch::new(n_tok);
+        let w = zero_op_weights(WeightBlob::F32(&mix_storage), &base, &scale);
+        hc_pre(
+            &streams,
+            &mut merged,
+            &w,
+            &mut scratch,
+            n_tok,
+            SimdTier::Scalar,
+        )
+        .unwrap();
+        // Each token's merged value should reflect ONLY that token's
+        // streams. With sigmoid(0)+eps ≈ 0.5, pre weights sum to ≈ 2,
+        // and a uniform stream of v gives merged ≈ 2v.
+        for t in 0..n_tok {
+            let expected = 2.0 * (t + 1) as f32 * 10.0;
+            let actual = merged[t * DSV4_N_EMBD];
+            assert!(
+                (actual - expected).abs() < 0.5,
+                "token {t}: expected merged ≈ {expected}, got {actual}"
+            );
+            // Spot-check end of row too — catches stride errors where
+            // only the first few elements of each token are correct.
+            let actual_end = merged[(t + 1) * DSV4_N_EMBD - 1];
+            assert!(
+                (actual_end - expected).abs() < 0.5,
+                "token {t} end: expected merged ≈ {expected}, got {actual_end}"
+            );
+        }
+
+        // hc_post then writes new streams. With a uniform sublayer_out,
+        // each token's new state should depend ONLY on that token's
+        // previous state.
+        let mut sublayer_out = vec![0.0_f32; n_tok * DSV4_N_EMBD];
+        for t in 0..n_tok {
+            let v = (t + 1) as f32;
+            for d in 0..DSV4_N_EMBD {
+                sublayer_out[t * DSV4_N_EMBD + d] = v;
+            }
+        }
+        hc_post(&mut streams, &sublayer_out, &mut scratch, n_tok).unwrap();
+        // Per token t: new_stream ≈ sublayer_out (= t+1) * post (≈ 1.0)
+        // + sum_over_src comb[*, src] * old_streams (≈ (t+1)*10).
+        // Since comb is doubly stochastic, row-sum ≈ 1, so new ≈
+        // (t+1) + (t+1)*10 = (t+1)*11. Spot-check first + last of
+        // first stream of each token.
+        for t in 0..n_tok {
+            let expected = (t + 1) as f32 * 11.0;
+            let actual = streams[t * HC_DIM];
+            assert!(
+                (actual - expected).abs() < 1.0,
+                "post token {t}: expected ≈ {expected}, got {actual}"
             );
         }
     }
