@@ -97,4 +97,11 @@ pub enum Error {
     /// inputs that would otherwise overflow `align_up`.
     #[error("invalid tensor data alignment {0} (must be 1..=65536, power of two recommended)")]
     InvalidAlignment(u64),
+
+    /// A GGUF `Bool` value was encoded with a byte other than `0` or `1`.
+    /// The GGUF spec defines bool as exactly those two values; accepting any
+    /// non-zero byte as `true` would let a crafted file smuggle out-of-band
+    /// data through what looks like a normal bool field.
+    #[error("invalid GGUF bool byte {0} (must be 0 or 1)")]
+    InvalidBool(u8),
 }

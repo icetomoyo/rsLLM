@@ -129,9 +129,16 @@ impl<'a> Reader<'a> {
         Ok(f64::from_bits(self.read_u64_le()?))
     }
 
-    /// Read a GGUF-style bool: a single byte, zero or non-zero.
+    /// Read a GGUF-style bool: a single byte. The GGUF spec encodes a bool
+    /// as exactly `0` (false) or `1` (true); any other byte is rejected with
+    /// [`Error::InvalidBool`] so a crafted file can't smuggle out-of-band
+    /// data through a field that downstream code treats as a normal bool.
     pub fn read_bool(&mut self) -> Result<bool, Error> {
-        Ok(self.read_u8()? != 0)
+        match self.read_u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            raw => Err(Error::InvalidBool(raw)),
+        }
     }
 
     /// Read a GGUF length-prefixed string: `u64 length` followed by `length`
@@ -200,10 +207,18 @@ mod tests {
 
     #[test]
     fn read_bool_basic() {
-        let mut r = Reader::new(&[0, 1, 2]);
+        let mut r = Reader::new(&[0, 1]);
         assert!(!r.read_bool().unwrap());
         assert!(r.read_bool().unwrap());
-        assert!(r.read_bool().unwrap()); // any non-zero is true
+    }
+
+    #[test]
+    fn read_bool_rejects_non_canonical_byte() {
+        let mut r = Reader::new(&[2]);
+        match r.read_bool() {
+            Err(Error::InvalidBool(2)) => {}
+            other => panic!("expected InvalidBool(2), got {other:?}"),
+        }
     }
 
     #[test]

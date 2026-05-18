@@ -14,7 +14,7 @@
 //! §"ds4.c 行号引用基线" for the mapping table; re-audit on upstream
 //! bumps via `git -C path/to/ds4 grep -n <anchor>`.
 
-use rsllm_gguf::Metadata;
+use rsllm_gguf::{Array, Metadata, Value};
 
 use crate::Error;
 
@@ -131,6 +131,11 @@ pub const DSV4_RMS_EPS: f32 = 1e-6;
 /// present but exposed as a separate metadata key by upstream so we
 /// validate it independently. Ref: `ds4.c:53`.
 pub const DSV4_HC_EPS: f32 = 1e-6;
+
+/// SwiGLU clamp exponent. Bounds the FFN activation magnitude before the
+/// SiLU gate, preventing numerical blow-up for outlier activations. Same
+/// value at every layer. Ref: `ds4.c:55`.
+pub const DSV4_SWIGLU_CLAMP_EXP: f32 = 10.0;
 
 /// Number of leading layers that use **hash routing** for MoE instead
 /// of top-k softmax routing (`ds4.c:5002-5050`). Layers `[0, 3)` use
@@ -322,6 +327,25 @@ pub fn validate_metadata(meta: &Metadata) -> Result<(), Error> {
     )?;
     expect_f32_close(meta, "deepseek4.hyper_connection.epsilon", DSV4_HC_EPS)?;
 
+    // 15. Per-layer compress ratios. Upstream `validate_compress_ratio_metadata`
+    // (`ds4.c:2401-2434`) requires a u32/i32 array of length >= N_LAYER whose
+    // values match `layer_compress_ratio(il)` for every layer. A mismatch would
+    // silently route the wrong layers through the indexer / ratio-128 paths.
+    expect_compress_ratios(meta)?;
+
+    // 16. Per-layer SwiGLU clamp exponents (`ds4.c:2436-2462`). Same shape
+    // requirement; every layer must use `DSV4_SWIGLU_CLAMP_EXP`. A drifted
+    // value would change the FFN activation bound without warning.
+    expect_swiglu_clamp(meta)?;
+
+    // 17. Optional expert-group keys (`ds4.c:2511-2529`). DS V4 Flash never
+    // uses expert groups: both `expert_group_count` and
+    // `expert_group_used_count` must be 0 if present. Missing keys are OK
+    // (upstream `model_get_u32` leaves the value at its 0 init), so absence
+    // is treated as 0.
+    expect_optional_u32_zero(meta, "deepseek4.expert_group_count")?;
+    expect_optional_u32_zero(meta, "deepseek4.expert_group_used_count")?;
+
     Ok(())
 }
 
@@ -362,6 +386,133 @@ fn expect_bool(meta: &Metadata, key: &'static str, want: bool) -> Result<(), Err
             actual: got.to_string(),
         })
     }
+}
+
+fn expect_optional_u32_zero(meta: &Metadata, key: &'static str) -> Result<(), Error> {
+    match meta.get(key) {
+        None => Ok(()),
+        Some(v) => match v.as_u32() {
+            Some(0) => Ok(()),
+            Some(got) => Err(Error::ShapeMismatch {
+                key,
+                expected: "0 (or absent)".to_string(),
+                actual: got.to_string(),
+            }),
+            None => Err(Error::ShapeMismatch {
+                key,
+                expected: "u32 or absent".to_string(),
+                actual: format!("{:?}", v.ty()),
+            }),
+        },
+    }
+}
+
+/// Validate `deepseek4.attention.compress_ratios` matches the per-layer
+/// fixed schedule (`ds4.c:411-416`). Accepts both U32 and I32 element
+/// arrays for parity with upstream. Length must be at least N_LAYER;
+/// surplus tail entries are ignored exactly as upstream does.
+fn expect_compress_ratios(meta: &Metadata) -> Result<(), Error> {
+    const KEY: &str = "deepseek4.attention.compress_ratios";
+    let value = meta.get(KEY).ok_or(Error::MissingMetadata(KEY))?;
+    let arr = match value {
+        Value::Array(a) => a,
+        other => {
+            return Err(Error::ShapeMismatch {
+                key: KEY,
+                expected: "Array(U32|I32)".to_string(),
+                actual: format!("{:?}", other.ty()),
+            });
+        }
+    };
+    let len = arr.len();
+    if len < DSV4_N_LAYER {
+        return Err(Error::ShapeMismatch {
+            key: KEY,
+            expected: format!(">= {DSV4_N_LAYER}"),
+            actual: len.to_string(),
+        });
+    }
+    for il in 0..DSV4_N_LAYER {
+        let got = match arr {
+            Array::U32(v) => v[il],
+            Array::I32(v) => {
+                let raw = v[il];
+                if raw < 0 {
+                    return Err(Error::ShapeMismatch {
+                        key: KEY,
+                        expected: format!("non-negative @ layer {il}"),
+                        actual: raw.to_string(),
+                    });
+                }
+                raw as u32
+            }
+            _ => {
+                return Err(Error::ShapeMismatch {
+                    key: KEY,
+                    expected: "Array(U32|I32)".to_string(),
+                    actual: format!("Array({:?})", arr.item_type()),
+                });
+            }
+        };
+        let want = rsllm_kvcache::dsv4::shape::layer_compress_ratio(il);
+        if got != want {
+            return Err(Error::ShapeMismatch {
+                key: KEY,
+                expected: format!("{want} @ layer {il}"),
+                actual: got.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validate `deepseek4.swiglu_clamp_exp` is an F32 (or F64) array of
+/// length >= N_LAYER, with every entry close to [`DSV4_SWIGLU_CLAMP_EXP`].
+/// Ref: `ds4.c:2436-2462`.
+fn expect_swiglu_clamp(meta: &Metadata) -> Result<(), Error> {
+    const KEY: &str = "deepseek4.swiglu_clamp_exp";
+    let value = meta.get(KEY).ok_or(Error::MissingMetadata(KEY))?;
+    let arr = match value {
+        Value::Array(a) => a,
+        other => {
+            return Err(Error::ShapeMismatch {
+                key: KEY,
+                expected: "Array(F32|F64)".to_string(),
+                actual: format!("{:?}", other.ty()),
+            });
+        }
+    };
+    let len = arr.len();
+    if len < DSV4_N_LAYER {
+        return Err(Error::ShapeMismatch {
+            key: KEY,
+            expected: format!(">= {DSV4_N_LAYER}"),
+            actual: len.to_string(),
+        });
+    }
+    for il in 0..DSV4_N_LAYER {
+        let got: f32 = match arr {
+            Array::F32(v) => v[il],
+            Array::F64(v) => v[il] as f32,
+            _ => {
+                return Err(Error::ShapeMismatch {
+                    key: KEY,
+                    expected: "Array(F32|F64)".to_string(),
+                    actual: format!("Array({:?})", arr.item_type()),
+                });
+            }
+        };
+        let want = DSV4_SWIGLU_CLAMP_EXP;
+        let denom = want.abs().max(1.0);
+        if (got - want).abs() / denom >= 1e-3 {
+            return Err(Error::ShapeMismatch {
+                key: KEY,
+                expected: format!("{want} @ layer {il}"),
+                actual: format!("{got}"),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn expect_f32_close(meta: &Metadata, key: &'static str, want: f32) -> Result<(), Error> {
@@ -502,6 +653,19 @@ mod tests {
             "deepseek4.hyper_connection.epsilon",
             Value::F32(DSV4_HC_EPS),
         );
+        // Per-layer arrays — populated to match the upstream schedule.
+        let ratios: Vec<u32> = (0..DSV4_N_LAYER)
+            .map(rsllm_kvcache::dsv4::shape::layer_compress_ratio)
+            .collect();
+        m.insert(
+            "deepseek4.attention.compress_ratios",
+            Value::Array(Array::U32(ratios)),
+        );
+        let clamps: Vec<f32> = vec![DSV4_SWIGLU_CLAMP_EXP; DSV4_N_LAYER];
+        m.insert(
+            "deepseek4.swiglu_clamp_exp",
+            Value::Array(Array::F32(clamps)),
+        );
         m
     }
 
@@ -545,9 +709,10 @@ mod tests {
     #[test]
     fn rejects_missing_required_key() {
         let mut m = good_meta();
-        // BTreeMap has no `remove` exposed; rebuild without one key.
-        // Simulate by inserting a wrong-typed value (still triggers MissingMetadata
-        // because get_u32 returns None on String).
+        // `Metadata` exposes no `remove`, so we type-smuggle a String into
+        // a numeric key. `get_u32` returns `None` on a String value, which
+        // surfaces as `MissingMetadata` — the same code path a truly-absent
+        // key would take. If `Metadata` ever gains `remove`, prefer that.
         m.insert(
             "deepseek4.embedding_length",
             Value::String("oops".to_string()),
@@ -634,5 +799,115 @@ mod tests {
             }
             other => panic!("expected ShapeMismatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rejects_missing_compress_ratios_array() {
+        let mut m = good_meta();
+        m.insert(
+            "deepseek4.attention.compress_ratios",
+            Value::String("nope".to_string()),
+        );
+        let err = validate_metadata(&m).unwrap_err();
+        match err {
+            Error::ShapeMismatch { key, .. } => {
+                assert_eq!(key, "deepseek4.attention.compress_ratios");
+            }
+            other => panic!("expected ShapeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_short_compress_ratios_array() {
+        let mut m = good_meta();
+        m.insert(
+            "deepseek4.attention.compress_ratios",
+            Value::Array(Array::U32(vec![0, 0, 4])),
+        );
+        let err = validate_metadata(&m).unwrap_err();
+        assert!(matches!(err, Error::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn rejects_wrong_compress_ratio_value() {
+        let mut m = good_meta();
+        // Swap the layer-2 ratio (must be 4) for an unsupported 7.
+        let mut bad: Vec<u32> = (0..DSV4_N_LAYER)
+            .map(rsllm_kvcache::dsv4::shape::layer_compress_ratio)
+            .collect();
+        bad[2] = 7;
+        m.insert(
+            "deepseek4.attention.compress_ratios",
+            Value::Array(Array::U32(bad)),
+        );
+        let err = validate_metadata(&m).unwrap_err();
+        match err {
+            Error::ShapeMismatch { key, .. } => {
+                assert_eq!(key, "deepseek4.attention.compress_ratios");
+            }
+            other => panic!("expected ShapeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_compress_ratios_as_i32_array() {
+        let mut m = good_meta();
+        let ratios: Vec<i32> = (0..DSV4_N_LAYER)
+            .map(|il| rsllm_kvcache::dsv4::shape::layer_compress_ratio(il) as i32)
+            .collect();
+        m.insert(
+            "deepseek4.attention.compress_ratios",
+            Value::Array(Array::I32(ratios)),
+        );
+        validate_metadata(&m).unwrap();
+    }
+
+    #[test]
+    fn rejects_wrong_swiglu_clamp_value() {
+        let mut m = good_meta();
+        let mut bad = vec![DSV4_SWIGLU_CLAMP_EXP; DSV4_N_LAYER];
+        bad[7] = 5.0;
+        m.insert("deepseek4.swiglu_clamp_exp", Value::Array(Array::F32(bad)));
+        let err = validate_metadata(&m).unwrap_err();
+        match err {
+            Error::ShapeMismatch { key, .. } => assert_eq!(key, "deepseek4.swiglu_clamp_exp"),
+            other => panic!("expected ShapeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_swiglu_clamp_as_f64_array() {
+        let mut m = good_meta();
+        let clamps = vec![DSV4_SWIGLU_CLAMP_EXP as f64; DSV4_N_LAYER];
+        m.insert(
+            "deepseek4.swiglu_clamp_exp",
+            Value::Array(Array::F64(clamps)),
+        );
+        validate_metadata(&m).unwrap();
+    }
+
+    #[test]
+    fn accepts_missing_optional_expert_group_keys() {
+        // good_meta() never inserts the optional keys; absence is fine.
+        validate_metadata(&good_meta()).unwrap();
+    }
+
+    #[test]
+    fn rejects_nonzero_expert_group_count() {
+        let mut m = good_meta();
+        m.insert("deepseek4.expert_group_count", Value::U32(8));
+        let err = validate_metadata(&m).unwrap_err();
+        match err {
+            Error::ShapeMismatch { key, .. } => assert_eq!(key, "deepseek4.expert_group_count"),
+            other => panic!("expected ShapeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_zero_expert_group_keys_when_present() {
+        let mut m = good_meta();
+        m.insert("deepseek4.expert_group_count", Value::U32(0));
+        m.insert("deepseek4.expert_group_used_count", Value::U32(0));
+        validate_metadata(&m).unwrap();
     }
 }
