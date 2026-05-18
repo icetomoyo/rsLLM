@@ -9,8 +9,10 @@
 //! See [`docs/03-HLD.md`](https://github.com/icetomoyo/rsLLM/blob/main/docs/03-HLD.md)
 //! for the architecture overview.
 
+pub mod engine;
 pub mod sampler;
 
+pub use engine::{DecodeStep, Engine, EngineError, Session};
 pub use sampler::{DEFAULT_MIN_P, DEFAULT_TEMPERATURE, DEFAULT_THINK_TEMPERATURE, Sampler, SamplingParams};
 
 /// Returns the version string of the rsLLM library.
