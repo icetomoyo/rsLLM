@@ -29,13 +29,21 @@
 //! layer-weight struct (MIT, The ds4.c authors). Line numbers pinned
 //! to ds4 commit `ef0a490` (2026-05-17).
 
-use rsllm_gguf::{GgmlType, GgufFile, TensorInfo};
+use rsllm_gguf::{GgmlType, GgufFile, Metadata, TensorInfo};
 use rsllm_kvcache::dsv4::shape::{layer_compress_ratio, layer_has_indexer};
 
 use crate::Error;
+use crate::deepseek_v4_flash::{DeepSeekV4Flash, DsV4Block};
 use crate::dsv4::compressor::{CompressorWeights, IndexerReadWeights, IndexerWriteWeights};
+use crate::dsv4::hc::{HC_SINKHORN_BUF_LEN, HcOpWeights};
+use crate::dsv4::mla::MlaWeights;
+use crate::dsv4::moe::{
+    MoeExpertWeights, MoeHashRouter, MoeTopkRouter, SharedExpertWeights, StackedExperts,
+};
 use crate::dsv4::shape::{
-    DSV4_HEAD_DIM, DSV4_N_EMBD, DSV4_N_INDEXER_HEAD, DSV4_N_INDEXER_HEAD_DIM,
+    DSV4_HASH_ROUTE_LAYERS, DSV4_HEAD_DIM, DSV4_N_EMBD, DSV4_N_EXPERT, DSV4_N_EXPERT_USED,
+    DSV4_N_FF_EXP, DSV4_N_HEAD, DSV4_N_INDEXER_HEAD, DSV4_N_INDEXER_HEAD_DIM, DSV4_N_LAYER,
+    DSV4_N_LORA_Q, DSV4_N_VOCAB, validate_metadata,
 };
 use crate::dsv4::weight::WeightBlob;
 
@@ -227,6 +235,63 @@ pub fn resolve_blob_opt<'a>(
     }
 }
 
+/// Reinterpret a byte slice as `&[i32]`. Same shape as
+/// [`reinterpret_as_f32`] — used for the hash-router `tid2eid`
+/// lookup table (`[N_EXPERT_USED × N_VOCAB]` row-major `i32`).
+fn reinterpret_as_i32<'a>(bytes: &'a [u8], name: &str) -> Result<&'a [i32], Error> {
+    if !bytes.len().is_multiple_of(4) {
+        return Err(Error::ShapeMismatch {
+            key: "loader.i32.length",
+            expected: "byte length divisible by 4 (I32)".into(),
+            actual: format!("{name}: {}", bytes.len()),
+        });
+    }
+    if !(bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<i32>()) {
+        return Err(Error::ShapeMismatch {
+            key: "loader.i32.alignment",
+            expected: "4-byte aligned I32 tensor".into(),
+            actual: format!(
+                "{name}: alignment offset {}",
+                bytes.as_ptr() as usize % std::mem::align_of::<i32>()
+            ),
+        });
+    }
+    // SAFETY: same reasoning as reinterpret_as_f32. i32 has no
+    // invalid bit patterns; every 4-byte sequence is a valid i32.
+    let slice = unsafe {
+        std::slice::from_raw_parts(bytes.as_ptr() as *const i32, bytes.len() / 4)
+    };
+    Ok(slice)
+}
+
+/// Resolve an I32-typed tensor (GGUF type `I32 = 24`) to a `&[i32]`.
+///
+/// # Errors
+/// - [`Error::MissingTensor`] if the name is absent.
+/// - [`Error::ShapeMismatch`] if the declared dtype is not I32 or
+///   the byte payload is misaligned.
+pub fn resolve_i32_slice<'a>(gguf: &'a GgufFile, name: &str) -> Result<&'a [i32], Error> {
+    let info = lookup(gguf, name)?;
+    let bytes = gguf.tensor_bytes(info).ok_or_else(|| Error::ShapeMismatch {
+        key: "loader.tensor_bytes",
+        expected: "valid byte range".into(),
+        actual: format!("{name}: out of bounds in GGUF mmap"),
+    })?;
+    let dtype = GgmlType::from_u32(info.raw_type).ok_or_else(|| Error::ShapeMismatch {
+        key: "loader.dtype",
+        expected: "known GgmlType".into(),
+        actual: format!("{name}: raw_type={}", info.raw_type),
+    })?;
+    if dtype != GgmlType::I32 {
+        return Err(Error::ShapeMismatch {
+            key: "loader.expected_i32",
+            expected: "I32".into(),
+            actual: format!("{name}: {dtype:?}"),
+        });
+    }
+    reinterpret_as_i32(bytes, name)
+}
+
 /// Build the F008.B `CompressorWeights` for layer `il`, **if** the
 /// layer regime calls for it. Returns `None` for dense layers
 /// (`compress_ratio == 0`).
@@ -322,6 +387,302 @@ pub fn load_indexer<'a>(
             attn_indexer_head_weight: head_w,
         },
     )))
+}
+
+/// Build an [`HcOpWeights`] for one of the four HC slots on layer
+/// `il`. `prefix` is the suffix family — `"hc_pre_attn"`,
+/// `"hc_post_attn"`, `"hc_pre_ffn"`, or `"hc_post_ffn"`.
+///
+/// HC scales (`[pre, post, comb]`) are not stored per-tensor in
+/// llama.cpp DeepSeek GGUFs — they come from a per-layer metadata
+/// triplet. v0.1.0 hard-codes `[1.0, 1.0, 1.0]` until ds4 upstream
+/// confirms the exact metadata key names (TODO(ds4)).
+///
+/// # Errors
+/// - [`Error::MissingTensor`] if either the `.weight` or `.base`
+///   tensor for this HC slot is absent.
+/// - [`Error::ShapeMismatch`] if any backing storage byte count is
+///   inconsistent with the expected `[24 × N_EMBD]` / `[24]` shape.
+pub fn load_hc_op_weights<'a>(
+    gguf: &'a GgufFile,
+    il: usize,
+    prefix: &str,
+) -> Result<HcOpWeights<'a>, Error> {
+    let mix_w_name = tensor_names::blk(il, &format!("{prefix}.weight"));
+    let mix_base_name = tensor_names::blk(il, &format!("{prefix}.base"));
+    let mix_w = resolve_blob(gguf, &mix_w_name)?;
+    mix_w.check_shape(HC_SINKHORN_BUF_LEN, DSV4_N_EMBD, "loader.hc.mix_w")?;
+    let mix_base = resolve_f32_slice(gguf, &mix_base_name)?;
+    if mix_base.len() != HC_SINKHORN_BUF_LEN {
+        return Err(Error::ShapeMismatch {
+            key: "loader.hc.mix_base",
+            expected: format!("{HC_SINKHORN_BUF_LEN}"),
+            actual: format!("{mix_base_name}: {}", mix_base.len()),
+        });
+    }
+    Ok(HcOpWeights {
+        mix_w,
+        mix_base,
+        // TODO(ds4): pull from metadata once the canonical key names
+        // are confirmed (`deepseek.hc.{pre,post,comb}_scale` is the
+        // most likely convention based on the surrounding metadata
+        // schema validated in `dsv4::shape::validate_metadata`).
+        scale: [1.0, 1.0, 1.0],
+    })
+}
+
+/// Build the routed-expert `MoeExpertWeights` for layer `il`.
+///
+/// # Errors
+/// [`Error::MissingTensor`] or [`Error::ShapeMismatch`] as for the
+/// underlying lookup / shape checks.
+pub fn load_moe_experts<'a>(gguf: &'a GgufFile, il: usize) -> Result<MoeExpertWeights<'a>, Error> {
+    let gate_name = tensor_names::blk(il, tensor_names::FFN_GATE_EXPS);
+    let up_name = tensor_names::blk(il, tensor_names::FFN_UP_EXPS);
+    let down_name = tensor_names::blk(il, tensor_names::FFN_DOWN_EXPS);
+    let gate = resolve_blob(gguf, &gate_name)?;
+    let up = resolve_blob(gguf, &up_name)?;
+    let down = resolve_blob(gguf, &down_name)?;
+    let per_expert = DSV4_N_FF_EXP * DSV4_N_EMBD;
+    Ok(MoeExpertWeights {
+        gate: StackedExperts {
+            blob: gate,
+            elements_per_expert: per_expert,
+        },
+        up: StackedExperts {
+            blob: up,
+            elements_per_expert: per_expert,
+        },
+        down: StackedExperts {
+            blob: down,
+            elements_per_expert: per_expert, // same total element count
+        },
+    })
+}
+
+/// Build the shared-expert weights for layer `il`. Always present
+/// — every layer has exactly one shared expert.
+///
+/// # Errors
+/// Bubbles up missing-tensor / shape-mismatch from the underlying
+/// lookups.
+pub fn load_shared_expert<'a>(
+    gguf: &'a GgufFile,
+    il: usize,
+) -> Result<SharedExpertWeights<'a>, Error> {
+    let gate = resolve_blob(gguf, &tensor_names::blk(il, tensor_names::FFN_GATE_SHEXP))?;
+    let up = resolve_blob(gguf, &tensor_names::blk(il, tensor_names::FFN_UP_SHEXP))?;
+    let down = resolve_blob(gguf, &tensor_names::blk(il, tensor_names::FFN_DOWN_SHEXP))?;
+    gate.check_shape(DSV4_N_FF_EXP, DSV4_N_EMBD, "loader.shared.gate")?;
+    up.check_shape(DSV4_N_FF_EXP, DSV4_N_EMBD, "loader.shared.up")?;
+    down.check_shape(DSV4_N_EMBD, DSV4_N_FF_EXP, "loader.shared.down")?;
+    Ok(SharedExpertWeights { gate, up, down })
+}
+
+/// Build the router pair (hash for layers `< DSV4_HASH_ROUTE_LAYERS`,
+/// top-k otherwise). Returns the populated half + a `None` for the
+/// other.
+///
+/// # Errors
+/// - [`Error::MissingTensor`] if any required tensor is absent.
+/// - [`Error::ShapeMismatch`] from the underlying lookups.
+pub fn load_router<'a>(
+    gguf: &'a GgufFile,
+    il: usize,
+) -> Result<(Option<MoeHashRouter<'a>>, Option<MoeTopkRouter<'a>>), Error> {
+    let gate_inp = resolve_blob(gguf, &tensor_names::blk(il, tensor_names::FFN_GATE_INP))?;
+    gate_inp.check_shape(DSV4_N_EXPERT, DSV4_N_EMBD, "loader.router.gate_inp")?;
+    // Optional gate bias `[N_EXPERT]`. Most checkpoints ship it.
+    let gate_bias = match resolve_blob_opt(
+        gguf,
+        &tensor_names::blk(il, tensor_names::FFN_EXP_PROBS_B),
+    )? {
+        Some(WeightBlob::F32(s)) => {
+            if s.len() != DSV4_N_EXPERT {
+                return Err(Error::ShapeMismatch {
+                    key: "loader.router.gate_bias",
+                    expected: format!("{DSV4_N_EXPERT}"),
+                    actual: format!("{}", s.len()),
+                });
+            }
+            Some(s)
+        }
+        Some(WeightBlob::Quant { .. }) => {
+            return Err(Error::ShapeMismatch {
+                key: "loader.router.gate_bias",
+                expected: "F32".into(),
+                actual: "quantised".into(),
+            });
+        }
+        None => None,
+    };
+
+    if il < DSV4_HASH_ROUTE_LAYERS {
+        let tid2eid_name = tensor_names::blk(il, tensor_names::TID2EID);
+        let tid2eid = resolve_i32_slice(gguf, &tid2eid_name)?;
+        let expected = DSV4_N_EXPERT_USED * DSV4_N_VOCAB;
+        if tid2eid.len() != expected {
+            return Err(Error::ShapeMismatch {
+                key: "loader.router.tid2eid",
+                expected: format!("{expected}"),
+                actual: format!("{}", tid2eid.len()),
+            });
+        }
+        Ok((
+            Some(MoeHashRouter {
+                tid2eid,
+                gate_inp,
+                gate_bias,
+            }),
+            None,
+        ))
+    } else {
+        Ok((
+            None,
+            Some(MoeTopkRouter {
+                gate_inp,
+                gate_bias,
+            }),
+        ))
+    }
+}
+
+/// Assemble the [`MlaWeights`] for layer `il`.
+fn load_mla_weights<'a>(gguf: &'a GgufFile, il: usize) -> Result<MlaWeights<'a>, Error> {
+    let attn_q_a = resolve_blob(gguf, &tensor_names::blk(il, tensor_names::ATTN_Q_A))?;
+    attn_q_a.check_shape(DSV4_N_LORA_Q, DSV4_N_EMBD, "loader.mla.attn_q_a")?;
+    let q_a_norm = resolve_f32_slice(gguf, &tensor_names::blk(il, tensor_names::ATTN_Q_A_NORM))?;
+    if q_a_norm.len() != DSV4_N_LORA_Q {
+        return Err(Error::ShapeMismatch {
+            key: "loader.mla.q_a_norm",
+            expected: format!("{DSV4_N_LORA_Q}"),
+            actual: format!("{}", q_a_norm.len()),
+        });
+    }
+    let attn_q_b = resolve_blob(gguf, &tensor_names::blk(il, tensor_names::ATTN_Q_B))?;
+    attn_q_b.check_shape(
+        DSV4_N_HEAD * DSV4_HEAD_DIM,
+        DSV4_N_LORA_Q,
+        "loader.mla.attn_q_b",
+    )?;
+    let attn_kv_a = resolve_blob(gguf, &tensor_names::blk(il, tensor_names::ATTN_KV_A))?;
+    attn_kv_a.check_shape(DSV4_HEAD_DIM, DSV4_N_EMBD, "loader.mla.attn_kv_a")?;
+    let kv_a_norm = resolve_f32_slice(gguf, &tensor_names::blk(il, tensor_names::ATTN_KV_A_NORM))?;
+    if kv_a_norm.len() != DSV4_HEAD_DIM {
+        return Err(Error::ShapeMismatch {
+            key: "loader.mla.kv_a_norm",
+            expected: format!("{DSV4_HEAD_DIM}"),
+            actual: format!("{}", kv_a_norm.len()),
+        });
+    }
+    Ok(MlaWeights {
+        attn_q_a,
+        q_a_norm,
+        attn_q_b,
+        attn_kv_a,
+        kv_a_norm,
+    })
+}
+
+/// Assemble one [`DsV4Block`] for layer `il`.
+///
+/// # Errors
+/// Any missing-tensor or shape-mismatch from the underlying lookups.
+pub fn load_block<'a>(gguf: &'a GgufFile, il: usize) -> Result<DsV4Block<'a>, Error> {
+    let attn_norm = resolve_f32_slice(gguf, &tensor_names::blk(il, tensor_names::ATTN_NORM))?;
+    let mla = load_mla_weights(gguf, il)?;
+    let attn_sinks = resolve_f32_slice(gguf, &tensor_names::blk(il, tensor_names::ATTN_SINKS))?;
+    let attn_output_a = resolve_blob(gguf, &tensor_names::blk(il, tensor_names::ATTN_OUTPUT_A))?;
+    let attn_output_b = resolve_blob(gguf, &tensor_names::blk(il, tensor_names::ATTN_OUTPUT_B))?;
+
+    let hc_pre_attn = load_hc_op_weights(gguf, il, "hc_pre_attn")?;
+    let hc_post_attn = load_hc_op_weights(gguf, il, "hc_post_attn")?;
+    let hc_pre_ffn = load_hc_op_weights(gguf, il, "hc_pre_ffn")?;
+    let hc_post_ffn = load_hc_op_weights(gguf, il, "hc_post_ffn")?;
+
+    let ffn_norm = resolve_f32_slice(gguf, &tensor_names::blk(il, tensor_names::FFN_NORM))?;
+    let moe_experts = load_moe_experts(gguf, il)?;
+    let shared_expert = load_shared_expert(gguf, il)?;
+    let (hash_router, topk_router) = load_router(gguf, il)?;
+
+    let compressor = load_compressor(gguf, il)?;
+    let (indexer_write, indexer_read) = match load_indexer(gguf, il)? {
+        Some((w, r)) => (Some(w), Some(r)),
+        None => (None, None),
+    };
+
+    Ok(DsV4Block {
+        attn_norm,
+        mla,
+        attn_sinks,
+        attn_output_a,
+        attn_output_b,
+        hc_pre_attn,
+        hc_post_attn,
+        ffn_norm,
+        moe_experts,
+        shared_expert,
+        hash_router,
+        topk_router,
+        hc_pre_ffn,
+        hc_post_ffn,
+        compressor,
+        indexer_write,
+        indexer_read,
+    })
+}
+
+/// Top-level GGUF → model loader. Validates metadata, locates every
+/// per-layer tensor, and constructs a [`DeepSeekV4Flash`] borrowing
+/// the GGUF mmap for its weight views.
+///
+/// # Errors
+/// - [`Error::MissingMetadata`] / [`Error::ShapeMismatch`] for any
+///   GGUF metadata key that disagrees with the DS V4 Flash spec.
+/// - [`Error::MissingTensor`] for any required tensor that is
+///   absent (the message identifies the concrete `blk.N.foo` name).
+/// - [`Error::ShapeMismatch`] when a tensor's byte count disagrees
+///   with the expected logical shape.
+pub fn load_dsv4_flash(gguf: &GgufFile) -> Result<DeepSeekV4Flash<'_>, Error> {
+    // 1. Metadata sanity. Catches arch / shape constant drift early.
+    validate_metadata(gguf.metadata())?;
+
+    // 2. Global tensors.
+    let embed_tokens = resolve_blob(gguf, tensor_names::TOKEN_EMBD)?;
+    embed_tokens.check_shape(DSV4_N_VOCAB, DSV4_N_EMBD, "loader.token_embd")?;
+    let output_norm = resolve_f32_slice(gguf, tensor_names::OUTPUT_NORM)?;
+    if output_norm.len() != DSV4_N_EMBD {
+        return Err(Error::ShapeMismatch {
+            key: "loader.output_norm",
+            expected: format!("{DSV4_N_EMBD}"),
+            actual: format!("{}", output_norm.len()),
+        });
+    }
+    // `output.weight` is optional — falls back to the tied
+    // `token_embd.weight` matrix when the LM head shares parameters.
+    let lm_head = match resolve_blob_opt(gguf, tensor_names::OUTPUT)? {
+        Some(blob) => {
+            blob.check_shape(DSV4_N_VOCAB, DSV4_N_EMBD, "loader.lm_head")?;
+            blob
+        }
+        None => embed_tokens,
+    };
+
+    // 3. Per-layer blocks.
+    let mut blocks = Vec::with_capacity(DSV4_N_LAYER);
+    for il in 0..DSV4_N_LAYER {
+        blocks.push(load_block(gguf, il)?);
+    }
+
+    DeepSeekV4Flash::new(embed_tokens, blocks, output_norm, lm_head)
+}
+
+/// Inspect the metadata table directly. Convenience for callers
+/// (e.g. `rsllm inspect`) that want the architecture string without
+/// constructing the full model.
+#[must_use]
+pub fn architecture_name(meta: &Metadata) -> Option<&str> {
+    meta.get_str("general.architecture")
 }
 
 /// Report the dimensions of all expected MLA weights so a caller
@@ -594,6 +955,78 @@ mod tests {
         assert_eq!(write.attn_indexer_kv.byte_len(), kv_elems * 4);
         assert_eq!(write.attn_indexer_kv_score.byte_len(), kv_elems * 4);
         assert_eq!(read.attn_indexer_q.byte_len(), q_elems * 4);
+    }
+
+    #[test]
+    fn resolve_i32_slice_returns_data_for_i32_tensor() {
+        let values: [i32; 4] = [10, -5, 0, i32::MAX];
+        let mut payload = Vec::with_capacity(16);
+        for v in &values {
+            payload.extend_from_slice(&v.to_le_bytes());
+        }
+        let bytes = build_gguf(
+            &[],
+            &[("toy_i32", GgmlType::I32 as u32, vec![4], payload)],
+        );
+        let file = GgufFile::from_bytes(bytes).unwrap();
+        let s = resolve_i32_slice(&file, "toy_i32").unwrap();
+        assert_eq!(s, &values);
+    }
+
+    #[test]
+    fn resolve_i32_slice_rejects_f32_tensor() {
+        let payload = f32s_to_bytes(&[1.0, 2.0]);
+        let bytes = build_gguf(&[], &[("toy", GgmlType::F32 as u32, vec![2], payload)]);
+        let file = GgufFile::from_bytes(bytes).unwrap();
+        let err = resolve_i32_slice(&file, "toy").unwrap_err();
+        assert!(matches!(err, Error::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn load_block_missing_attn_norm_surfaces_layer_index() {
+        // Empty GGUF — every per-layer tensor is missing. The first
+        // failure should mention "blk.5.attn_norm.weight" precisely.
+        let bytes = build_gguf(&[], &[]);
+        let file = GgufFile::from_bytes(bytes).unwrap();
+        let err = load_block(&file, 5).unwrap_err();
+        match err {
+            Error::MissingTensor(name) => {
+                assert!(name.contains("blk.5"), "got {name}");
+                assert!(name.contains("attn_norm"), "got {name}");
+            }
+            other => panic!("expected MissingTensor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_dsv4_flash_metadata_failure_surfaces() {
+        // Empty GGUF lacks `general.architecture` etc — validate_metadata
+        // must reject before any tensor lookup runs.
+        let bytes = build_gguf(&[], &[]);
+        let file = GgufFile::from_bytes(bytes).unwrap();
+        let err = load_dsv4_flash(&file).unwrap_err();
+        // validate_metadata yields MissingMetadata; either that or
+        // ShapeMismatch is acceptable — both indicate the metadata
+        // sanity step fired before any tensor lookup.
+        assert!(matches!(
+            err,
+            Error::MissingMetadata(_) | Error::ShapeMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn architecture_name_reads_metadata() {
+        let mut key_buf = Vec::new();
+        // Pack a String value: 8-byte length prefix + bytes.
+        let v = "deepseek-v4-flash";
+        key_buf.extend_from_slice(&(v.len() as u64).to_le_bytes());
+        key_buf.extend_from_slice(v.as_bytes());
+        let bytes = build_gguf(
+            &[("general.architecture", 8 /* String */, key_buf)],
+            &[],
+        );
+        let file = GgufFile::from_bytes(bytes).unwrap();
+        assert_eq!(architecture_name(file.metadata()), Some("deepseek-v4-flash"));
     }
 
     #[test]
