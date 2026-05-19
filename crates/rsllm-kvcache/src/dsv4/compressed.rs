@@ -180,6 +180,23 @@ impl CompressedKvPool {
         self.state_count
     }
 
+    /// Double-buffer multiplier. `2` for ratio-4 layers, `1` otherwise.
+    /// Exposed so the caller of [`Self::accumulate_wide`] can size its
+    /// `kv_cur` / `sc_cur` matmul output buffers to `width = coff *
+    /// head_dim`.
+    #[must_use]
+    pub fn coff(&self) -> usize {
+        self.coff
+    }
+
+    /// State-row width in floats — `coff * head_dim`. The
+    /// [`Self::accumulate_wide`] entry point expects `kv` and `score`
+    /// slices of exactly this length.
+    #[must_use]
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
     /// Read-only slice of all aggregated rows in chronological order.
     /// Shape `[n_comp × head_dim]` row-major.
     #[must_use]
@@ -255,6 +272,89 @@ impl CompressedKvPool {
         }
         self.state_count += 1;
 
+        self.maybe_emit()
+    }
+
+    /// Wide-row variant of [`Self::accumulate`] used by the F011.B
+    /// stateful compressor algorithm in `rsllm-models::dsv4::compressor`.
+    ///
+    /// `kv` and `score` are both `width = coff * head_dim`-wide rows
+    /// produced by the compressor's `wkv·x` / `wgate·x` matmuls (with
+    /// APE bias already added to `score`). The row is written into
+    /// the upper-half slot (`ratio + pos_mod` for ratio-4) or the
+    /// single-half slot (`pos_mod` for ratio-128), and the same
+    /// boundary / rotation logic as [`Self::accumulate`] runs.
+    ///
+    /// **Post-processing contract.** On emission the per-dim softmax
+    /// aggregate is written into the compressed array as a RAW pooled
+    /// value, with no RMSNorm or RoPE applied yet. The caller MUST
+    /// post-process that row in place via [`Self::compressed_row_mut`]
+    /// before any downstream attention read sees it; the upstream
+    /// `compressor_decode_one` (`ds4.c:6483-6500`) does exactly this.
+    /// A caller that forgets the post-processing will leave a raw
+    /// pooled row in `compressed`, which subsequent attention paths
+    /// would treat as a final (RoPE-rotated, RMS-normalised) row and
+    /// produce corrupt scores. This contract is in service of avoiding
+    /// a per-emission scratch allocation; cleaner alternatives are
+    /// possible if the perf cost is acceptable.
+    ///
+    /// Returns `Some(idx)` of the just-emitted (pre-post-processing)
+    /// row, or `None` when more tokens are needed.
+    ///
+    /// # Errors
+    /// - `Error::ShapeMismatch` if `kv.len() != width` or `score.len() != width`.
+    /// - `Error::CompressedPoolFull` if an emission would exceed `cap_comp`.
+    pub fn accumulate_wide(
+        &mut self,
+        kv: &[f32],
+        score: &[f32],
+    ) -> Result<Option<usize>, Error> {
+        if kv.len() != self.width {
+            return Err(Error::ShapeMismatch {
+                what: "CompressedKvPool::accumulate_wide: kv",
+                expected: self.width,
+                actual: kv.len(),
+            });
+        }
+        if score.len() != self.width {
+            return Err(Error::ShapeMismatch {
+                what: "CompressedKvPool::accumulate_wide: score",
+                expected: self.width,
+                actual: score.len(),
+            });
+        }
+
+        let slot = self.state_count as usize;
+        let row = if self.coff == 2 {
+            self.ratio as usize + slot
+        } else {
+            slot
+        };
+        let row_off = row * self.width;
+        self.state_kv[row_off..row_off + self.width].copy_from_slice(kv);
+        self.state_score[row_off..row_off + self.width].copy_from_slice(score);
+        self.state_count += 1;
+
+        self.maybe_emit()
+    }
+
+    /// Mutable access to a just-emitted compressed row, for callers of
+    /// [`Self::accumulate_wide`] that need to apply RMSNorm + RoPE
+    /// (and optionally FP8 quantize) in place before subsequent
+    /// attention reads see the row.
+    ///
+    /// # Panics
+    /// Panics if `idx >= n_comp` (asserting the caller is reading a
+    /// row they actually emitted).
+    pub fn compressed_row_mut(&mut self, idx: usize) -> &mut [f32] {
+        assert!(idx < self.n_comp, "compressed_row_mut: idx out of range");
+        let off = idx * self.head_dim;
+        &mut self.compressed[off..off + self.head_dim]
+    }
+
+    /// Run the boundary check + aggregation + rotation step.
+    /// Shared between [`Self::accumulate`] and [`Self::accumulate_wide`].
+    fn maybe_emit(&mut self) -> Result<Option<usize>, Error> {
         if self.state_count < self.ratio {
             return Ok(None);
         }
@@ -481,6 +581,85 @@ mod tests {
             p.accumulate(&const_row(0.0, 4), &const_row(0.0, 4)).unwrap();
         }
         assert_eq!(p.len(), 1);
+    }
+
+    #[test]
+    fn coff_and_width_track_ratio() {
+        let r4 = CompressedKvPool::new(2, 4, 8);
+        assert_eq!(r4.coff(), 2);
+        assert_eq!(r4.width(), 16); // 2 * 8
+        let r128 = CompressedKvPool::new(1, 128, 8);
+        assert_eq!(r128.coff(), 1);
+        assert_eq!(r128.width(), 8);
+    }
+
+    #[test]
+    fn accumulate_wide_emits_at_boundary_with_distinct_lanes_ratio4() {
+        // F011.B-style entry: caller supplies width-wide (= 2*head_dim)
+        // kv/score rows where lane p and lane c carry DISTINCT values.
+        // The dual-lane softmax should mix both lanes per dim.
+        let head_dim = 2;
+        let width = 4; // 2 * head_dim, ratio-4
+        let mut p = CompressedKvPool::new(2, 4, head_dim);
+        // Score uniform 0.0 across all lanes — pure mean across all 8
+        // contributing slots (4 lane-p + 4 lane-c, but for the first
+        // window lane-p of the lower half is NEG_INF; the upstream
+        // softmax then collapses to the 4 upper-half rows × 2 lanes.
+        let score = vec![0.0_f32; width];
+        // Token 0: kv lane p = [10, 10], lane c = [20, 20]
+        let mut kv0 = vec![0.0_f32; width];
+        kv0[..head_dim].copy_from_slice(&[10.0, 10.0]);
+        kv0[head_dim..].copy_from_slice(&[20.0, 20.0]);
+        for _ in 0..4 {
+            p.accumulate_wide(&kv0, &score).unwrap();
+        }
+        // First window aggregation reads:
+        // - Lane p (lower-half rows 0..4 col 0..head_dim): NEG_INF score,
+        //   contributes 0.
+        // - Lane c (upper-half rows 4..7 col head_dim..2*head_dim):
+        //   4 rows × kv=20, score=0 → softmax-mean = 20.
+        // So output should be 20 for each dim.
+        let row = &p.rows()[..head_dim];
+        for &v in row {
+            assert!((v - 20.0).abs() < 1e-5, "expected 20.0, got {v}");
+        }
+    }
+
+    #[test]
+    fn accumulate_wide_rejects_wrong_width() {
+        let mut p = CompressedKvPool::new(2, 4, 6);
+        // width = 12 for ratio-4. Passing 6 (head_dim) should fail.
+        let err = p.accumulate_wide(&[0.0; 6], &[0.0; 12]).unwrap_err();
+        assert!(matches!(err, Error::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn compressed_row_mut_allows_in_place_post_processing() {
+        let head_dim = 4;
+        let mut p = CompressedKvPool::new(2, 128, head_dim);
+        for _ in 0..128 {
+            p.accumulate(&const_row(2.0, head_dim), &const_row(0.0, head_dim))
+                .unwrap();
+        }
+        // Just-emitted row holds the raw pool value (here, 2.0). Caller
+        // overwrites in place — mimics what F011.B will do for RMSNorm
+        // and RoPE.
+        let row = p.compressed_row_mut(0);
+        for v in row.iter_mut() {
+            *v = 99.0;
+        }
+        let final_row = &p.rows()[..head_dim];
+        assert!(final_row.iter().all(|&v| v == 99.0));
+    }
+
+    #[test]
+    fn compressed_row_mut_panics_on_unemitted_idx() {
+        let mut p = CompressedKvPool::new(2, 128, 4);
+        // No emissions yet — n_comp == 0, idx 0 is out of range.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            p.compressed_row_mut(0);
+        }));
+        assert!(result.is_err());
     }
 
     #[test]
