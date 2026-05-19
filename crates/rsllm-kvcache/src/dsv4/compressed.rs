@@ -45,15 +45,20 @@
 //! ## API stability
 //!
 //! The current [`CompressedKvPool::accumulate`] takes `head_dim`-wide
-//! `kv` and `score` slices. For ratio-4 layers, the value is written
-//! into the upper-half **lane c** only (the upper `head_dim` columns
-//! of the upper half), with lane p left at its initial state
-//! (`kv = 0`, `score = NEG_INF`). Aggregation handles the NEG_INF
-//! lane correctly (max picks lane c, exp(NEG_INF - max) = 0), so the
-//! numerical output for the current placeholder caller is unchanged.
-//! F011.B will introduce a wide-row API once the actual compressor
-//! algorithm (`x → kv_cur, sc_cur` projections) is implemented; at
-//! that point the lane-p contributions become non-trivial.
+//! `kv` and `score` slices. For ratio-4 layers the value is
+//! **replicated** across both lanes of the upper-half row (lane p at
+//! columns `[0, head_dim)`, lane c at columns `[head_dim, 2*head_dim)`).
+//! Replication preserves the upstream invariant that the compressor
+//! matmul output is `width = 2 * head_dim` wide and writes every lane
+//! each token — without it, the rotation would move only NEG_INF
+//! lane-p data into the lower half and the sliding-window aggregation
+//! would collapse to the current ratio-4 window only. Identical
+//! replication keeps the per-window numerical output equal to the
+//! single-lane case while still giving the rotation a real "previous
+//! window" payload to slide. F011.B will introduce a wide-row API
+//! once the actual compressor algorithm (`x → kv_cur, sc_cur`
+//! projections) is implemented; at that point the two lanes carry
+//! independent payloads.
 //!
 //! Ported by reference from `ds4.c:6258-6420` (MIT, The ds4.c authors).
 //! Line numbers pinned to ds4 commit `ef0a490` (2026-05-17).
@@ -368,8 +373,9 @@ fn per_dim_softmax_aggregate(
     width: usize,
     out: &mut [f32],
 ) {
-    debug_assert_eq!(state_kv.len(), coff * ratio * width);
-    debug_assert_eq!(state_score.len(), coff * ratio * width);
+    let state_rows = coff * ratio;
+    debug_assert_eq!(state_kv.len(), state_rows * width);
+    debug_assert_eq!(state_score.len(), state_rows * width);
     debug_assert_eq!(out.len(), head_dim);
     debug_assert_eq!(width, coff * head_dim);
 
@@ -395,7 +401,17 @@ fn per_dim_softmax_aggregate(
                 }
             }
         }
-        if !max_s.is_finite() {
+        // Match ds4.c:6402 exactly: short-circuit only when every
+        // slot is NEG_INF (the initial state — no observation yet).
+        // The previous `!max_s.is_finite()` Rust guard *also* caught
+        // +Inf, which is a structural divergence from upstream even
+        // though the observable result is the same: +Inf propagates
+        // through `expf(+Inf - +Inf) = NaN` and the trailing
+        // `denom > 0.0` ternary below catches the NaN and emits 0.0
+        // — exactly what upstream produces. Mirroring the upstream
+        // guard expression keeps the code structurally portable so
+        // future audits read top-to-bottom against ds4.c.
+        if max_s <= NEG_INF * 0.5 {
             out[j] = 0.0;
             continue;
         }
