@@ -77,11 +77,15 @@ struct TokenEntry {
 /// Path to the vendored test-vector directory, relative to the
 /// workspace root. CARGO_MANIFEST_DIR is the rsllm-models crate dir,
 /// so `../../tests/dsv4-vectors/` lands us at the repo root vectors.
-fn vectors_dir() -> PathBuf {
+///
+/// Returns `None` when the directory is absent (clean clone, vendored
+/// vectors not yet downloaded). The caller pairs this with the
+/// `RSLLM_DSV4_GGUF_PATH` env check to skip cleanly rather than panic.
+fn vectors_dir() -> Option<PathBuf> {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/dsv4-vectors")
         .canonicalize()
-        .expect("dsv4-vectors directory must exist")
+        .ok()
 }
 
 #[test]
@@ -96,6 +100,18 @@ fn dsv4_vectors_replay_top1_hit_rate_is_100_percent() {
             return;
         }
     };
+    let root = match vectors_dir() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "\nF008.C.3.e dsv4-vectors replay SKIPPED — \
+                 `tests/dsv4-vectors/` is not present on this clone. \
+                 Vendor the vector set (see docs/features/v0.1.0.md) \
+                 to enable the harness.\n"
+            );
+            return;
+        }
+    };
 
     let gguf = GgufFile::open(&gguf_path)
         .unwrap_or_else(|e| panic!("failed to open GGUF at {gguf_path}: {e}"));
@@ -104,7 +120,7 @@ fn dsv4_vectors_replay_top1_hit_rate_is_100_percent() {
     let model = load_dsv4_flash(&gguf).expect("failed to load DS V4 Flash model");
     let engine = DsV4FlashEngine::new(model);
 
-    let manifest_path = vectors_dir().join("manifest.json");
+    let manifest_path = root.join("manifest.json");
     let manifest_bytes = std::fs::read(&manifest_path)
         .unwrap_or_else(|e| panic!("read {manifest_path:?}: {e}"));
     let manifest: Manifest =
@@ -114,7 +130,6 @@ fn dsv4_vectors_replay_top1_hit_rate_is_100_percent() {
     let mut hits = 0usize;
     let mut failures: Vec<String> = Vec::new();
 
-    let root = vectors_dir();
     for entry in &manifest.prompts {
         let prompt_path = root.join(&entry.prompt_file);
         let official_path = root.join(&entry.official_file);

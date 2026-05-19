@@ -27,7 +27,10 @@
 use rsllm_backend_cpu::SimdTier;
 use rsllm_backend_cpu::ops::scalar;
 
-use super::shape::{DSV4_N_EMBD, DSV4_N_EXPERT, DSV4_N_EXPERT_USED, DSV4_N_FF_EXP};
+use super::shape::{
+    DSV4_EXPERT_WEIGHT_SCALE, DSV4_N_EMBD, DSV4_N_EXPERT, DSV4_N_EXPERT_USED, DSV4_N_FF_EXP,
+    DSV4_SWIGLU_CLAMP_EXP,
+};
 use super::weight::{WeightBlob, matmul_weight_f32};
 use crate::Error;
 
@@ -429,6 +432,9 @@ pub fn apply_shared_expert(
     for t in 0..n_tok {
         let x_t = &x[t * n_embd..(t + 1) * n_embd];
         let out_t = &mut out[t * n_embd..(t + 1) * n_embd];
+        // Shared expert runs **without** the SwiGLU clamp (`ds4.c:5043`,
+        // `swiglu()` is invoked plain — only the *routed* experts at
+        // `ds4.c:3833-3839` / `5345-5353` apply the clamp).
         apply_expert_swiglu(
             out_t,
             x_t,
@@ -438,6 +444,7 @@ pub fn apply_shared_expert(
             &mut scratch.h_gate,
             &mut scratch.h_up,
             &mut scratch.h_act,
+            None,
             tier,
         )?;
     }
@@ -447,9 +454,19 @@ pub fn apply_shared_expert(
 /// Apply one expert's SwiGLU FFN to a single token.
 ///
 /// `gate`, `up`, `down` are the expert's three matmul views;
-/// `h_gate`, `h_up`, `h_act`, `expert_out` are scratch buffers.
+/// `h_gate`, `h_up`, `h_act` are scratch buffers; `out` receives the
+/// `[N_EMBD]` expert output.
 ///
-/// Math: `out = down @ (silu(gate @ x) * (up @ x))`.
+/// `clamp` selects between two regimes mirroring `ds4.c`:
+/// - `None` — plain `silu(gate) * up`, used by the shared expert
+///   (`ds4.c:5022-5024`, `layer_shared_ffn_one`).
+/// - `Some(c)` — pre-SwiGLU clamping (`ds4.c:3833-3839`, `5345-5353`):
+///   `gate` is upper-bounded by `c`; `up` is two-sided bounded by
+///   `[-c, +c]`. The gate has no lower bound because `silu` saturates
+///   to zero for large negative inputs anyway.
+///
+/// Math (clamped form):
+/// `out = down @ (silu(min(gate@x, c)) * clamp(up@x, -c, +c))`.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_expert_swiglu(
     out: &mut [f32],
@@ -460,6 +477,7 @@ pub fn apply_expert_swiglu(
     h_gate: &mut [f32],
     h_up: &mut [f32],
     h_act: &mut [f32],
+    clamp: Option<f32>,
     tier: SimdTier,
 ) -> Result<(), Error> {
     let n_embd = DSV4_N_EMBD;
@@ -467,9 +485,34 @@ pub fn apply_expert_swiglu(
 
     matmul_weight_f32(h_gate, gate, x, 1, n_embd, n_ff, tier)?;
     matmul_weight_f32(h_up, up, x, 1, n_embd, n_ff, tier)?;
+    if let Some(c) = clamp {
+        apply_swiglu_clamp(h_gate, h_up, c);
+    }
     scalar::swiglu(h_act, h_gate, h_up);
     matmul_weight_f32(out, down, h_act, 1, n_ff, n_embd, tier)?;
     Ok(())
+}
+
+/// In-place pre-SwiGLU clamp for routed experts (`ds4.c:3833-3839`).
+///
+/// `gate[i] := min(gate[i], c)` and `up[i] := clamp(up[i], -c, +c)`,
+/// applied only when `c > 1e-6` (matching the upstream guard).
+fn apply_swiglu_clamp(h_gate: &mut [f32], h_up: &mut [f32], c: f32) {
+    if c <= 1e-6 {
+        return;
+    }
+    for v in h_gate.iter_mut() {
+        if *v > c {
+            *v = c;
+        }
+    }
+    for v in h_up.iter_mut() {
+        if *v > c {
+            *v = c;
+        } else if *v < -c {
+            *v = -c;
+        }
+    }
 }
 
 /// Add `bias[e]` to `gate_logits[t, e]` for every token. No-op when
@@ -515,9 +558,17 @@ fn check_moe_shapes(out: &mut [f32], x: &[f32], n_tok: usize) -> Result<(), Erro
     Ok(())
 }
 
-/// `w_i = sqrt(softplus(l_i))` then L1-normalize across the
-/// `N_EXPERT_USED` selected indices. Mirrors `ds4.c:5045-5050` /
-/// `ds4.c:5093-5097`.
+/// `w_i = sqrt(softplus(l_i))` then L1-normalize and scale by the
+/// MoE expert-weights coefficient `DSV4_EXPERT_WEIGHT_SCALE = 1.5`.
+/// Mirrors `ds4.c:5193-5195` (hash) / `ds4.c:5266-5270` (top-k):
+///
+/// ```text
+/// w_i = sqrt(softplus(l_i)) / sum_j(sqrt(softplus(l_j))) * 1.5
+/// ```
+///
+/// The 1.5× is baked into the per-expert weight here so every downstream
+/// accumulator (`out += w_i * expert_i_out`) inherits it without needing
+/// a second multiply.
 fn compute_routing_weights(
     gate_logits: &[f32],
     selected_experts: &[u32],
@@ -547,7 +598,16 @@ fn compute_routing_weights(
             out_t[i] = w;
             sum += w;
         }
-        let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+        // L1-normalize and apply the upstream `DS4_EXPERT_WEIGHT_SCALE`
+        // factor in one pass (`ds4.c:5195`/`5270`). `sum == 0.0` happens
+        // only on a numerically degenerate batch (all logits saturate
+        // softplus to zero); in that case we leave weights at zero so
+        // the layer contributes nothing instead of NaN.
+        let inv = if sum > 0.0 {
+            DSV4_EXPERT_WEIGHT_SCALE / sum
+        } else {
+            0.0
+        };
         for w in out_t.iter_mut() {
             *w *= inv;
         }
@@ -606,6 +666,7 @@ fn accumulate_moe_outputs(
             let gate = weights.gate.expert(e);
             let up = weights.up.expert(e);
             let down = weights.down.expert(e);
+            // Routed experts clamp gate / up pre-SwiGLU (`ds4.c:5345-5353`).
             apply_expert_swiglu(
                 expert_out,
                 x_t,
@@ -615,6 +676,7 @@ fn accumulate_moe_outputs(
                 h_gate,
                 h_up,
                 h_act,
+                Some(DSV4_SWIGLU_CLAMP_EXP),
                 tier,
             )?;
             for j in 0..n_embd {
@@ -638,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn routing_weights_l1_normalize() {
+    fn routing_weights_l1_normalize_and_scale() {
         // 4 tokens, mock logits, mock selections.
         let logits: Vec<f32> = (0..DSV4_N_EXPERT)
             .map(|i| (i as f32) * 0.01)
@@ -646,11 +708,40 @@ mod tests {
         let selected = vec![0_u32, 1, 2, 3, 4, 5];
         let mut weights = vec![0.0_f32; DSV4_N_EXPERT_USED];
         compute_routing_weights(&logits, &selected, &mut weights, 1);
+        // Per ds4.c:5193-5195 / 5266-5270: weights L1-normalize then
+        // multiply by `DS4_EXPERT_WEIGHT_SCALE = 1.5`, so the post-scale
+        // sum equals 1.5 (not 1.0).
         let sum: f32 = weights.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-5, "routing weight sum = {sum}");
+        assert!(
+            (sum - DSV4_EXPERT_WEIGHT_SCALE).abs() < 1e-5,
+            "routing weight sum = {sum}, expected {DSV4_EXPERT_WEIGHT_SCALE}"
+        );
         for &w in &weights {
             assert!(w >= 0.0);
         }
+    }
+
+    #[test]
+    fn swiglu_clamp_bounds_gate_above_and_up_both_sides() {
+        // gate: upper bound only; up: two-sided. Matches ds4.c:3833-3839.
+        let mut h_gate = vec![-15.0_f32, -5.0, 0.0, 5.0, 15.0];
+        let mut h_up = vec![-15.0_f32, -5.0, 0.0, 5.0, 15.0];
+        apply_swiglu_clamp(&mut h_gate, &mut h_up, DSV4_SWIGLU_CLAMP_EXP);
+        // gate: only +15 → +10; everything else unchanged.
+        assert_eq!(h_gate, vec![-15.0, -5.0, 0.0, 5.0, 10.0]);
+        // up: both -15 → -10 and +15 → +10.
+        assert_eq!(h_up, vec![-10.0, -5.0, 0.0, 5.0, 10.0]);
+    }
+
+    #[test]
+    fn swiglu_clamp_disabled_when_threshold_tiny() {
+        // ds4.c:3833 / 4049: `if (clamp > 1.0e-6f)` — values below the
+        // threshold no-op the clamp so callers can opt out per layer.
+        let mut h_gate = vec![1e6_f32, -1e6];
+        let mut h_up = vec![1e6_f32, -1e6];
+        apply_swiglu_clamp(&mut h_gate, &mut h_up, 0.0);
+        assert_eq!(h_gate, vec![1e6, -1e6]);
+        assert_eq!(h_up, vec![1e6, -1e6]);
     }
 
     #[test]
