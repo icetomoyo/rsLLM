@@ -360,6 +360,13 @@ pub fn load_compressor<'a>(
             actual: format!("{norm_name}: {}", norm.len()),
         });
     }
+    if let Some(pos) = norm.iter().position(|v| !v.is_finite()) {
+        return Err(Error::ShapeMismatch {
+            key: "loader.compressor.norm.finite",
+            expected: "all-finite f32".to_string(),
+            actual: format!("{norm_name}: non-finite at index {pos} ({})", norm[pos]),
+        });
+    }
 
     Ok(Some(CompressorWeights { kv, gate, ape, norm }))
 }
@@ -442,6 +449,16 @@ pub fn load_indexer<'a>(
             key: "loader.indexer.comp_norm",
             expected: format!("{DSV4_N_INDEXER_HEAD_DIM}"),
             actual: format!("{comp_norm_name}: {}", comp_norm.len()),
+        });
+    }
+    if let Some(pos) = comp_norm.iter().position(|v| !v.is_finite()) {
+        return Err(Error::ShapeMismatch {
+            key: "loader.indexer.comp_norm.finite",
+            expected: "all-finite f32".to_string(),
+            actual: format!(
+                "{comp_norm_name}: non-finite at index {pos} ({})",
+                comp_norm[pos]
+            ),
         });
     }
 

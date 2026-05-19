@@ -149,6 +149,14 @@ pub struct IndexerWeights<'a> {
 ///
 /// Output buffer layout: `[n_tok × HEAD_DIM]` row-major.
 ///
+/// **Superseded by [`compressor_decode_one`] (F011.B).** This function
+/// remains only for the F006 / F008.C-era placeholder path in
+/// `attention.rs`. It uses `weights.kv` as a single-matrix proxy,
+/// skipping APE bias, the gate-side score projection, per-ratio
+/// pooling, RMSNorm, and RoPE. F011.C will retire this entry point
+/// and route the per-token compressor through `compressor_decode_one`
+/// + `CompressedKvPool::accumulate_wide`.
+///
 /// # Errors
 /// [`Error::ShapeMismatch`] if any of the input/output buffer lengths
 /// disagree with the documented dimensions.
@@ -335,6 +343,19 @@ pub fn compressor_decode_one(
 
         // RoPE tail rotation at the compressed-pool position with the
         // upstream compressed-layer YaRN regime (`ds4.c:4745-4790`).
+        // Emission only fires when `(pos + 1) % ratio == 0` (the pool's
+        // boundary check, mirroring `ds4.c:6449`), so `pos + 1 >= ratio`
+        // always holds here. `saturating_sub` is defensive against a
+        // future caller that violates the invariant (e.g. driving the
+        // pool through a non-stream code path); the debug_assert below
+        // surfaces the bug in test builds rather than silently mis-
+        // rotating the row in release.
+        debug_assert!(
+            pos + 1 >= ratio,
+            "compressor_decode_one emission invariant: pos+1 ({}) must be >= ratio ({})",
+            pos + 1,
+            ratio,
+        );
         let comp_pos = (pos + 1).saturating_sub(ratio);
         let params = compress_rope_params(comp_pos, il, head_dim as u32);
         rope_yarn_tail(row, &params, tier).map_err(|e| Error::ShapeMismatch {
@@ -358,6 +379,11 @@ pub fn compressor_decode_one(
 /// Build the [`RoPEParams`] bundle for a compressed-layer emission,
 /// mirroring `ds4.c:4745-4790` `rope_tail_layer_inplace` for
 /// compressed layers (`ds4_layer_compress_ratio(il) != 0`).
+///
+/// `_il` is accepted for signature parity with upstream's per-layer
+/// dispatch. All compressed DS V4 Flash layers share the same
+/// `freq_base` / `freq_scale` / `ext_factor` regime, so `il` is not
+/// read; future layer-tier specialisation would consult it.
 fn compress_rope_params(pos: u32, _il: u32, head_dim: u32) -> RoPEParams {
     // Constants come from ds4.c:56-61. `freq_scale = 1 / SCALE_FACTOR`,
     // and the `attn_factor` correction cancels YaRN's internal mscale
@@ -388,6 +414,10 @@ fn compress_rope_params(pos: u32, _il: u32, head_dim: u32) -> RoPEParams {
 /// row-major) into `out` (length `width`). For an F32-backed blob
 /// this is a single slice copy; for an F16-backed blob the slice
 /// is dequantised via `dequant_to_f32`. Other dtypes are rejected.
+///
+/// Integer arithmetic on the byte offset is checked
+/// (`usize::checked_mul` + `checked_add`) so a crafted GGUF cannot
+/// wrap the computation and produce a nonsensical-but-in-bounds slice.
 fn read_ape_column(
     ape: &WeightBlob<'_>,
     width: usize,
@@ -395,25 +425,47 @@ fn read_ape_column(
     pos_mod: u32,
     out: &mut [f32],
 ) -> Result<(), Error> {
-    debug_assert_eq!(out.len(), width);
-    debug_assert!(pos_mod < ratio);
-    let _ = ratio; // ratio used only for the assertion above
-    let off = (pos_mod as usize) * width;
+    if out.len() != width {
+        return Err(Error::ShapeMismatch {
+            key: "compressor.ape.out",
+            expected: format!("{width}"),
+            actual: format!("{}", out.len()),
+        });
+    }
+    if pos_mod >= ratio {
+        return Err(Error::ShapeMismatch {
+            key: "compressor.ape.pos_mod",
+            expected: format!("< {ratio}"),
+            actual: format!("{pos_mod}"),
+        });
+    }
+    let off = (pos_mod as usize)
+        .checked_mul(width)
+        .ok_or(Error::ShapeMismatch {
+            key: "compressor.ape.offset",
+            expected: "pos_mod * width must not overflow".to_string(),
+            actual: format!("pos_mod={pos_mod}, width={width}"),
+        })?;
     match ape {
         WeightBlob::F32(s) => {
-            if off + width > s.len() {
+            let end = off.checked_add(width).ok_or(Error::ShapeMismatch {
+                key: "compressor.ape.f32_end",
+                expected: "off + width must not overflow".to_string(),
+                actual: format!("off={off}, width={width}"),
+            })?;
+            if end > s.len() {
                 return Err(Error::ShapeMismatch {
                     key: "compressor.ape.f32_slice",
-                    expected: format!("{} f32s", off + width),
+                    expected: format!("{end} f32s"),
                     actual: format!("{}", s.len()),
                 });
             }
-            out.copy_from_slice(&s[off..off + width]);
+            out.copy_from_slice(&s[off..end]);
             Ok(())
         }
         WeightBlob::Quant { data, dtype } => {
-            let elem_bytes = match dtype {
-                GgmlType::F16 | GgmlType::BF16 => 2_usize,
+            let elem_bytes: usize = match dtype {
+                GgmlType::F16 | GgmlType::BF16 => 2,
                 GgmlType::F32 => 4,
                 other => {
                     return Err(Error::ShapeMismatch {
@@ -423,8 +475,25 @@ fn read_ape_column(
                     });
                 }
             };
-            let byte_off = off * elem_bytes;
-            let byte_end = byte_off + width * elem_bytes;
+            let byte_off = off.checked_mul(elem_bytes).ok_or(Error::ShapeMismatch {
+                key: "compressor.ape.byte_off",
+                expected: "off * elem_bytes must not overflow".to_string(),
+                actual: format!("off={off}, elem_bytes={elem_bytes}"),
+            })?;
+            let col_bytes = width
+                .checked_mul(elem_bytes)
+                .ok_or(Error::ShapeMismatch {
+                    key: "compressor.ape.col_bytes",
+                    expected: "width * elem_bytes must not overflow".to_string(),
+                    actual: format!("width={width}, elem_bytes={elem_bytes}"),
+                })?;
+            let byte_end = byte_off
+                .checked_add(col_bytes)
+                .ok_or(Error::ShapeMismatch {
+                    key: "compressor.ape.byte_end",
+                    expected: "byte_off + col_bytes must not overflow".to_string(),
+                    actual: format!("byte_off={byte_off}, col_bytes={col_bytes}"),
+                })?;
             if byte_end > data.len() {
                 return Err(Error::ShapeMismatch {
                     key: "compressor.ape.byte_slice",
@@ -753,6 +822,27 @@ mod tests {
             &mut kv_cur, &mut sc_cur, &mut ape_col, SimdTier::Scalar,
         )
         .unwrap_err();
+        assert!(matches!(err, Error::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn read_ape_column_rejects_out_of_range_pos_mod() {
+        // ratio=2, pos_mod=5 is way beyond the column count.
+        let ape = vec![0.0_f32; 4 * 2];
+        let blob = WeightBlob::F32(&ape);
+        let mut out = vec![0.0_f32; 4];
+        let err = read_ape_column(&blob, 4, 2, 5, &mut out).unwrap_err();
+        assert!(matches!(err, Error::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn read_ape_column_rejects_too_short_blob() {
+        // Blob declares width=4 but holds only 6 f32s, so column 1 ([4, 8))
+        // overruns. The bounds check must fire.
+        let ape = vec![0.0_f32; 6];
+        let blob = WeightBlob::F32(&ape);
+        let mut out = vec![0.0_f32; 4];
+        let err = read_ape_column(&blob, 4, 2, 1, &mut out).unwrap_err();
         assert!(matches!(err, Error::ShapeMismatch { .. }));
     }
 

@@ -304,6 +304,9 @@ impl CompressedKvPool {
     /// # Errors
     /// - `Error::ShapeMismatch` if `kv.len() != width` or `score.len() != width`.
     /// - `Error::CompressedPoolFull` if an emission would exceed `cap_comp`.
+    #[must_use = "an emitted row holds the raw pooled value; the caller \
+                  must post-process it (RMSNorm + RoPE) via \
+                  compressed_row_mut before downstream attention reads it"]
     pub fn accumulate_wide(
         &mut self,
         kv: &[f32],
@@ -426,6 +429,17 @@ impl CompressedKvPool {
     ///   carry the rotated previous window; rows `[ratio, ratio + rem)`
     ///   carry the in-flight window's first `rem` tokens.
     /// - ratio-128: clear rows `[rem, ratio)`.
+    ///
+    /// **Precondition.** `n_tokens` should equal the total number of
+    /// tokens actually accumulated (i.e. `pos + 1` at call time). The
+    /// function unconditionally overwrites `state_count` with
+    /// `n_tokens % ratio`; if the supplied count disagrees with the
+    /// caller's true position, subsequent `accumulate` /
+    /// `accumulate_wide` calls will write to the wrong state slot and
+    /// produce silently wrong compressed rows. No runtime check
+    /// enforces the precondition because some callers (e.g. tests
+    /// that simulate prefill-truncation paths) intentionally pass
+    /// a smaller `n_tokens` to normalise the count downward.
     pub fn finish_prefill_state(&mut self, n_tokens: usize) {
         let r = self.ratio as usize;
         let rem = n_tokens % r;
