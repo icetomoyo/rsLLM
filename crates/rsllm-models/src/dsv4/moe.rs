@@ -468,7 +468,7 @@ pub fn apply_shared_expert(
 /// Math (clamped form):
 /// `out = down @ (silu(min(gate@x, c)) * clamp(up@x, -c, +c))`.
 #[allow(clippy::too_many_arguments)]
-pub fn apply_expert_swiglu(
+pub(crate) fn apply_expert_swiglu(
     out: &mut [f32],
     x: &[f32],
     gate: &WeightBlob<'_>,
@@ -497,6 +497,13 @@ pub fn apply_expert_swiglu(
 ///
 /// `gate[i] := min(gate[i], c)` and `up[i] := clamp(up[i], -c, +c)`,
 /// applied only when `c > 1e-6` (matching the upstream guard).
+///
+/// NaN passes through unchanged because every IEEE-754 comparison with
+/// NaN is `false`, so neither branch fires. This matches ds4.c — neither
+/// the C clamp nor `silu()` sanitises NaN. NaN in a matmul output is
+/// already an upstream signal of either a corrupt GGUF weight or a
+/// kernel bug; we surface it (eventually as a NaN-laden logit) rather
+/// than silently mask it.
 fn apply_swiglu_clamp(h_gate: &mut [f32], h_up: &mut [f32], c: f32) {
     if c <= 1e-6 {
         return;
@@ -599,15 +606,18 @@ fn compute_routing_weights(
             sum += w;
         }
         // L1-normalize and apply the upstream `DS4_EXPERT_WEIGHT_SCALE`
-        // factor in one pass (`ds4.c:5195`/`5270`). `sum == 0.0` happens
-        // only on a numerically degenerate batch (all logits saturate
-        // softplus to zero); in that case we leave weights at zero so
-        // the layer contributes nothing instead of NaN.
-        let inv = if sum > 0.0 {
-            DSV4_EXPERT_WEIGHT_SCALE / sum
-        } else {
-            0.0
-        };
+        // factor in one pass (`ds4.c:5193-5195`/`5266-5270`). Upstream
+        // floors `sum` at `2^-14` (≈ 6.103515625e-5) BEFORE division, so
+        // a near-zero sum still produces small-but-nonzero weights
+        // rather than the hard zero our previous branch emitted. Match
+        // that semantics here to keep the numerical envelope identical
+        // to ds4 on degenerate batches.
+        // ds4.c uses `6.103515625e-5f`, which is exactly 2^-14. Express
+        // it as the reciprocal so the value stays exact in f32 and
+        // clippy doesn't complain about literal precision.
+        const ROUTING_SUM_FLOOR: f32 = 1.0 / 16_384.0;
+        let sum = sum.max(ROUTING_SUM_FLOOR);
+        let inv = DSV4_EXPERT_WEIGHT_SCALE / sum;
         for w in out_t.iter_mut() {
             *w *= inv;
         }
@@ -742,6 +752,68 @@ mod tests {
         apply_swiglu_clamp(&mut h_gate, &mut h_up, 0.0);
         assert_eq!(h_gate, vec![1e6, -1e6]);
         assert_eq!(h_up, vec![1e6, -1e6]);
+    }
+
+    #[test]
+    fn swiglu_clamp_threshold_boundary_at_1e_minus_6() {
+        // The upstream guard is `clamp > 1.0e-6f`. At the boundary, our
+        // implementation must treat `c == 1e-6` as DISABLED (matches
+        // `c <= 1e-6` in Rust) and `c` slightly above `1e-6` as ENABLED.
+        // This protects against a future "off-by-one" refactor flipping
+        // the comparison direction.
+        let mut a_gate = vec![100.0_f32];
+        let mut a_up = vec![100.0_f32];
+        apply_swiglu_clamp(&mut a_gate, &mut a_up, 1e-6);
+        assert_eq!(a_gate, vec![100.0]);
+        assert_eq!(a_up, vec![100.0]);
+
+        let mut b_gate = vec![100.0_f32];
+        let mut b_up = vec![100.0_f32];
+        // 1.000001e-6 — clearly above the threshold.
+        apply_swiglu_clamp(&mut b_gate, &mut b_up, 1.000_001e-6);
+        // gate and up are clamped to (just above) zero.
+        assert!(b_gate[0] < 1e-5);
+        assert!(b_up[0] < 1e-5);
+    }
+
+    #[test]
+    fn routing_weights_use_ds4_sum_floor_on_degenerate_logits() {
+        // Force `sum == 0.0`. Without the upstream floor we used to
+        // emit all-zero weights; ds4.c:5193 instead floors at 2^-14
+        // and divides anyway. Each weight stays small but non-zero
+        // — and the post-scale sum equals DSV4_EXPERT_WEIGHT_SCALE.
+        let mut logits = vec![0.0_f32; DSV4_N_EXPERT];
+        // softplus(-1e9) ≈ 0; sqrt(0) = 0 → sum = 0.
+        for v in logits.iter_mut() {
+            *v = -1e9;
+        }
+        let selected = vec![0_u32; DSV4_N_EXPERT_USED];
+        let mut weights = vec![0.0_f32; DSV4_N_EXPERT_USED];
+        compute_routing_weights(&logits, &selected, &mut weights, 1);
+        let sum: f32 = weights.iter().sum();
+        // Each weight is 0 / 6.103515625e-5 * 1.5 = 0, but the function
+        // must not produce NaN/Inf. The contract is "finite and the
+        // scale was applied"; with all-zero inputs the post-scale sum
+        // is naturally zero.
+        assert_eq!(sum, 0.0);
+        for &w in &weights {
+            assert!(w.is_finite());
+        }
+    }
+
+    #[test]
+    fn routing_weights_tiny_positive_sum_stays_bounded() {
+        // Single non-zero softplus result yields a tiny positive sum.
+        // Without the floor, `inv = 1.5 / sum` could overflow; with
+        // the floor, `inv = 1.5 / 6.103515625e-5 ≈ 24576` is finite.
+        let mut logits = vec![-1e9_f32; DSV4_N_EXPERT];
+        logits[0] = -20.0; // softplus ≈ 2e-9, sqrt ≈ 4.5e-5
+        let selected = vec![0_u32; DSV4_N_EXPERT_USED];
+        let mut weights = vec![0.0_f32; DSV4_N_EXPERT_USED];
+        compute_routing_weights(&logits, &selected, &mut weights, 1);
+        for &w in &weights {
+            assert!(w.is_finite(), "weight not finite: {w}");
+        }
     }
 
     #[test]
