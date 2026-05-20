@@ -29,8 +29,16 @@ use rsllm_kvcache::dsv4::shape::{
 use rsllm_kvcache::dsv4::three_tier::{LayerAppend, ThreeTierKvCache};
 
 use crate::Error;
-use crate::dsv4::compressor::{CompressorWeights, IndexerWeights, project_compressor_score};
+use crate::dsv4::compressor::{
+    CompressorWeights, IndexerWeights, compressor_decode_one,
+};
 use crate::dsv4::shape::{DSV4_HEAD_DIM, DSV4_N_HEAD};
+
+/// Maximum compressor `width = coff * head_dim` across all DS V4 Flash
+/// layers. Ratio-4 layers use `coff = 2` → `width = 1024`; ratio-128
+/// layers use `coff = 1` → `width = 512`. Pre-sizing the per-token
+/// scratch to the max avoids per-layer re-allocation.
+const COMPRESSOR_SCRATCH_MAX_WIDTH: usize = 2 * DSV4_HEAD_DIM;
 
 const _: () = assert!(KV_HEAD_DIM == DSV4_HEAD_DIM);
 
@@ -66,9 +74,14 @@ pub struct ThreeTierAttention<'cache, 'lora> {
     /// SIMD tier for the LoRA matmul kernels. Defaults to Scalar
     /// — set via [`Self::with_tier`].
     tier: SimdTier,
-    /// Reusable scratch — `[n_tok × HEAD_DIM]` compressor score rows.
-    /// Avoids per-token alloc inside the prefill loop.
-    scratch_compress_score: Vec<f32>,
+    /// Reusable scratch buffers for `compressor_decode_one` (F011.C).
+    /// Each holds one token's `width`-wide row; we re-use across the
+    /// per-token loop and across layers. Sized to the max width
+    /// (`COMPRESSOR_SCRATCH_MAX_WIDTH`); per-layer width is queried
+    /// from the pool and the buffer is sliced down before each call.
+    scratch_kv_cur: Vec<f32>,
+    scratch_sc_cur: Vec<f32>,
+    scratch_ape_col: Vec<f32>,
     /// Reusable scratch — `[n_tok × N_INDEXER_HEAD_DIM]` indexer KV rows.
     scratch_indexer_kv: Vec<f32>,
     /// Reusable scratch — `[n_tok × N_INDEXER_HEAD_DIM]` indexer scores.
@@ -93,7 +106,9 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
             cache,
             loras: EMPTY_LORAS,
             tier: SimdTier::Scalar,
-            scratch_compress_score: Vec::new(),
+            scratch_kv_cur: vec![0.0; COMPRESSOR_SCRATCH_MAX_WIDTH],
+            scratch_sc_cur: vec![0.0; COMPRESSOR_SCRATCH_MAX_WIDTH],
+            scratch_ape_col: vec![0.0; COMPRESSOR_SCRATCH_MAX_WIDTH],
             scratch_indexer_kv: Vec::new(),
             scratch_indexer_score: Vec::new(),
         }
@@ -111,7 +126,9 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
             cache,
             loras,
             tier: SimdTier::Scalar,
-            scratch_compress_score: Vec::new(),
+            scratch_kv_cur: vec![0.0; COMPRESSOR_SCRATCH_MAX_WIDTH],
+            scratch_sc_cur: vec![0.0; COMPRESSOR_SCRATCH_MAX_WIDTH],
+            scratch_ape_col: vec![0.0; COMPRESSOR_SCRATCH_MAX_WIDTH],
             scratch_indexer_kv: Vec::new(),
             scratch_indexer_score: Vec::new(),
         }
@@ -233,37 +250,15 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
             self.loras[layer_idx]
         };
 
-        // Project compressor / indexer signals from `x` if we have
-        // the weights. Otherwise fall back to per-token zero rows.
-        //
-        // Buffer policy: `resize` only zeroes *newly grown* capacity,
-        // so reused tail bytes from a larger prior call could leak in.
-        // Safe because:
-        // (a) the LoRA `Some` branch is overwrite — `matmul_weight_f32`
-        //     writes every `[t × out_dim..(t+1) × out_dim]` slot.
-        // (b) the `None` branch explicitly zeroes the full live slice
-        //     before the cache append reads from it.
-        // (c) all subsequent slices are `[0 .. n_tok × out_dim]`, so
-        //     stale capacity past the live region is never read.
-        if compress_ratio > 0 {
-            self.scratch_compress_score.resize(n_tok * head_dim, 0.0);
-            if let Some(c) = layer_loras.compressor {
-                project_compressor_score(
-                    c,
-                    x,
-                    &mut self.scratch_compress_score,
-                    n_tok,
-                    self.tier,
-                )?;
-            } else {
-                // No weights: explicit zeros (resize already
-                // initialized fresh capacity but reused capacity
-                // could carry stale data).
-                for v in self.scratch_compress_score.iter_mut() {
-                    *v = 0.0;
-                }
-            }
-        }
+        // F011.C: the compressor pool is now updated INSIDE the
+        // per-token loop below via `compressor_decode_one`, not via a
+        // single batched matmul + per-token append. The new path
+        // operates on the layer's compressor pool state directly,
+        // applies APE bias + per-dim softmax pooling + RMSNorm + RoPE
+        // on every emission, and skips the pool write entirely on
+        // non-boundary tokens. When no compressor weights are supplied
+        // (`layer_loras.compressor == None`), the pool stays empty —
+        // matching the F006 zero-placeholder semantics.
         if has_indexer {
             self.scratch_indexer_kv
                 .resize(n_tok * DSV4_N_INDEXER_HEAD_DIM, 0.0);
@@ -283,13 +278,42 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
 
         let scale = 1.0_f32 / (head_dim as f32).sqrt();
 
+        // Absolute sequence position of token 0 in this batch.
+        let batch_start_pos = self.cache.current_pos();
+
         for t in 0..n_tok {
             let kv_row = &kv[t * head_dim..(t + 1) * head_dim];
-            let comp_score_t = if compress_ratio > 0 {
-                Some(&self.scratch_compress_score[t * head_dim..(t + 1) * head_dim])
-            } else {
-                None
-            };
+
+            // 1a. Compressor pool update for this token (F011.C).
+            // Only fires when (a) the layer has a compressor pool
+            // (compress_ratio > 0) AND (b) LoRA weights were supplied.
+            // Without weights the pool stays empty, matching the F006
+            // zero-placeholder semantics.
+            if compress_ratio > 0
+                && let Some(weights) = layer_loras.compressor
+            {
+                let x_t = &x[t * crate::dsv4::shape::DSV4_N_EMBD
+                    ..(t + 1) * crate::dsv4::shape::DSV4_N_EMBD];
+                let pool = self.cache.layers[layer_idx]
+                    .compressed
+                    .as_mut()
+                    .expect("compress_ratio > 0 implies compressed pool present");
+                let width = pool.width();
+                debug_assert!(width <= COMPRESSOR_SCRATCH_MAX_WIDTH);
+                let pos = (batch_start_pos + t) as u32;
+                compressor_decode_one(
+                    x_t,
+                    weights,
+                    pool,
+                    pos,
+                    layer_idx as u32,
+                    &mut self.scratch_kv_cur[..width],
+                    &mut self.scratch_sc_cur[..width],
+                    &mut self.scratch_ape_col[..width],
+                    self.tier,
+                )?;
+            }
+
             let idx_kv_t = if has_indexer {
                 Some(
                     &self.scratch_indexer_kv
@@ -307,10 +331,9 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
                 None
             };
 
-            // 1. Append this token's KV to the appropriate tiers.
+            // 1b. Append this token's KV to the SWA ring + indexer pool.
             let append = LayerAppend {
                 kv_latent: kv_row,
-                compress_score: comp_score_t,
                 indexer_kv: idx_kv_t,
                 indexer_score: idx_score_t,
             };
@@ -543,25 +566,24 @@ mod tests {
     #[test]
     fn loras_path_writes_real_compressor_score_into_pool() {
         // Run 4 tokens through a ratio-4 layer (il=2) with a non-zero
-        // compressor weight. The compressed pool should fire one
-        // emission and that emission's row must be non-zero — a clear
-        // signal the LoRA-produced score was applied (vs the F006
-        // zero-placeholder which would also emit, but with the row
-        // equal to the simple unweighted average).
-
-        // Compressor weight: identity on the first HEAD_DIM lanes of x.
-        // F010.B note: the new 4-tensor compressor carries kv + gate +
-        // ape + norm. The legacy `project_compressor_score` path that
-        // this test exercises only consumes `kv` until F011 rewrites
-        // the algorithm — so kv gets the identity, gate/ape stay zero,
-        // norm stays at the all-ones default (no-op rms scale).
+        // compressor weight. The compressed pool should fire exactly
+        // one emission. F011.C now routes every token through
+        // `compressor_decode_one`, so the pool count is the structural
+        // signal that the wiring is intact (the numeric content is
+        // covered by the F011.B compressor unit tests).
+        //
+        // Compressor weight shapes for a ratio-4 layer:
+        // - kv / gate: [comp_width × n_embd] with comp_width = 2*HEAD_DIM
+        // - ape: [comp_width × ratio] = [comp_width × 4]
+        // - norm: [HEAD_DIM]
         let n_embd = crate::dsv4::shape::DSV4_N_EMBD;
-        let mut comp_kv = vec![0.0_f32; DSV4_HEAD_DIM * n_embd];
-        for o in 0..DSV4_HEAD_DIM {
+        let comp_width = 2 * DSV4_HEAD_DIM;
+        let mut comp_kv = vec![0.0_f32; comp_width * n_embd];
+        for o in 0..comp_width {
             comp_kv[o * n_embd + o] = 1.0;
         }
-        let comp_gate = vec![0.0_f32; DSV4_HEAD_DIM * n_embd];
-        let comp_ape = vec![0.0_f32; DSV4_HEAD_DIM * 128];
+        let comp_gate = vec![0.0_f32; comp_width * n_embd];
+        let comp_ape = vec![0.0_f32; comp_width * 4];
         let comp_norm = vec![1.0_f32; DSV4_HEAD_DIM];
         let compressor = CompressorWeights {
             kv: crate::dsv4::weight::WeightBlob::F32(&comp_kv),
@@ -604,17 +626,20 @@ mod tests {
         let mut cache = ThreeTierKvCache::new(64);
         {
             let mut attn = ThreeTierAttention::with_loras(&mut cache, &loras);
-            // Push 4 tokens (= ratio-4 boundary) on layer 2.
+            // Push 4 tokens (= ratio-4 boundary) on layer 2 as a single
+            // batched call so `pos = batch_start_pos + t` correctly
+            // advances 0..4 within the run. (Per-call advance_pos is
+            // the caller's job per the adapter docstring, but a single
+            // batched call keeps this test focused on the wiring.)
+            let q = vec![0.0_f32; 4 * DSV4_N_HEAD * DSV4_HEAD_DIM];
+            let kv = vec![1.0_f32; 4 * DSV4_HEAD_DIM];
+            // Token t gets value (t+1) at lane 0 so the score is non-trivial.
+            let mut x = vec![0.0_f32; 4 * n_embd];
             for t in 0..4 {
-                let q = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
-                let kv = vec![1.0_f32; DSV4_HEAD_DIM];
-                // x: token t gets value (t+1) at lane 0 so the score
-                // is non-trivial.
-                let mut x = vec![0.0_f32; n_embd];
-                x[0] = (t as f32) + 1.0;
-                let mut out = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
-                attn.run_layer(&q, &kv, &x, 2, &mut out).unwrap();
+                x[t * n_embd] = (t as f32) + 1.0;
             }
+            let mut out = vec![0.0_f32; 4 * DSV4_N_HEAD * DSV4_HEAD_DIM];
+            attn.run_layer(&q, &kv, &x, 2, &mut out).unwrap();
         }
         // After 4 tokens on a ratio-4 layer: exactly one compressed
         // pool emission.
@@ -645,19 +670,22 @@ mod tests {
     fn loras_indexer_emits_one_pool_entry_per_four_tokens() {
         // Exercises the indexer path end-to-end with an IndexerWeights
         // bundle supplied via slot.indexer. The indexer algorithm itself
-        // is deferred to F011, so the scratch buffers are zero-filled
+        // is deferred to F011.D, so the scratch buffers are zero-filled
         // regardless of weight content. The structural guarantee tested
         // here is: 4 tokens on a ratio-4 layer triggers exactly one
         // emission into the indexer compressed pool.
         //
-        // TODO(F011): once `project_indexer_*` is reinstated, add a
-        // non-zero numeric assertion on the emitted pool row to cover
-        // the wiring boundary between the layer-loop and the kernel.
+        // TODO(F011.D): once the indexer compressor sub-pipeline is
+        // wired, add a non-zero numeric assertion on the emitted pool
+        // row to cover the wiring boundary between the layer-loop and
+        // the kernel.
         let n_embd = crate::dsv4::shape::DSV4_N_EMBD;
-        // Compressor: all-zero, inert in this test.
-        let comp_kv = vec![0.0_f32; DSV4_HEAD_DIM * n_embd];
-        let comp_gate = vec![0.0_f32; DSV4_HEAD_DIM * n_embd];
-        let comp_ape = vec![0.0_f32; DSV4_HEAD_DIM * 128];
+        // Compressor: all-zero, inert in this test (still must have the
+        // ratio-4 shapes so `compressor_decode_one` matmuls pass).
+        let comp_width = 2 * DSV4_HEAD_DIM;
+        let comp_kv = vec![0.0_f32; comp_width * n_embd];
+        let comp_gate = vec![0.0_f32; comp_width * n_embd];
+        let comp_ape = vec![0.0_f32; comp_width * 4];
         let comp_norm = vec![1.0_f32; DSV4_HEAD_DIM];
         let compressor = CompressorWeights {
             kv: crate::dsv4::weight::WeightBlob::F32(&comp_kv),
@@ -699,16 +727,17 @@ mod tests {
         let mut cache = ThreeTierKvCache::new(64);
         {
             let mut attn = ThreeTierAttention::with_loras(&mut cache, &loras);
-            for _t in 0..4 {
-                let q = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
-                let kv = vec![1.0_f32; DSV4_HEAD_DIM];
-                let x = vec![0.0_f32; n_embd];
-                let mut out = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
-                attn.run_layer(&q, &kv, &x, 2, &mut out).unwrap();
-            }
+            // Single batched 4-token call (same reasoning as the
+            // sibling `loras_path_writes_real_compressor_score_into_pool`
+            // test — `pos` must advance 0..4 within the batch).
+            let q = vec![0.0_f32; 4 * DSV4_N_HEAD * DSV4_HEAD_DIM];
+            let kv = vec![1.0_f32; 4 * DSV4_HEAD_DIM];
+            let x = vec![0.0_f32; 4 * n_embd];
+            let mut out = vec![0.0_f32; 4 * DSV4_N_HEAD * DSV4_HEAD_DIM];
+            attn.run_layer(&q, &kv, &x, 2, &mut out).unwrap();
         }
         // 4 tokens through a ratio-4 indexer → exactly one emission.
-        // Numeric content is zero until F011 wires the real algorithm.
+        // Numeric content is zero until F011.D wires the real algorithm.
         let indexer_pool = cache.layers[2].indexer.as_ref().unwrap();
         assert_eq!(indexer_pool.len(), 1);
     }

@@ -107,19 +107,25 @@ impl LayerCache {
 /// Append-input bundle for one token's contribution to a layer's cache.
 ///
 /// `kv_latent` is the per-token MLA KV latent (`HEAD_DIM = 512` lanes).
-/// `compress_score` is the per-dim softmax-score for the compressor
-/// (`HEAD_DIM` lanes); `None` skips the compression update — caller
-/// should pass `None` for the first 2 dense layers OR pass real scores
-/// for compressed layers.
+///
+/// **Compressor pool update was moved out of `append_layer` in F011.C.**
+/// The compressor is now a stateful per-token pipeline owned by
+/// `rsllm_models::dsv4::compressor::compressor_decode_one`, which
+/// reaches into `layer.compressed` directly via its own scratch
+/// (`kv_cur` / `sc_cur` / `ape_col`) and the wide-row
+/// [`super::compressed::CompressedKvPool::accumulate_wide`] API. The
+/// caller must invoke that function before (or after, but
+/// consistently) calling `append_layer` for the same token; this
+/// struct no longer carries a `compress_score` field.
+///
 /// `indexer_kv` and `indexer_score` populate the indexer pool, both
 /// length `N_INDEXER_HEAD_DIM = 128`. Pass `None` to skip (also fine
-/// on non-indexer layers).
+/// on non-indexer layers). F011.D will move these out of `LayerAppend`
+/// the same way once the stateful indexer pipeline lands.
 #[derive(Debug, Clone, Copy)]
 pub struct LayerAppend<'a> {
     /// Required: `HEAD_DIM` lanes, the per-token KV latent for the SWA ring.
     pub kv_latent: &'a [f32],
-    /// Optional: per-dim score for compressed-pool aggregation.
-    pub compress_score: Option<&'a [f32]>,
     /// Optional: per-token indexer KV row (`N_INDEXER_HEAD_DIM` lanes).
     pub indexer_kv: Option<&'a [f32]>,
     /// Optional: per-dim score for the indexer compressed pool.
@@ -167,12 +173,17 @@ impl ThreeTierKvCache {
         self.ctx_size
     }
 
-    /// Append one token's full contribution to layer `il`.
+    /// Append one token's contribution to layer `il`'s SWA ring and
+    /// (if present) indexer pool.
     ///
     /// Writes the kv_latent to the SWA ring unconditionally. If the
-    /// layer is compressed, accumulates `compress_score` into the
-    /// compressed pool. If the layer has an indexer, accumulates
-    /// `indexer_kv` + `indexer_score` into the indexer pool.
+    /// layer has an indexer, accumulates `indexer_kv` + `indexer_score`
+    /// into the indexer pool.
+    ///
+    /// **The compressor pool is NOT touched here** (F011.C). Callers
+    /// must invoke `compressor_decode_one` (in `rsllm_models::dsv4::
+    /// compressor`) separately to update the compressor pool for
+    /// compressed layers.
     ///
     /// **Does not** advance `current_pos`; call [`Self::advance_pos`]
     /// after appending to all layers for the same token. This split
@@ -195,17 +206,7 @@ impl ThreeTierKvCache {
         // 1. Always write to the SWA ring.
         layer.swa.append(input.kv_latent)?;
 
-        // 2. Compressed pool (if present).
-        if let Some(pool) = layer.compressed.as_mut() {
-            let score = input.compress_score.ok_or(Error::ShapeMismatch {
-                what: "ThreeTierKvCache::append_layer: missing compress_score for compressed layer",
-                expected: DSV4_HEAD_DIM,
-                actual: 0,
-            })?;
-            pool.accumulate(input.kv_latent, score)?;
-        }
-
-        // 3. Indexer pool (if present).
+        // 2. Indexer pool (if present).
         if let Some(idx_pool) = layer.indexer.as_mut() {
             let idx_kv = input.indexer_kv.ok_or(Error::ShapeMismatch {
                 what: "ThreeTierKvCache::append_layer: missing indexer_kv for ratio-4 layer",
@@ -312,7 +313,6 @@ mod tests {
                 0,
                 LayerAppend {
                     kv_latent: &kv,
-                    compress_score: None,
                     indexer_kv: None,
                     indexer_score: None,
                 },
@@ -325,14 +325,14 @@ mod tests {
     fn append_layer_to_ratio4_needs_indexer_inputs() {
         let mut cache = ThreeTierKvCache::new(64);
         let kv = const_kv(0.5);
-        let comp_score = const_kv(0.0);
-        // Missing indexer_kv/score should error.
+        // Missing indexer_kv/score should error. The compressor pool is
+        // no longer touched by `append_layer`, so the test only
+        // exercises the indexer-missing branch.
         let err = cache
             .append_layer(
                 2,
                 LayerAppend {
                     kv_latent: &kv,
-                    compress_score: Some(&comp_score),
                     indexer_kv: None,
                     indexer_score: None,
                 },
@@ -345,7 +345,6 @@ mod tests {
     fn append_layer_full_ratio4_succeeds() {
         let mut cache = ThreeTierKvCache::new(64);
         let kv = const_kv(0.5);
-        let comp_score = const_kv(0.0);
         let idx_kv = const_indexer_kv(0.3);
         let idx_score = const_indexer_kv(0.0);
         cache
@@ -353,38 +352,32 @@ mod tests {
                 2,
                 LayerAppend {
                     kv_latent: &kv,
-                    compress_score: Some(&comp_score),
                     indexer_kv: Some(&idx_kv),
                     indexer_score: Some(&idx_score),
                 },
             )
             .unwrap();
         assert_eq!(cache.layers[2].swa.len(), 1);
-        // First token → no emission yet (need 4 to fire ratio-4 boundary).
+        // Compressor pool stays empty — `append_layer` no longer writes it.
         assert_eq!(cache.layers[2].compressed.as_ref().unwrap().len(), 0);
+        // Indexer first token → no emission yet (need 4 to fire boundary).
         assert_eq!(cache.layers[2].indexer.as_ref().unwrap().len(), 0);
     }
 
     #[test]
     fn finish_prefill_normalizes_compressor_state() {
         let mut cache = ThreeTierKvCache::new(64);
-        let kv = const_kv(0.5);
         let cs = const_kv(0.1);
-        let ikv = const_indexer_kv(0.2);
-        let is = const_indexer_kv(0.1);
-        // Push 7 tokens through layer 2 → 1 compressed emission, 3 in-flight state slots.
-        for _ in 0..7 {
-            cache
-                .append_layer(
-                    2,
-                    LayerAppend {
-                        kv_latent: &kv,
-                        compress_score: Some(&cs),
-                        indexer_kv: Some(&ikv),
-                        indexer_score: Some(&is),
-                    },
-                )
-                .unwrap();
+        // Push 7 tokens directly into the layer's compressor pool via
+        // the kvcache's own `accumulate` (the path real callers no
+        // longer use — the model crate now drives `accumulate_wide` via
+        // `compressor_decode_one` — but `finish_prefill` is a
+        // pool-level normaliser that we want to exercise in isolation).
+        {
+            let pool = cache.layers[2].compressed.as_mut().unwrap();
+            for _ in 0..7 {
+                pool.accumulate(&cs, &const_kv(0.0)).unwrap();
+            }
         }
         let comp_ref = cache.layers[2].compressed.as_ref().unwrap();
         assert_eq!(comp_ref.len(), 1);
@@ -404,7 +397,6 @@ mod tests {
                 99,
                 LayerAppend {
                     kv_latent: &kv,
-                    compress_score: None,
                     indexer_kv: None,
                     indexer_score: None,
                 },
@@ -422,7 +414,6 @@ mod tests {
                 0,
                 LayerAppend {
                     kv_latent: &kv,
-                    compress_score: None,
                     indexer_kv: None,
                     indexer_score: None,
                 },
