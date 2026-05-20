@@ -100,6 +100,13 @@ impl IndexerPool {
     /// Append one token's (kv, score) pair to the indexer's compressor
     /// state. Returns `Some(emitted_idx)` when a ratio-4 boundary fires.
     ///
+    /// **Tests/internal only.** As of F011.D the production path in
+    /// `rsllm-models::dsv4::attention::ThreeTierAttention::run_layer`
+    /// drives the indexer via `compressor_decode_one` against
+    /// [`Self::inner_mut`] (the wide-row `accumulate_wide` API).
+    /// This `head_dim`-wide entry point is retained for unit tests
+    /// of [`Self::select_top_k`].
+    ///
     /// # Errors
     /// Bubbles up [`CompressedKvPool::accumulate`] errors.
     pub fn accumulate(&mut self, kv: &[f32], score: &[f32]) -> Result<Option<usize>, Error> {
@@ -120,6 +127,16 @@ impl IndexerPool {
     /// drive the indexer's stateful per-token pipeline. The wrapper
     /// stays in place for its `select_top_k` method and for type-safety
     /// at construction sites; this accessor is the seam.
+    ///
+    /// **Caller contract.** Use only to advance per-token state via
+    /// `accumulate_wide` / `compressed_row_mut`. Do NOT invoke
+    /// `clear()` or `finish_prefill_state(...)` through this reference
+    /// mid-forward-pass — those operations reset the pool's internal
+    /// token cursor, which would silently desynchronise the indexer
+    /// from the layer's compressor pool and SWA ring. Session-level
+    /// resets should go through the cache-wide `ThreeTierKvCache::clear`
+    /// / `finish_prefill` entry points, which keep all three tiers
+    /// aligned.
     pub fn inner_mut(&mut self) -> &mut CompressedKvPool {
         &mut self.pool
     }

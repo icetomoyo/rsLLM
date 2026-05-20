@@ -3,14 +3,16 @@
 //!
 //! For each token in the input batch and one layer index `il`:
 //!
-//! 1. Append the per-token KV latent to the cache. Compressed layers
-//!    drive [`compressor_decode_one`] when `CompressorWeights` are
-//!    supplied (F011.C) — the full stateful per-token algorithm
-//!    (dual matmul → APE bias → pool aggregation → RMSNorm → RoPE-YaRN
-//!    tail) runs against the layer's `CompressedKvPool`. Without
-//!    weights the pool stays empty (F006 zero-placeholder semantics).
-//!    Ratio-4 indexer inputs are still zero-filled placeholders;
-//!    F011.D will wire the parallel indexer sub-pipeline.
+//! 1. Append the per-token KV latent to the SWA ring. For ratio-4 /
+//!    ratio-128 layers the residual `x` additionally drives the
+//!    stateful [`compressor_decode_one`] kernel — dual matmul → APE
+//!    bias → pool aggregation → RMSNorm → RoPE-YaRN tail — once for
+//!    the attention compressor pool (head_dim = 512) and, on ratio-4
+//!    layers, a second time for the indexer pool (head_dim = 128)
+//!    using `IndexerWeights::as_compressor_view()`. Both kernels share
+//!    the adapter's per-token scratch buffers (sequential, never
+//!    concurrent). Without weights, each pool stays empty (F006
+//!    zero-placeholder semantics).
 //! 2. Compute MLA-absorbed attention against the cached SWA window:
 //!    for each head `h ∈ [0, N_HEAD)`, softmax(Q_h · KV_k^T / √d) · KV_k.
 //!    Compressed-pool and indexer-selected rows are *additional* keys
@@ -42,6 +44,27 @@ use crate::dsv4::shape::{DSV4_HEAD_DIM, DSV4_N_HEAD};
 const COMPRESSOR_SCRATCH_MAX_WIDTH: usize = 2 * DSV4_HEAD_DIM;
 
 const _: () = assert!(KV_HEAD_DIM == DSV4_HEAD_DIM);
+
+/// Hard-error guard for the per-token scratch buffers. A malformed GGUF
+/// could in principle land a `CompressedKvPool::width()` value larger
+/// than [`COMPRESSOR_SCRATCH_MAX_WIDTH`] (1024 = `2 * HEAD_DIM`); the
+/// subsequent `self.scratch_*[..width]` slice would panic on the
+/// standard-library bounds check rather than returning `Err`. Convert
+/// that to a `Result` so adversarial / malformed inputs degrade
+/// gracefully instead of unwinding a hot inference loop. `kind` is one
+/// of `"compressor"` / `"indexer"` for diagnostics.
+fn check_scratch_width(width: usize, kind: &'static str) -> Result<(), Error> {
+    if width > COMPRESSOR_SCRATCH_MAX_WIDTH {
+        return Err(Error::ShapeMismatch {
+            key: "ThreeTierAttention::run_layer.scratch_width",
+            expected: format!(
+                "<= {COMPRESSOR_SCRATCH_MAX_WIDTH} ({kind} pool width)"
+            ),
+            actual: format!("{width}"),
+        });
+    }
+    Ok(())
+}
 
 /// Per-layer LoRA bundle the adapter borrows to produce real
 /// compress / indexer scores from the residual stream `x`. A `None`
@@ -308,7 +331,7 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
                     .as_mut()
                     .expect("compress_ratio > 0 implies compressed pool present");
                 let width = pool.width();
-                debug_assert!(width <= COMPRESSOR_SCRATCH_MAX_WIDTH);
+                check_scratch_width(width, "compressor")?;
                 compressor_decode_one(
                     x_t,
                     weights,
@@ -338,7 +361,7 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
                     .expect("has_indexer implies indexer pool present")
                     .inner_mut();
                 let width = idx_pool.width();
-                debug_assert!(width <= COMPRESSOR_SCRATCH_MAX_WIDTH);
+                check_scratch_width(width, "indexer")?;
                 let view = idx_weights.as_compressor_view();
                 compressor_decode_one(
                     x_t,

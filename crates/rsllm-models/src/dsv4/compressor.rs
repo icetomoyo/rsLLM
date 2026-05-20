@@ -9,12 +9,13 @@
 //! six-tensor bundle for ratio-4 layers aligned to ds4 upstream
 //! (`ds4.c:2326-2331` for shapes, `ds4.c:2610-2615` for load).
 //!
-//! **Algorithmic gap (F011.D follow-up).** The indexer-side stateful
-//! sub-pipeline (analogous to [`compressor_decode_one`] but for
-//! `IndexerWeights`) is intentionally absent. F011.D will add it.
-//! Until then `IndexerWeights` is loaded with the correct tensors but
-//! the downstream adapter in `attention.rs` keeps the F006
-//! zero-placeholder path for the indexer tier.
+//! The indexer side reuses the *same* [`compressor_decode_one`] kernel
+//! (per `ds4.c:7042-7057`, where the upstream `compressor_decode_one`
+//! is called a second time with `head_dim = N_INDEXER_HEAD_DIM = 128`
+//! and the indexer cache buffers). Callers obtain a
+//! [`CompressorWeights`] view of an [`IndexerWeights`] via
+//! [`IndexerWeights::as_compressor_view`] and pass the layer's
+//! [`rsllm_kvcache::dsv4::indexer::IndexerPool`]'s inner pool.
 //!
 //! ds4 anchors:
 //! - `attn_compressor` family — layer-weight struct at `ds4.c:2306+`,
@@ -151,11 +152,14 @@ impl<'a> IndexerWeights<'a> {
 // accumulate_wide`. See the F011.C commit body for the migration
 // notes.
 
-// NOTE(F011): project_indexer_* functions are intentionally absent.
-// F011 will add the proper stateful indexer pipeline once the full
-// algorithm (per-position APE bias, gate sigmoid, pool reduction,
-// RMSNorm) is modelled. `attention.rs` keeps zero-placeholder scores
-// for the indexer tier until then.
+// NOTE(F011.D): the indexer's stateful per-token pipeline reuses
+// `compressor_decode_one` via `IndexerWeights::as_compressor_view()` —
+// no separate `project_indexer_*` kernel exists, matching ds4 upstream
+// (`ds4.c:7042-7057` calls `compressor_decode_one` again with
+// `head_dim = DS4_N_INDEXER_HEAD_DIM = 128`). The `attn_q_b` and
+// `proj` tensors of `IndexerWeights` are NOT consumed by this kernel
+// — they feed the F011.E top-K selection path (indexer query
+// projection) that lands later in the chain.
 
 /// Stateful per-token compressor step, mirroring `ds4.c:6431-6524`
 /// `compressor_decode_one`.
