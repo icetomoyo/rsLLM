@@ -4,10 +4,13 @@
 //! For each token in the input batch and one layer index `il`:
 //!
 //! 1. Append the per-token KV latent to the cache. Compressed layers
-//!    receive a placeholder per-dim score (zeros → uniform pooling);
-//!    ratio-4 indexer inputs are likewise placeholdered. Real scoring
-//!    weights are produced by `attn_compressor` / `attn_indexer` LoRAs,
-//!    which are part of the F008 (numerical parity) extension.
+//!    drive [`compressor_decode_one`] when `CompressorWeights` are
+//!    supplied (F011.C) — the full stateful per-token algorithm
+//!    (dual matmul → APE bias → pool aggregation → RMSNorm → RoPE-YaRN
+//!    tail) runs against the layer's `CompressedKvPool`. Without
+//!    weights the pool stays empty (F006 zero-placeholder semantics).
+//!    Ratio-4 indexer inputs are still zero-filled placeholders;
+//!    F011.D will wire the parallel indexer sub-pipeline.
 //! 2. Compute MLA-absorbed attention against the cached SWA window:
 //!    for each head `h ∈ [0, N_HEAD)`, softmax(Q_h · KV_k^T / √d) · KV_k.
 //!    Compressed-pool and indexer-selected rows are *additional* keys
@@ -280,6 +283,30 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
 
         // Absolute sequence position of token 0 in this batch.
         let batch_start_pos = self.cache.current_pos();
+        // Guard the `pos` cast in the per-token loop: `compressor_decode_one`
+        // takes `pos: u32`, but `batch_start_pos + t` is a `usize`. On a
+        // 64-bit host a long-running stream could in principle exceed
+        // `u32::MAX` (~4.29B tokens). Verify the largest position we will
+        // produce in this batch fits into `u32` BEFORE entering the loop
+        // so the cast below cannot silently truncate. Computed once.
+        if n_tok > 0 {
+            let last_pos =
+                batch_start_pos
+                    .checked_add(n_tok - 1)
+                    .ok_or(Error::ShapeMismatch {
+                        key: "ThreeTierAttention::run_layer.pos",
+                        expected: "batch_start_pos + n_tok - 1 must not overflow usize"
+                            .to_string(),
+                        actual: format!("batch_start_pos={batch_start_pos}, n_tok={n_tok}"),
+                    })?;
+            if last_pos > u32::MAX as usize {
+                return Err(Error::ShapeMismatch {
+                    key: "ThreeTierAttention::run_layer.pos",
+                    expected: format!("<= {} (u32::MAX)", u32::MAX),
+                    actual: format!("{last_pos}"),
+                });
+            }
+        }
 
         for t in 0..n_tok {
             let kv_row = &kv[t * head_dim..(t + 1) * head_dim];
@@ -633,10 +660,17 @@ mod tests {
             // batched call keeps this test focused on the wiring.)
             let q = vec![0.0_f32; 4 * DSV4_N_HEAD * DSV4_HEAD_DIM];
             let kv = vec![1.0_f32; 4 * DSV4_HEAD_DIM];
-            // Token t gets value (t+1) at lane 0 so the score is non-trivial.
+            // Token t gets value (t+1) at lane 0 AND lane head_dim. The
+            // identity-kv weight then puts (t+1) into kv_cur[0] (lane p
+            // col 0) and kv_cur[head_dim] (lane c col 0). On the first
+            // emission window the ratio-4 double-buffer's lower half
+            // (lane p) is still default-init (NEG_INF), so only lane c
+            // participates in the aggregation — populating x[head_dim]
+            // is what makes the first emission have non-zero content.
             let mut x = vec![0.0_f32; 4 * n_embd];
             for t in 0..4 {
                 x[t * n_embd] = (t as f32) + 1.0;
+                x[t * n_embd + DSV4_HEAD_DIM] = (t as f32) + 1.0;
             }
             let mut out = vec![0.0_f32; 4 * DSV4_N_HEAD * DSV4_HEAD_DIM];
             attn.run_layer(&q, &kv, &x, 2, &mut out).unwrap();
@@ -644,6 +678,20 @@ mod tests {
         // After 4 tokens on a ratio-4 layer: exactly one compressed
         // pool emission.
         assert_eq!(cache.layers[2].compressed.as_ref().unwrap().len(), 1);
+        // Adapter-boundary content check: with identity-kv on the first
+        // `comp_width` lanes and a non-zero `x` at lanes 0 + head_dim,
+        // at least one lane of the emitted row must be non-zero. Catches
+        // bugs where `run_layer` passes the wrong `x_t` slice or the
+        // wrong `pos` to `compressor_decode_one` — failures the
+        // F011.B unit tests cannot detect because they exercise the
+        // kernel directly. (The exact magnitude depends on RMSNorm +
+        // RoPE; we only assert non-zero presence, not a specific value.)
+        let pool = cache.layers[2].compressed.as_ref().unwrap();
+        let row = &pool.rows()[..DSV4_HEAD_DIM];
+        assert!(
+            row.iter().any(|&v| v.abs() > 1e-4),
+            "expected at least one non-zero lane in emitted row, got all-zero (wiring bug?)"
+        );
     }
 
     #[test]
