@@ -106,6 +106,24 @@ impl IndexerPool {
         self.pool.accumulate(kv, score)
     }
 
+    /// Width of one row in the underlying compressor state buffer —
+    /// `coff * head_dim`. For an indexer (always ratio-4) this is
+    /// `2 * N_INDEXER_HEAD_DIM = 256`.
+    #[must_use]
+    pub fn width(&self) -> usize {
+        self.pool.width()
+    }
+
+    /// Mutable reference to the underlying [`CompressedKvPool`].
+    /// Exposed (F011.D) so the rsllm-models `compressor_decode_one`
+    /// kernel — which operates on `CompressedKvPool` directly — can
+    /// drive the indexer's stateful per-token pipeline. The wrapper
+    /// stays in place for its `select_top_k` method and for type-safety
+    /// at construction sites; this accessor is the seam.
+    pub fn inner_mut(&mut self) -> &mut CompressedKvPool {
+        &mut self.pool
+    }
+
     /// Discard all rows and reset state.
     pub fn clear(&mut self) {
         self.pool.clear();

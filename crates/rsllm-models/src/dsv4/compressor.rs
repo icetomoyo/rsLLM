@@ -127,6 +127,24 @@ pub struct IndexerWeights<'a> {
     pub comp_norm: &'a [f32],
 }
 
+impl<'a> IndexerWeights<'a> {
+    /// View the four `comp_*` tensors as a [`CompressorWeights`] so the
+    /// same [`compressor_decode_one`] kernel can drive the indexer's
+    /// stateful per-token pipeline. Upstream `ds4.c:7042-7054` reuses
+    /// `compressor_decode_one` for the indexer too, parameterised only
+    /// by `head_dim` (128 vs 512) and the cache buffers — the algorithm
+    /// is identical. F011.D adopts the same approach.
+    #[must_use]
+    pub fn as_compressor_view(&self) -> CompressorWeights<'a> {
+        CompressorWeights {
+            kv: self.comp_kv,
+            gate: self.comp_gate,
+            ape: self.comp_ape,
+            norm: self.comp_norm,
+        }
+    }
+}
+
 // NOTE(F011.C): the old placeholder `project_compressor_score` was
 // retired here. Callers now route through `compressor_decode_one`
 // (the stateful per-token entry point) + `CompressedKvPool::

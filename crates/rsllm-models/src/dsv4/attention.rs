@@ -26,9 +26,7 @@
 //! Line numbers pinned to ds4 commit `ef0a490` (2026-05-17).
 
 use rsllm_backend_cpu::SimdTier;
-use rsllm_kvcache::dsv4::shape::{
-    DSV4_HEAD_DIM as KV_HEAD_DIM, DSV4_N_INDEXER_HEAD_DIM, DSV4_N_LAYER,
-};
+use rsllm_kvcache::dsv4::shape::{DSV4_HEAD_DIM as KV_HEAD_DIM, DSV4_N_LAYER};
 use rsllm_kvcache::dsv4::three_tier::{LayerAppend, ThreeTierKvCache};
 
 use crate::Error;
@@ -77,18 +75,16 @@ pub struct ThreeTierAttention<'cache, 'lora> {
     /// SIMD tier for the LoRA matmul kernels. Defaults to Scalar
     /// — set via [`Self::with_tier`].
     tier: SimdTier,
-    /// Reusable scratch buffers for `compressor_decode_one` (F011.C).
+    /// Reusable scratch buffers for `compressor_decode_one` (F011.C/D).
     /// Each holds one token's `width`-wide row; we re-use across the
-    /// per-token loop and across layers. Sized to the max width
+    /// per-token loop and across layers AND across the compressor /
+    /// indexer pipelines (since each runs a separate kernel call per
+    /// token, never concurrently). Sized to the max width
     /// (`COMPRESSOR_SCRATCH_MAX_WIDTH`); per-layer width is queried
     /// from the pool and the buffer is sliced down before each call.
     scratch_kv_cur: Vec<f32>,
     scratch_sc_cur: Vec<f32>,
     scratch_ape_col: Vec<f32>,
-    /// Reusable scratch — `[n_tok × N_INDEXER_HEAD_DIM]` indexer KV rows.
-    scratch_indexer_kv: Vec<f32>,
-    /// Reusable scratch — `[n_tok × N_INDEXER_HEAD_DIM]` indexer scores.
-    scratch_indexer_score: Vec<f32>,
 }
 
 /// Empty slice used by [`ThreeTierAttention::new`] so the `loras`
@@ -112,8 +108,6 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
             scratch_kv_cur: vec![0.0; COMPRESSOR_SCRATCH_MAX_WIDTH],
             scratch_sc_cur: vec![0.0; COMPRESSOR_SCRATCH_MAX_WIDTH],
             scratch_ape_col: vec![0.0; COMPRESSOR_SCRATCH_MAX_WIDTH],
-            scratch_indexer_kv: Vec::new(),
-            scratch_indexer_score: Vec::new(),
         }
     }
 
@@ -132,8 +126,6 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
             scratch_kv_cur: vec![0.0; COMPRESSOR_SCRATCH_MAX_WIDTH],
             scratch_sc_cur: vec![0.0; COMPRESSOR_SCRATCH_MAX_WIDTH],
             scratch_ape_col: vec![0.0; COMPRESSOR_SCRATCH_MAX_WIDTH],
-            scratch_indexer_kv: Vec::new(),
-            scratch_indexer_score: Vec::new(),
         }
     }
 
@@ -261,23 +253,11 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
         // on every emission, and skips the pool write entirely on
         // non-boundary tokens. When no compressor weights are supplied
         // (`layer_loras.compressor == None`), the pool stays empty —
-        // matching the F006 zero-placeholder semantics.
-        if has_indexer {
-            self.scratch_indexer_kv
-                .resize(n_tok * DSV4_N_INDEXER_HEAD_DIM, 0.0);
-            self.scratch_indexer_score
-                .resize(n_tok * DSV4_N_INDEXER_HEAD_DIM, 0.0);
-            // TODO(F011): indexer pipeline — project_indexer_* intentionally absent.
-            // F011 will wire the per-position APE bias, gate sigmoid, pool reduction,
-            // and RMSNorm using `layer_loras.indexer`. Until then, zero-fill both
-            // scratch buffers so the cache append is exercised but scores are inert.
-            for v in self.scratch_indexer_kv.iter_mut() {
-                *v = 0.0;
-            }
-            for v in self.scratch_indexer_score.iter_mut() {
-                *v = 0.0;
-            }
-        }
+        // matching the F006 zero-placeholder semantics. The indexer
+        // sub-pipeline (F011.D) reuses the same `compressor_decode_one`
+        // kernel against the per-layer `IndexerPool` and `IndexerWeights`
+        // (head_dim = N_INDEXER_HEAD_DIM = 128 vs the compressor's 512;
+        // algorithm otherwise identical, per `ds4.c:7042-7057`).
 
         let scale = 1.0_f32 / (head_dim as f32).sqrt();
 
@@ -316,6 +296,8 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
             // (compress_ratio > 0) AND (b) LoRA weights were supplied.
             // Without weights the pool stays empty, matching the F006
             // zero-placeholder semantics.
+            let pos = (batch_start_pos + t) as u32;
+
             if compress_ratio > 0
                 && let Some(weights) = layer_loras.compressor
             {
@@ -327,7 +309,6 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
                     .expect("compress_ratio > 0 implies compressed pool present");
                 let width = pool.width();
                 debug_assert!(width <= COMPRESSOR_SCRATCH_MAX_WIDTH);
-                let pos = (batch_start_pos + t) as u32;
                 compressor_decode_one(
                     x_t,
                     weights,
@@ -341,29 +322,40 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
                 )?;
             }
 
-            let idx_kv_t = if has_indexer {
-                Some(
-                    &self.scratch_indexer_kv
-                        [t * DSV4_N_INDEXER_HEAD_DIM..(t + 1) * DSV4_N_INDEXER_HEAD_DIM],
-                )
-            } else {
-                None
-            };
-            let idx_score_t = if has_indexer {
-                Some(
-                    &self.scratch_indexer_score
-                        [t * DSV4_N_INDEXER_HEAD_DIM..(t + 1) * DSV4_N_INDEXER_HEAD_DIM],
-                )
-            } else {
-                None
-            };
+            // 1b. Indexer sub-pipeline (F011.D). Same kernel as the
+            // attention compressor, just operating on the indexer pool
+            // (head_dim = 128) with the `comp_*` tensors of
+            // `IndexerWeights`. Only fires on ratio-4 layers that
+            // actually have indexer weights supplied.
+            if has_indexer
+                && let Some(idx_weights) = layer_loras.indexer
+            {
+                let x_t = &x[t * crate::dsv4::shape::DSV4_N_EMBD
+                    ..(t + 1) * crate::dsv4::shape::DSV4_N_EMBD];
+                let idx_pool = self.cache.layers[layer_idx]
+                    .indexer
+                    .as_mut()
+                    .expect("has_indexer implies indexer pool present")
+                    .inner_mut();
+                let width = idx_pool.width();
+                debug_assert!(width <= COMPRESSOR_SCRATCH_MAX_WIDTH);
+                let view = idx_weights.as_compressor_view();
+                compressor_decode_one(
+                    x_t,
+                    &view,
+                    idx_pool,
+                    pos,
+                    layer_idx as u32,
+                    &mut self.scratch_kv_cur[..width],
+                    &mut self.scratch_sc_cur[..width],
+                    &mut self.scratch_ape_col[..width],
+                    self.tier,
+                )?;
+            }
 
-            // 1b. Append this token's KV to the SWA ring + indexer pool.
-            let append = LayerAppend {
-                kv_latent: kv_row,
-                indexer_kv: idx_kv_t,
-                indexer_score: idx_score_t,
-            };
+            // 1c. Append this token's KV to the SWA ring. Compressor and
+            // indexer pools are driven separately above.
+            let append = LayerAppend { kv_latent: kv_row };
             self.cache.append_layer(layer_idx, append)?;
 
             // 2. Attention over the SWA window. The cache stores rows
@@ -449,6 +441,7 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rsllm_kvcache::dsv4::shape::DSV4_N_INDEXER_HEAD_DIM;
 
     fn make_q(n_tok: usize, fill: f32) -> Vec<f32> {
         vec![fill; n_tok * DSV4_N_HEAD * DSV4_HEAD_DIM]
@@ -716,20 +709,19 @@ mod tests {
 
     #[test]
     fn loras_indexer_emits_one_pool_entry_per_four_tokens() {
-        // Exercises the indexer path end-to-end with an IndexerWeights
-        // bundle supplied via slot.indexer. The indexer algorithm itself
-        // is deferred to F011.D, so the scratch buffers are zero-filled
-        // regardless of weight content. The structural guarantee tested
-        // here is: 4 tokens on a ratio-4 layer triggers exactly one
-        // emission into the indexer compressed pool.
-        //
-        // TODO(F011.D): once the indexer compressor sub-pipeline is
-        // wired, add a non-zero numeric assertion on the emitted pool
-        // row to cover the wiring boundary between the layer-loop and
-        // the kernel.
+        // F011.D wired the indexer through the same
+        // `compressor_decode_one` kernel as the attention compressor
+        // (different head_dim — 128 vs 512 — same algorithm). This
+        // test exercises BOTH the structural emission count and the
+        // adapter-boundary numeric content. Compressor weights stay
+        // inert (all zero kv/gate/ape) so the compressor pool emits a
+        // zero row; the indexer-side `comp_kv` carries the identity-
+        // truncation pattern, and `x` is populated at the two lanes
+        // (0 + N_INDEXER_HEAD_DIM) that route into lane c col 0 of
+        // the ratio-4 double-buffer's first window.
         let n_embd = crate::dsv4::shape::DSV4_N_EMBD;
-        // Compressor: all-zero, inert in this test (still must have the
-        // ratio-4 shapes so `compressor_decode_one` matmuls pass).
+        // Compressor: inert. Must still carry ratio-4 shapes so the
+        // compressor kernel's matmuls succeed.
         let comp_width = 2 * DSV4_HEAD_DIM;
         let comp_kv = vec![0.0_f32; comp_width * n_embd];
         let comp_gate = vec![0.0_f32; comp_width * n_embd];
@@ -741,15 +733,19 @@ mod tests {
             ape: crate::dsv4::weight::WeightBlob::F32(&comp_ape),
             norm: &comp_norm,
         };
-        // Indexer weights: six-tensor bundle (shapes matching upstream).
-        // All-zero is fine because F011 owns the algorithm; this test
-        // only checks the cache-append plumbing.
+        // Indexer weights — identity-truncation on the first
+        // `index_width = 256` lanes of `comp_kv`, so the kernel's kv
+        // matmul produces `kv_cur[o] = x[o]` for `o < index_width`.
+        // Everything else stays zero/ones.
         let index_width = 2 * DSV4_N_INDEXER_HEAD_DIM; // 256
         let idx_attn_q_b =
             vec![0.0_f32; crate::dsv4::shape::DSV4_N_LORA_Q * crate::dsv4::shape::DSV4_N_INDEXER_HEAD * DSV4_N_INDEXER_HEAD_DIM];
         let idx_proj = vec![0.0_f32; n_embd * crate::dsv4::shape::DSV4_N_INDEXER_HEAD];
         let idx_comp_ape = vec![0.0_f32; index_width * 4];
-        let idx_comp_kv = vec![0.0_f32; n_embd * index_width];
+        let mut idx_comp_kv = vec![0.0_f32; n_embd * index_width];
+        for o in 0..index_width {
+            idx_comp_kv[o * n_embd + o] = 1.0;
+        }
         let idx_comp_gate = vec![0.0_f32; n_embd * index_width];
         let idx_comp_norm = vec![1.0_f32; DSV4_N_INDEXER_HEAD_DIM];
         let indexer_weights_bundle = IndexerWeights {
@@ -780,14 +776,28 @@ mod tests {
             // test — `pos` must advance 0..4 within the batch).
             let q = vec![0.0_f32; 4 * DSV4_N_HEAD * DSV4_HEAD_DIM];
             let kv = vec![1.0_f32; 4 * DSV4_HEAD_DIM];
-            let x = vec![0.0_f32; 4 * n_embd];
+            // Populate x at lane 0 + lane N_INDEXER_HEAD_DIM so the
+            // ratio-4 dual-buffer's lane c col 0 picks up `t+1` on the
+            // first emission window. Lane p reads default-init rows on
+            // the first window, so we have to feed lane c specifically.
+            let mut x = vec![0.0_f32; 4 * n_embd];
+            for t in 0..4 {
+                x[t * n_embd] = (t as f32) + 1.0;
+                x[t * n_embd + DSV4_N_INDEXER_HEAD_DIM] = (t as f32) + 1.0;
+            }
             let mut out = vec![0.0_f32; 4 * DSV4_N_HEAD * DSV4_HEAD_DIM];
             attn.run_layer(&q, &kv, &x, 2, &mut out).unwrap();
         }
         // 4 tokens through a ratio-4 indexer → exactly one emission.
-        // Numeric content is zero until F011.D wires the real algorithm.
         let indexer_pool = cache.layers[2].indexer.as_ref().unwrap();
         assert_eq!(indexer_pool.len(), 1);
+        // Adapter-boundary content check (F011.D): non-zero `x` and
+        // identity `comp_kv` should produce a non-zero emitted row.
+        let row = &indexer_pool.rows()[..DSV4_N_INDEXER_HEAD_DIM];
+        assert!(
+            row.iter().any(|&v| v.abs() > 1e-4),
+            "expected at least one non-zero lane in emitted indexer row, got all-zero"
+        );
     }
 
     #[test]

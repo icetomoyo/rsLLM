@@ -20,7 +20,7 @@ use crate::Error;
 use super::compressed::CompressedKvPool;
 use super::indexer::IndexerPool;
 use super::shape::{
-    DSV4_HEAD_DIM, DSV4_N_INDEXER_HEAD_DIM, DSV4_N_LAYER, DSV4_N_SWA, layer_compress_ratio,
+    DSV4_HEAD_DIM, DSV4_N_LAYER, DSV4_N_SWA, layer_compress_ratio,
     layer_has_indexer,
 };
 use super::swa::RawSwaRing;
@@ -108,28 +108,21 @@ impl LayerCache {
 ///
 /// `kv_latent` is the per-token MLA KV latent (`HEAD_DIM = 512` lanes).
 ///
-/// **Compressor pool update was moved out of `append_layer` in F011.C.**
-/// The compressor is now a stateful per-token pipeline owned by
-/// `rsllm_models::dsv4::compressor::compressor_decode_one`, which
-/// reaches into `layer.compressed` directly via its own scratch
-/// (`kv_cur` / `sc_cur` / `ape_col`) and the wide-row
-/// [`super::compressed::CompressedKvPool::accumulate_wide`] API. The
-/// caller must invoke that function before (or after, but
-/// consistently) calling `append_layer` for the same token; this
-/// struct no longer carries a `compress_score` field.
+/// **Both the compressor pool and the indexer pool are NO LONGER
+/// touched here.** They moved to stateful per-token pipelines owned by
+/// `rsllm_models::dsv4::compressor::compressor_decode_one`:
+/// - F011.C migrated the attention compressor.
+/// - F011.D migrated the indexer compressor (same kernel, indexer
+///   pool, smaller `head_dim`).
 ///
-/// `indexer_kv` and `indexer_score` populate the indexer pool, both
-/// length `N_INDEXER_HEAD_DIM = 128`. Pass `None` to skip (also fine
-/// on non-indexer layers). F011.D will move these out of `LayerAppend`
-/// the same way once the stateful indexer pipeline lands.
+/// The caller must invoke `compressor_decode_one` once per token for
+/// each pool that exists on the layer before (or after, but
+/// consistently) calling `append_layer` for that same token. This
+/// struct now carries only the SWA-ring input.
 #[derive(Debug, Clone, Copy)]
 pub struct LayerAppend<'a> {
     /// Required: `HEAD_DIM` lanes, the per-token KV latent for the SWA ring.
     pub kv_latent: &'a [f32],
-    /// Optional: per-token indexer KV row (`N_INDEXER_HEAD_DIM` lanes).
-    pub indexer_kv: Option<&'a [f32]>,
-    /// Optional: per-dim score for the indexer compressed pool.
-    pub indexer_score: Option<&'a [f32]>,
 }
 
 /// Top-level cache: 43 layer caches, current cursor, layer compress ratios.
@@ -173,17 +166,14 @@ impl ThreeTierKvCache {
         self.ctx_size
     }
 
-    /// Append one token's contribution to layer `il`'s SWA ring and
-    /// (if present) indexer pool.
+    /// Append one token's contribution to layer `il`'s SWA ring.
     ///
-    /// Writes the kv_latent to the SWA ring unconditionally. If the
-    /// layer has an indexer, accumulates `indexer_kv` + `indexer_score`
-    /// into the indexer pool.
+    /// Writes the kv_latent to the SWA ring unconditionally.
     ///
-    /// **The compressor pool is NOT touched here** (F011.C). Callers
-    /// must invoke `compressor_decode_one` (in `rsllm_models::dsv4::
-    /// compressor`) separately to update the compressor pool for
-    /// compressed layers.
+    /// **Neither the compressor pool nor the indexer pool is touched
+    /// here** (F011.C / F011.D). Callers must invoke
+    /// `compressor_decode_one` (in `rsllm_models::dsv4::compressor`)
+    /// separately on each pool present on the layer.
     ///
     /// **Does not** advance `current_pos`; call [`Self::advance_pos`]
     /// after appending to all layers for the same token. This split
@@ -203,24 +193,11 @@ impl ThreeTierKvCache {
         }
         let layer = &mut self.layers[il];
 
-        // 1. Always write to the SWA ring.
+        // Only the SWA ring is driven from append_layer now. The
+        // compressor + indexer pools each have their own stateful
+        // per-token pipeline (compressor_decode_one) owned by
+        // `rsllm-models`.
         layer.swa.append(input.kv_latent)?;
-
-        // 2. Indexer pool (if present).
-        if let Some(idx_pool) = layer.indexer.as_mut() {
-            let idx_kv = input.indexer_kv.ok_or(Error::ShapeMismatch {
-                what: "ThreeTierKvCache::append_layer: missing indexer_kv for ratio-4 layer",
-                expected: DSV4_N_INDEXER_HEAD_DIM,
-                actual: 0,
-            })?;
-            let idx_score = input.indexer_score.ok_or(Error::ShapeMismatch {
-                what: "ThreeTierKvCache::append_layer: missing indexer_score for ratio-4 layer",
-                expected: DSV4_N_INDEXER_HEAD_DIM,
-                actual: 0,
-            })?;
-            idx_pool.accumulate(idx_kv, idx_score)?;
-        }
-
         Ok(())
     }
 
@@ -265,9 +242,6 @@ mod tests {
     fn const_kv(v: f32) -> Vec<f32> {
         vec![v; DSV4_HEAD_DIM]
     }
-    fn const_indexer_kv(v: f32) -> Vec<f32> {
-        vec![v; DSV4_N_INDEXER_HEAD_DIM]
-    }
 
     #[test]
     fn new_cache_has_n_layer_blocks() {
@@ -309,58 +283,25 @@ mod tests {
         let mut cache = ThreeTierKvCache::new(64);
         let kv = const_kv(7.0);
         cache
-            .append_layer(
-                0,
-                LayerAppend {
-                    kv_latent: &kv,
-                    indexer_kv: None,
-                    indexer_score: None,
-                },
-            )
+            .append_layer(0, LayerAppend { kv_latent: &kv })
             .unwrap();
         assert_eq!(cache.layers[0].swa.len(), 1);
     }
 
     #[test]
-    fn append_layer_to_ratio4_needs_indexer_inputs() {
+    fn append_layer_to_ratio4_writes_swa_only() {
+        // F011.D: `append_layer` no longer touches the indexer pool —
+        // the indexer is driven by `compressor_decode_one` in the model
+        // crate. So a ratio-4 append carries only kv_latent and must
+        // succeed regardless of any indexer state.
         let mut cache = ThreeTierKvCache::new(64);
         let kv = const_kv(0.5);
-        // Missing indexer_kv/score should error. The compressor pool is
-        // no longer touched by `append_layer`, so the test only
-        // exercises the indexer-missing branch.
-        let err = cache
-            .append_layer(
-                2,
-                LayerAppend {
-                    kv_latent: &kv,
-                    indexer_kv: None,
-                    indexer_score: None,
-                },
-            )
-            .unwrap_err();
-        assert!(matches!(err, Error::ShapeMismatch { .. }));
-    }
-
-    #[test]
-    fn append_layer_full_ratio4_succeeds() {
-        let mut cache = ThreeTierKvCache::new(64);
-        let kv = const_kv(0.5);
-        let idx_kv = const_indexer_kv(0.3);
-        let idx_score = const_indexer_kv(0.0);
         cache
-            .append_layer(
-                2,
-                LayerAppend {
-                    kv_latent: &kv,
-                    indexer_kv: Some(&idx_kv),
-                    indexer_score: Some(&idx_score),
-                },
-            )
+            .append_layer(2, LayerAppend { kv_latent: &kv })
             .unwrap();
         assert_eq!(cache.layers[2].swa.len(), 1);
-        // Compressor pool stays empty — `append_layer` no longer writes it.
+        // Neither pool is touched.
         assert_eq!(cache.layers[2].compressed.as_ref().unwrap().len(), 0);
-        // Indexer first token → no emission yet (need 4 to fire boundary).
         assert_eq!(cache.layers[2].indexer.as_ref().unwrap().len(), 0);
     }
 
@@ -393,14 +334,7 @@ mod tests {
         let mut cache = ThreeTierKvCache::new(64);
         let kv = const_kv(0.0);
         let err = cache
-            .append_layer(
-                99,
-                LayerAppend {
-                    kv_latent: &kv,
-                    indexer_kv: None,
-                    indexer_score: None,
-                },
-            )
+            .append_layer(99, LayerAppend { kv_latent: &kv })
             .unwrap_err();
         assert!(matches!(err, Error::InvalidLayer { .. }));
     }
@@ -410,14 +344,7 @@ mod tests {
         let mut cache = ThreeTierKvCache::new(64);
         let kv = const_kv(1.0);
         cache
-            .append_layer(
-                0,
-                LayerAppend {
-                    kv_latent: &kv,
-                    indexer_kv: None,
-                    indexer_score: None,
-                },
-            )
+            .append_layer(0, LayerAppend { kv_latent: &kv })
             .unwrap();
         cache.advance_pos(1);
         assert_eq!(cache.current_pos(), 1);
