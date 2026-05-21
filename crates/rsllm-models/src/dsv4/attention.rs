@@ -28,6 +28,7 @@
 //! Line numbers pinned to ds4 commit `ef0a490` (2026-05-17).
 
 use rsllm_backend_cpu::SimdTier;
+use rsllm_backend_cpu::ops::rope::{RoPEParams, rope_yarn_tail};
 use rsllm_kvcache::dsv4::shape::{
     DSV4_HEAD_DIM as KV_HEAD_DIM, DSV4_N_INDEXER_HEAD, DSV4_N_INDEXER_HEAD_DIM, DSV4_N_INDEXER_TOP_K,
     DSV4_N_LAYER,
@@ -39,7 +40,9 @@ use crate::dsv4::compressor::{
     CompressorWeights, IndexerWeights, compressor_decode_one,
 };
 use crate::dsv4::indexer::{project_indexer_query, project_indexer_weights};
-use crate::dsv4::shape::{DSV4_HEAD_DIM, DSV4_N_EMBD, DSV4_N_HEAD, DSV4_N_LORA_Q};
+use crate::dsv4::shape::{
+    DSV4_HEAD_DIM, DSV4_N_EMBD, DSV4_N_HEAD, DSV4_N_LORA_Q, DSV4_N_ROT, DSV4_ROPE_FREQ_BASE,
+};
 
 /// Maximum compressor `width = coff * head_dim` across all DS V4 Flash
 /// layers. Ratio-4 layers use `coff = 2` → `width = 1024`; ratio-128
@@ -630,13 +633,52 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
                     }
                 }
             }
-            // TODO(F011.E.C): on ratio-4 layers, apply the indexer
-            // top-K mask to the compressed sweep (currently all
-            // compressed rows participate; top-K turns this O(n_comp)
-            // into O(K=512)).
+
+            // 3. F011.E.D: inverse RoPE tail rotation on the per-head
+            //    attention output. MLA's absorbed form has K = V (both
+            //    drawn from the same RoPE-rotated KV latent), so the
+            //    attention output `softmax(Q·K) · V` carries the K's
+            //    RoPE encoding; the downstream `attn_output_a/b`
+            //    projection expects un-rotated input. Mirror
+            //    `ds4.c:7163`:
+            //    ```c
+            //    rope_tail_layer_inplace(heads, N_HEAD, HEAD_DIM, N_ROT,
+            //                            pos, il, true);  // inverse=true
+            //    ```
+            let out_t = &mut attn_out[t * q_stride..(t + 1) * q_stride];
+            let inverse_params = inverse_rope_params(pos);
+            rope_yarn_tail(out_t, &inverse_params, self.tier).map_err(|e| {
+                Error::ShapeMismatch {
+                    key: "ThreeTierAttention::run_layer.inverse_rope",
+                    expected: "valid RoPE inverse tail rotation".to_string(),
+                    actual: format!("{e}"),
+                }
+            })?;
         }
 
         Ok(())
+    }
+}
+
+/// RoPE params for the per-token Q output inverse rotation
+/// (F011.E.D). Standard MLA regime (freq_base = 10000, no YaRN ramp),
+/// over `N_HEAD = 64` heads of `HEAD_DIM = 512` each, rotating the
+/// trailing `N_ROT = 64` lanes in the inverse direction so the
+/// downstream `attn_output_a/b` projection sees an un-rotated input.
+fn inverse_rope_params(pos: u32) -> RoPEParams {
+    RoPEParams {
+        n_head: DSV4_N_HEAD as u32,
+        head_dim: DSV4_HEAD_DIM as u32,
+        n_rot: DSV4_N_ROT as u32,
+        pos,
+        n_ctx_orig: 65_536,
+        freq_base: DSV4_ROPE_FREQ_BASE,
+        freq_scale: 1.0,
+        ext_factor: 0.0,
+        attn_factor: 1.0,
+        beta_fast: 32.0,
+        beta_slow: 1.0,
+        inverse: true,
     }
 }
 
@@ -681,15 +723,65 @@ mod tests {
         let q = make_q(2, 0.0); // uniform → softmax averages keys
         let mut out = vec![0.0_f32; 2 * DSV4_N_HEAD * DSV4_HEAD_DIM];
         attn.run_layer(&q, &kv, &make_x(kv.len() / DSV4_HEAD_DIM), &[], 0, &mut out).unwrap();
-        // Token 0 attends only to itself (value 1.0).
+        // F011.E.D: inverse RoPE rotates the trailing N_ROT = 64 lanes
+        // of each head, so only the first head_dim - N_ROT = 448 lanes
+        // (the non-rotated prefix) hold the raw weighted-sum result.
+        let n_nope = DSV4_HEAD_DIM - DSV4_N_ROT;
+        // Token 0 attends only to itself (value 1.0) — pos=0 makes the
+        // RoPE rotation an identity, so all lanes hold 1.0.
         for &v in out.iter().take(DSV4_HEAD_DIM) {
             assert!((v - 1.0).abs() < 1e-5);
         }
-        // Token 1 attends uniformly to {1.0, 2.0} → mean 1.5.
+        // Token 1 attends uniformly to {1.0, 2.0} → mean 1.5. The
+        // first 448 (non-rotated) lanes hold 1.5 verbatim; the last
+        // 64 (rotated) lanes are RoPE-shuffled mixes of consecutive
+        // pairs of 1.5s, so we only assert on the non-rotated prefix.
         let stride = DSV4_N_HEAD * DSV4_HEAD_DIM;
-        for (d, &v) in out[stride..stride + DSV4_HEAD_DIM].iter().enumerate() {
+        for (d, &v) in out[stride..stride + DSV4_HEAD_DIM]
+            .iter()
+            .enumerate()
+            .take(n_nope)
+        {
             assert!((v - 1.5).abs() < 1e-5, "token 1 head 0 dim {d} = {v}");
         }
+    }
+
+    #[test]
+    fn run_layer_inverse_rope_perturbs_only_tail_lanes_for_positive_pos() {
+        // F011.E.D: the post-sweep inverse RoPE rotates the trailing
+        // `N_ROT = 64` lanes of each head. Lanes `[0, head_dim - N_ROT)
+        // = [0, 448)` are the non-rotated prefix and stay verbatim;
+        // lanes `[448, 512)` are pairwise mixed by `cos/sin` at the
+        // current token position.
+        //
+        // Strategy: drive two tokens through layer 0 with Q=0 and a
+        // constant KV. Token 1 sits at pos=1 (non-trivial RoPE
+        // angle). Verify:
+        // - Prefix lanes equal the unrotated mean (no surprise).
+        // - At least one trailing lane is NOT equal to that mean
+        //   (RoPE actually fired).
+        let mut cache = ThreeTierKvCache::new(32);
+        let mut attn = ThreeTierAttention::new(&mut cache);
+        let mut kv = vec![0.0_f32; 2 * DSV4_HEAD_DIM];
+        for d in 0..DSV4_HEAD_DIM {
+            kv[d] = 1.0;
+            kv[DSV4_HEAD_DIM + d] = 1.0;
+        }
+        let q = make_q(2, 0.0);
+        let mut out = vec![0.0_f32; 2 * DSV4_N_HEAD * DSV4_HEAD_DIM];
+        attn.run_layer(&q, &kv, &make_x(2), &[], 0, &mut out).unwrap();
+        let stride = DSV4_N_HEAD * DSV4_HEAD_DIM;
+        let head1 = &out[stride..stride + DSV4_HEAD_DIM]; // token 1, head 0
+        let n_nope = DSV4_HEAD_DIM - DSV4_N_ROT;
+        // Prefix: untouched.
+        for &v in head1.iter().take(n_nope) {
+            assert!((v - 1.0).abs() < 1e-5);
+        }
+        // Tail: at least one lane has rotated away from 1.0.
+        let any_rotated = head1[n_nope..]
+            .iter()
+            .any(|&v| (v - 1.0).abs() > 1e-3);
+        assert!(any_rotated, "expected inverse RoPE to perturb at least one tail lane");
     }
 
     #[test]
