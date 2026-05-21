@@ -178,12 +178,21 @@ impl<'a> IndexerWeights<'a> {
 ///    rotation at position `comp_pos = pos + 1 - ratio` with the
 ///    upstream compressed-layer parameters
 ///    (`freq_base = DSV4_COMPRESS_ROPE_FREQ_BASE`, ramped YaRN).
-/// 5. **TODO(F011.fp8):** the attention compressor (head_dim = 512)
-///    additionally runs `dsv4_fp8_kv_quantize_row_inplace_cpu`
-///    (`ds4.c:6500`) on the post-RoPE row. That kernel has no Rust
-///    equivalent yet; the row stays at full f32 precision until
-///    F011.fp8 lands. This is a known numerical divergence vs ds4.c
-///    that affects attention-side scoring but not crash safety.
+/// 5. **TODO(F012):** the post-RoPE row goes through a per-head
+///    quantisation-aware transform that depends on `head_dim`.
+///
+///    - `head_dim == DSV4_HEAD_DIM = 512` (attention compressor):
+///      `dsv4_fp8_kv_quantize_row_inplace_cpu(row, head_dim, N_ROT)`
+///      per `ds4.c:6583`.
+///    - `head_dim == DSV4_N_INDEXER_HEAD_DIM = 128` (indexer compressor):
+///      `dsv4_indexer_qat_row_inplace_cpu(row, head_dim)` per
+///      `ds4.c:6585` — a Hadamard-128 + FP4 act quant pair
+///      (`ds4.c:1677-1709`).
+///
+///    Neither kernel has a Rust equivalent yet; the row stays at full
+///    f32 precision until F012 lands. This is a known numerical
+///    divergence vs ds4.c that affects attention-side scoring + indexer
+///    top-K selection but NOT crash safety.
 ///
 /// Returns `true` when an emission fired on this token, `false`
 /// otherwise. Callers reading from `pool.rows()` should call this
@@ -310,12 +319,17 @@ pub fn compressor_decode_one(
             actual: format!("{e}"),
         })?;
 
-        // TODO(F011.fp8): attention compressor (head_dim ==
-        // DSV4_HEAD_DIM = 512) additionally runs
-        // `dsv4_fp8_kv_quantize_row_inplace_cpu(row, head_dim, DSV4_N_ROT)`
-        // here per `ds4.c:6498-6501`. No Rust equivalent yet — the row
-        // stays at full f32 precision. The indexer compressor
-        // (head_dim = 128) skips this step upstream too.
+        // TODO(F012): post-RoPE QAT step, dispatched by head_dim:
+        //   - head_dim == DSV4_HEAD_DIM = 512 (attention compressor):
+        //     `dsv4_fp8_kv_quantize_row_inplace_cpu(row, head_dim, DSV4_N_ROT)`
+        //     per `ds4.c:6583`.
+        //   - head_dim == DSV4_N_INDEXER_HEAD_DIM = 128 (indexer
+        //     compressor): `dsv4_indexer_qat_row_inplace_cpu(row, head_dim)`
+        //     per `ds4.c:6585` — Hadamard-128 + FP4 act quant pair
+        //     (`ds4.c:1677-1709`).
+        // Both kernels are missing in v0.1.0; the row stays at full f32
+        // precision until F012 lands. Known numerical divergence vs
+        // ds4.c; affects scoring quality, not crash safety.
         return Ok(true);
     }
 

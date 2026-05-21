@@ -24,7 +24,10 @@
 use rsllm_backend_cpu::SimdTier;
 use rsllm_backend_cpu::ops::{RoPEParams, rmsnorm, rope_yarn_tail};
 
-use super::shape::{DSV4_HEAD_DIM, DSV4_N_EMBD, DSV4_N_HEAD, DSV4_N_LORA_Q, DSV4_N_ROT, DSV4_RMS_EPS};
+use super::shape::{
+    DSV4_HEAD_DIM, DSV4_N_EMBD, DSV4_N_HEAD, DSV4_N_LORA_Q, DSV4_N_ROT, DSV4_RMS_EPS,
+    DSV4_ROPE_ORIG_CTX,
+};
 use super::weight::{WeightBlob, matmul_weight_f32};
 use crate::Error;
 
@@ -252,7 +255,7 @@ fn rope_params_at(pos: u32, n_head: u32) -> RoPEParams {
         pos,
         // DS V4 Flash's original context length. ds4.c:104 fixes this at
         // 65536; YaRN extrapolation lets us run beyond it.
-        n_ctx_orig: 65_536,
+        n_ctx_orig: DSV4_ROPE_ORIG_CTX,
         freq_base: super::shape::DSV4_ROPE_FREQ_BASE,
         freq_scale: 1.0,
         // ext_factor = 0 disables the YaRN ramp; v0.1.0 ships the

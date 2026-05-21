@@ -200,9 +200,22 @@ impl<'engine, 'gguf: 'engine> DsV4FlashSession<'engine, 'gguf> {
             let loras = self.engine.collect_layer_loras();
             let mut attn =
                 ThreeTierAttention::with_loras(&mut self.cache, &loras).with_tier(tier);
+            // F011.E review fix: replace the `position_offset as u32`
+            // truncating cast with a checked conversion. The earlier
+            // F011.C cast guard in `run_layer` would also catch this,
+            // but doing the check at the call site keeps `engine_impl`
+            // self-contained instead of depending on a downstream
+            // adapter's invariant. Token positions cannot exceed
+            // `u32::MAX = ~4.29B` in a v0.1.0 deployment, but the
+            // explicit guard documents the limit.
+            let pos_off: u32 =
+                u32::try_from(position_offset).map_err(|_| EngineError::ShapeMismatch {
+                    what: "DsV4FlashSession::forward_pass.position_offset".into(),
+                    expected: format!("<= {}", u32::MAX),
+                    actual: format!("{position_offset}"),
+                })?;
             for il in 0..DSV4_N_LAYER {
                 let block = &self.engine.model.blocks[il];
-                let pos_off = position_offset as u32;
                 let mut closure =
                     |q: &[f32],
                      kv: &[f32],

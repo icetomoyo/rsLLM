@@ -13,16 +13,21 @@
 //!    the adapter's per-token scratch buffers (sequential, never
 //!    concurrent). Without weights, each pool stays empty (F006
 //!    zero-placeholder semantics).
-//! 2. Compute MLA-absorbed attention against the cached SWA window:
-//!    for each head `h ∈ [0, N_HEAD)`, softmax(Q_h · KV_k^T / √d) · KV_k.
-//!    Compressed-pool and indexer-selected rows are *additional* keys
-//!    that decode would attend to — those are wired here as a `TODO(F008)`
-//!    extension; F006's contract is the cache plumbing.
+//! 2. Mixed attention sweep over SWA + compressed pool + (on ratio-4
+//!    layers) indexer top-K-filtered compressed rows. Per-head:
+//!    softmax(Q_h · K_k^T / √d) · K_k with `attn_sinks[h]` folded in
+//!    as a virtual key contributing only to the denominator
+//!    (`ds4.c:6700-6760` `layer_attention_mixed_one`). When indexer
+//!    weights + non-empty `qr_norm` are supplied (F011.E.C), the
+//!    long-history loop is restricted to the indexer's top-K = 512
+//!    most relevant compressed rows; otherwise every compressed row
+//!    participates.
 //!
-//! The attention sink (per-head virtual logit, `attn_sinks [N_HEAD]`)
-//! is **not** applied here — it modifies the softmax denominator only,
-//! and the absorbed-form weight stays separate from the cache itself.
-//! That detail is consumed at the post-projection stage in F008.
+//! 3. Inverse RoPE tail rotation on the per-head attention output
+//!    (`ds4.c:7163`). MLA's absorbed form re-uses the same RoPE-
+//!    rotated KV latent as both K and V, so `softmax(Q·K)·V` carries
+//!    K's RoPE encoding; the downstream `attn_output_a/b` projection
+//!    expects an un-rotated input.
 //!
 //! Ported by reference from `ds4.c:6310-6371` (MIT, The ds4.c authors).
 //! Line numbers pinned to ds4 commit `ef0a490` (2026-05-17).
@@ -42,6 +47,7 @@ use crate::dsv4::compressor::{
 use crate::dsv4::indexer::{project_indexer_query, project_indexer_weights};
 use crate::dsv4::shape::{
     DSV4_HEAD_DIM, DSV4_N_EMBD, DSV4_N_HEAD, DSV4_N_LORA_Q, DSV4_N_ROT, DSV4_ROPE_FREQ_BASE,
+    DSV4_ROPE_ORIG_CTX,
 };
 
 /// Maximum compressor `width = coff * head_dim` across all DS V4 Flash
@@ -490,6 +496,16 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
                 .compressed
                 .as_ref()
                 .map_or(&[][..], |p| p.rows());
+            // F011.E review fix: document the alignment invariant that
+            // `CompressedKvPool::rows()` returns `[n_comp × head_dim]`
+            // row-major (where `head_dim = DSV4_HEAD_DIM = 512`). The
+            // pool itself maintains this — it only appends whole rows
+            // post-RMSNorm — so the integer division is exact.
+            debug_assert!(
+                comp_rows.len().is_multiple_of(head_dim),
+                "CompressedKvPool::rows() must return a multiple of head_dim ({head_dim}); got len={}",
+                comp_rows.len()
+            );
             let n_comp = comp_rows.len() / head_dim;
             let n_keys = n_raw + n_comp;
             if n_keys == 0 {
@@ -604,7 +620,13 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
                     *l = (*l - max_logit).exp();
                     denom += *l;
                 }
-                if denom == 0.0 {
+                // F011.E review fix (security-review MEDIUM): catch
+                // NaN-laced inputs. A single NaN logit propagates as
+                // `exp(NaN - max) = NaN` into `denom`. Plain `== 0.0`
+                // fails on NaN, so we explicitly reject non-finite
+                // denom. Without this, `inv_denom = 1.0 / NaN = NaN`
+                // contaminates `attn_out` for the affected token+head.
+                if !denom.is_finite() || denom == 0.0 {
                     continue;
                 }
                 let inv_denom = 1.0_f32 / denom;
@@ -619,10 +641,18 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
                 }
                 for c in 0..n_comp {
                     if !comp_allowed(c) {
-                        // F011.E.C: disallowed rows have `logits[c] == 0`
-                        // anyway (exp(-inf - max) == 0), so the skip is
-                        // an optimisation, not a correctness fix. It
-                        // also matches `ds4.c:6747-6748`.
+                        // F011.E.C: disallowed rows had their logit set
+                        // to `-inf` in the score-computation loop above,
+                        // so `(*l - max_logit).exp() == 0` whenever
+                        // `max_logit` is finite (which is the only
+                        // branch we reach here — the all-`-inf` case is
+                        // gated by the `!max_logit.is_finite()` continue
+                        // earlier). Skipping the iteration is an
+                        // optimisation (avoid the zero-weight axpy) +
+                        // a defensive guard against pathological inputs
+                        // that produce a finite `max_logit` but cause
+                        // arithmetic NaN downstream. Matches the
+                        // `ds4.c:6747-6748` skip condition.
                         continue;
                     }
                     let logit = logits[n_raw + c];
@@ -671,7 +701,7 @@ fn inverse_rope_params(pos: u32) -> RoPEParams {
         head_dim: DSV4_HEAD_DIM as u32,
         n_rot: DSV4_N_ROT as u32,
         pos,
-        n_ctx_orig: 65_536,
+        n_ctx_orig: DSV4_ROPE_ORIG_CTX,
         freq_base: DSV4_ROPE_FREQ_BASE,
         freq_scale: 1.0,
         ext_factor: 0.0,
@@ -926,6 +956,34 @@ mod tests {
         let mut out = vec![123.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
         attn.run_layer(&q, &kv, &make_x(kv.len() / DSV4_HEAD_DIM), &[], 0, &mut out).unwrap();
         assert!(out.iter().all(|v| *v == 0.0), "expected all zeros, got {:?}", &out[..4]);
+    }
+
+    #[test]
+    fn run_layer_zeros_output_on_partial_nan_inputs() {
+        // F011.E review fix: when only SOME logits are NaN (e.g. one
+        // SWA dot-product contains NaN-laced weights while the rest
+        // are finite), `max_logit` stays finite and the `!is_finite`
+        // guard does not fire. The post-softmax `denom` then contains
+        // NaN, and the `!denom.is_finite()` check is what rejects the
+        // contaminated token+head. Without that guard,
+        // `inv_denom = 1.0 / NaN = NaN` would leak into `attn_out`.
+        let mut cache = ThreeTierKvCache::new(8);
+        let mut attn = ThreeTierAttention::new(&mut cache);
+        // Two SWA tokens: token 0 has finite KV, token 1 has NaN at
+        // lane 0 (head 0's dot product becomes NaN). Q is uniform.
+        let mut kv = vec![1.0_f32; 2 * DSV4_HEAD_DIM];
+        kv[DSV4_HEAD_DIM] = f32::NAN;
+        let q = make_q(2, 0.1);
+        let mut out = vec![0.0_f32; 2 * DSV4_N_HEAD * DSV4_HEAD_DIM];
+        attn.run_layer(&q, &kv, &make_x(2), &[], 0, &mut out).unwrap();
+        // Token 1, head 0 should be all zeros (NaN-guarded).
+        let stride = DSV4_N_HEAD * DSV4_HEAD_DIM;
+        for &v in &out[stride..stride + DSV4_HEAD_DIM] {
+            assert!(
+                v == 0.0,
+                "expected zero from NaN-guard on partial-NaN logits, got {v}"
+            );
+        }
     }
 
     #[test]

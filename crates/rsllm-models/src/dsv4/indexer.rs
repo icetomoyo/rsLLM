@@ -30,7 +30,7 @@ use rsllm_backend_cpu::ops::rope::{RoPEParams, rope_yarn_tail};
 use super::compressor::IndexerWeights;
 use super::shape::{
     DSV4_N_EMBD, DSV4_N_INDEXER_HEAD, DSV4_N_INDEXER_HEAD_DIM, DSV4_N_LORA_Q, DSV4_N_ROT,
-    DSV4_ROPE_FREQ_BASE,
+    DSV4_ROPE_FREQ_BASE, DSV4_ROPE_ORIG_CTX,
 };
 use super::weight::matmul_weight_f32;
 use crate::Error;
@@ -44,6 +44,16 @@ use crate::Error;
 /// matvec_any(q, model, layer->indexer_attn_q_b, qr_norm);
 /// rope_tail_layer_inplace(q, n_head, head_dim, DS4_N_ROT, pos, il, false);
 /// ```
+///
+/// **TODO(F012): upstream additionally runs**
+/// `dsv4_indexer_qat_rows_inplace_cpu(q, n_head, head_dim)` here
+/// (`ds4.c:6969`), a per-head Hadamard-128 + FP4 quantisation-aware
+/// transform (`ds4.c:1677-1709`). Without it the top-K scoring is
+/// numerically off vs the model's reference graph — but the call
+/// path stays sound. F012 will land the Hadamard + FP4 kernels and
+/// wire them here plus at the indexer compressor pool emission
+/// (`ds4.c:6585`). Until then, `project_indexer_query` returns a
+/// RoPE-only query; expect a measurable drop in top-K precision.
 ///
 /// # Arguments
 /// - `qr_norm` — single token's LoRA-Q post-norm latent, length
@@ -188,7 +198,7 @@ fn indexer_query_rope_params(pos: u32) -> RoPEParams {
         head_dim: DSV4_N_INDEXER_HEAD_DIM as u32,
         n_rot: DSV4_N_ROT as u32,
         pos,
-        n_ctx_orig: 65_536,
+        n_ctx_orig: DSV4_ROPE_ORIG_CTX,
         freq_base: DSV4_ROPE_FREQ_BASE,
         freq_scale: 1.0,
         ext_factor: 0.0,
