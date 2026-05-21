@@ -388,13 +388,23 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
             let append = LayerAppend { kv_latent: kv_row };
             self.cache.append_layer(layer_idx, append)?;
 
-            // 2. Attention over the SWA window. The cache stores rows
-            //    in chronological order (oldest → newest), so iterating
-            //    by `row(idx)` gives the natural attention key order.
+            // 2. Mixed attention sweep — SWA raw keys + (F011.E.B)
+            //    long-history compressed-pool rows, all in the same
+            //    per-head softmax. Mirrors `ds4.c:6700-6760`
+            //    (`layer_attention_mixed_one`). Non-compressed layers
+            //    (dense / ratio-128 with no compressed pool) collapse
+            //    to the SWA-only path equivalent to
+            //    `layer_attention_rows_one` (`ds4.c:4969-5007`).
             let layer = &self.cache.layers[layer_idx];
-            let n_keys = layer.swa.len();
+            let n_raw = layer.swa.len();
+            let comp_rows: &[f32] = layer
+                .compressed
+                .as_ref()
+                .map_or(&[][..], |p| p.rows());
+            let n_comp = comp_rows.len() / head_dim;
+            let n_keys = n_raw + n_comp;
             if n_keys == 0 {
-                // Defensive: append should have written one row already.
+                // Defensive: append should have written one SWA row.
                 for o in &mut attn_out[t * q_stride..(t + 1) * q_stride] {
                     *o = 0.0;
                 }
@@ -402,8 +412,6 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
             }
 
             // Per-head softmax(Q_h · K_k^T) · K_k.
-            // Logits scratch is local — `n_keys ≤ N_SWA = 128`, so we
-            // can afford a small Vec without instrumenting global state.
             //
             // F011.E.A: per-head `attn_sinks` is folded in as a virtual
             // key with `score = sinks[h]` and `value = 0`. It contributes
@@ -414,6 +422,11 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
             // (`layer_attention_rows_one`). When `attn_sinks` is `None`
             // (F006-era placeholder tests) the adapter behaves as if
             // every sink were `-inf`, i.e. no sink contribution.
+            //
+            // F011.E.B: logits is sized for `n_keys = n_raw + n_comp`.
+            // Rows `[0, n_raw)` come from the SWA ring, rows
+            // `[n_raw, n_raw + n_comp)` come from the compressed pool.
+            // Both contribute to the same softmax (single max / denom).
             let sinks = layer_loras.attn_sinks;
             if let Some(s) = sinks
                 && s.len() != n_head
@@ -429,14 +442,26 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
                 let q_h = &q[t * q_stride + h * head_dim..t * q_stride + (h + 1) * head_dim];
                 let sink_h = sinks.map_or(f32::NEG_INFINITY, |s| s[h]);
 
-                // Compute logits.
+                // Compute logits — SWA first, then compressed pool.
                 logits.clear();
                 let mut max_logit = sink_h;
-                for k in 0..n_keys {
+                for k in 0..n_raw {
                     let k_row = layer.swa.row(k)?;
                     let mut dot = 0.0_f32;
                     for d in 0..head_dim {
                         dot += q_h[d] * k_row[d];
+                    }
+                    let l = dot * scale;
+                    if l > max_logit {
+                        max_logit = l;
+                    }
+                    logits.push(l);
+                }
+                for c in 0..n_comp {
+                    let kv = &comp_rows[c * head_dim..(c + 1) * head_dim];
+                    let mut dot = 0.0_f32;
+                    for d in 0..head_dim {
+                        dot += q_h[d] * kv[d];
                     }
                     let l = dot * scale;
                     if l > max_logit {
@@ -455,10 +480,6 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
 
                 // Guard against non-finite max_logit (all-NaN or
                 // sinks=None with all-negative-infinity logits).
-                // Mirrors the equivalent guard in
-                // `CompressedKvPool::per_dim_softmax_aggregate` so a
-                // NaN in upstream weights does not silently propagate
-                // to model logits.
                 if !max_logit.is_finite() {
                     continue;
                 }
@@ -480,19 +501,26 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
                 let inv_denom = 1.0_f32 / denom;
 
                 // Weighted sum into attn_out.
-                for (k, &logit) in logits.iter().enumerate() {
+                for (k, &logit) in logits.iter().enumerate().take(n_raw) {
                     let k_row = layer.swa.row(k)?;
                     let w = logit * inv_denom;
                     for (o, &kv_d) in out_h.iter_mut().zip(k_row.iter()) {
                         *o += w * kv_d;
                     }
                 }
+                for c in 0..n_comp {
+                    let logit = logits[n_raw + c];
+                    let kv = &comp_rows[c * head_dim..(c + 1) * head_dim];
+                    let w = logit * inv_denom;
+                    for (o, &kv_d) in out_h.iter_mut().zip(kv.iter()) {
+                        *o += w * kv_d;
+                    }
+                }
             }
-            // TODO(F011.E.B): also attend to compressed-pool rows
-            // (`layer.compressed.rows()`). F011.E.A wired sinks; B
-            // extends the sweep to the long-history compressed tier.
             // TODO(F011.E.C): on ratio-4 layers, apply the indexer
-            // top-K mask to the compressed sweep.
+            // top-K mask to the compressed sweep (currently all
+            // compressed rows participate; top-K turns this O(n_comp)
+            // into O(K=512)).
         }
 
         Ok(())
@@ -606,6 +634,64 @@ mod tests {
             err,
             Error::ShapeMismatch { key, .. } if key == "ThreeTierAttention::run_layer.attn_sinks"
         ));
+    }
+
+    #[test]
+    fn run_layer_attends_to_compressed_pool_rows() {
+        // F011.E.B: with a pre-populated compressed pool whose lane 0
+        // is non-zero, the attention output must reflect that
+        // compressed contribution alongside the SWA window. Strategy:
+        // 1. Push a row into the compressed pool directly via the
+        //    pool API (bypassing `compressor_decode_one` so the test
+        //    stays focused on the SWEEP side, not the kernel side —
+        //    F011.B/C/D tests already cover the kernel).
+        // 2. Run `run_layer` on a ratio-4 layer with Q = unit vector
+        //    on lane 0 (so head 0 sees a non-zero dot with the
+        //    compressed pool's lane-0-non-zero row).
+        // 3. Verify head 0 lane 0 of the output is non-zero AND the
+        //    output differs from the SWA-only baseline.
+        let mut cache = ThreeTierKvCache::new(64);
+        // Pre-seed compressed pool on layer 2 with a single emitted row
+        // that has lane 0 = 7.0.
+        {
+            let pool = cache.layers[2].compressed.as_mut().unwrap();
+            let head_dim = DSV4_HEAD_DIM;
+            let mut kv_seed = vec![0.0_f32; head_dim];
+            kv_seed[0] = 7.0;
+            // Push the row via the head_dim-wide `accumulate` placeholder
+            // — it stores into the upper-half state for ratio-4 and
+            // emits on the 4th call.
+            for _ in 0..4 {
+                let _ = pool.accumulate(&kv_seed, &vec![0.0_f32; head_dim]);
+            }
+            assert_eq!(pool.len(), 1);
+        }
+        // Now run the layer with Q[head=0, lane=0] = 1.0, all else 0,
+        // and an SWA row of zeros (kv=0). The SWA contribution is
+        // dot(q, 0) = 0; the compressed row contributes dot(q, [7,0,...]) = 7
+        // for head 0 only. Without sinks, softmax over {SWA row=0,
+        // compressed row=7} concentrates mass on the compressed row.
+        let mut q = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
+        q[0] = 1.0;
+        let kv = vec![0.0_f32; DSV4_HEAD_DIM];
+        let mut out = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
+        let mut attn = ThreeTierAttention::new(&mut cache);
+        attn.run_layer(&q, &kv, &make_x(1), 2, &mut out).unwrap();
+        // Head 0 lane 0: weight on compressed row ≈ exp(7/sqrt(512)) /
+        // (exp(0) + exp(7/sqrt(512))) ≈ 0.5765; value at lane 0 = 7.0.
+        // So out[head=0, lane=0] ≈ 0.5765 * 7.0 ≈ 4.04.
+        let head0_lane0 = out[0];
+        assert!(
+            head0_lane0 > 1.0,
+            "head 0 lane 0 = {head0_lane0}, expected significant compressed-pool contribution"
+        );
+        // Heads 1+ have Q=0 so attention is uniform over {SWA=0, comp};
+        // value at lane 0 = 0.5 * 0 + 0.5 * 7 = 3.5.
+        let head1_lane0 = out[DSV4_HEAD_DIM];
+        assert!(
+            (head1_lane0 - 3.5).abs() < 1e-4,
+            "head 1 lane 0 = {head1_lane0}, expected ≈ 3.5"
+        );
     }
 
     #[test]
