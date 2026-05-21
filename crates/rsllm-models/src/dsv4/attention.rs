@@ -67,14 +67,21 @@ fn check_scratch_width(width: usize, kind: &'static str) -> Result<(), Error> {
 }
 
 /// Per-layer LoRA bundle the adapter borrows to produce real
-/// compress / indexer scores from the residual stream `x`. A `None`
-/// entry on any sub-field means "use placeholder zeros for that
-/// signal" — useful for partial wiring and for the F006-era tests
-/// that don't yet hand in real weights.
+/// compress / indexer scores from the residual stream `x` and feed the
+/// attention softmax. A `None` entry on any sub-field means "use
+/// placeholder zeros for that signal" — useful for partial wiring and
+/// for the F006-era tests that don't yet hand in real weights.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LayerLoRAs<'a> {
     pub compressor: Option<&'a CompressorWeights<'a>>,
     pub indexer: Option<&'a IndexerWeights<'a>>,
+    /// Per-head attention sink logits, `[N_HEAD] = [64]` F32. Added as
+    /// a virtual key to the per-head softmax (`ds4.c:6710-6711` and
+    /// `:4976-4977`); contributes only to the denominator and to the
+    /// `max_score` discovery loop. When `None` the adapter falls back
+    /// to no sink (F006 behaviour), which deviates numerically from
+    /// upstream but keeps the placeholder tests passing.
+    pub attn_sinks: Option<&'a [f32]>,
 }
 
 /// Stateful adapter that satisfies F005's [`crate::AttentionFn`] surface
@@ -397,13 +404,34 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
             // Per-head softmax(Q_h · K_k^T) · K_k.
             // Logits scratch is local — `n_keys ≤ N_SWA = 128`, so we
             // can afford a small Vec without instrumenting global state.
+            //
+            // F011.E.A: per-head `attn_sinks` is folded in as a virtual
+            // key with `score = sinks[h]` and `value = 0`. It contributes
+            // to the softmax denominator and to the running `max_score`
+            // discovery, but the zero value makes its `weight * value`
+            // term drop out of the numerator. Mirrors `ds4.c:6710-6711`
+            // (`layer_attention_mixed_one`) and `:4976-4977`
+            // (`layer_attention_rows_one`). When `attn_sinks` is `None`
+            // (F006-era placeholder tests) the adapter behaves as if
+            // every sink were `-inf`, i.e. no sink contribution.
+            let sinks = layer_loras.attn_sinks;
+            if let Some(s) = sinks
+                && s.len() != n_head
+            {
+                return Err(Error::ShapeMismatch {
+                    key: "ThreeTierAttention::run_layer.attn_sinks",
+                    expected: format!("{n_head}"),
+                    actual: format!("{}", s.len()),
+                });
+            }
             let mut logits = Vec::with_capacity(n_keys);
             for h in 0..n_head {
                 let q_h = &q[t * q_stride + h * head_dim..t * q_stride + (h + 1) * head_dim];
+                let sink_h = sinks.map_or(f32::NEG_INFINITY, |s| s[h]);
 
                 // Compute logits.
                 logits.clear();
-                let mut max_logit = f32::NEG_INFINITY;
+                let mut max_logit = sink_h;
                 for k in 0..n_keys {
                     let k_row = layer.swa.row(k)?;
                     let mut dot = 0.0_f32;
@@ -425,20 +453,29 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
                     *o = 0.0;
                 }
 
-                // Guard against non-finite max_logit (all-NaN or all
-                // negative-infinity inputs). Mirrors the equivalent
-                // guard in `CompressedKvPool::per_dim_softmax_aggregate`
-                // so a NaN in upstream weights does not silently
-                // propagate to model logits.
+                // Guard against non-finite max_logit (all-NaN or
+                // sinks=None with all-negative-infinity logits).
+                // Mirrors the equivalent guard in
+                // `CompressedKvPool::per_dim_softmax_aggregate` so a
+                // NaN in upstream weights does not silently propagate
+                // to model logits.
                 if !max_logit.is_finite() {
                     continue;
                 }
 
-                // Softmax (numerically stable).
-                let mut denom = 0.0_f32;
+                // Softmax (numerically stable). Sink contributes to
+                // `denom` only (its value is implicitly 0).
+                let mut denom = if sink_h.is_finite() {
+                    (sink_h - max_logit).exp()
+                } else {
+                    0.0_f32
+                };
                 for l in logits.iter_mut() {
                     *l = (*l - max_logit).exp();
                     denom += *l;
+                }
+                if denom == 0.0 {
+                    continue;
                 }
                 let inv_denom = 1.0_f32 / denom;
 
@@ -451,10 +488,11 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
                     }
                 }
             }
-            // TODO(F008): also attend to compressed-pool rows and (on
-            // ratio-4 layers) indexer-selected rows. Placeholder scores
-            // make those tiers numerically inert today, but the cache
-            // is being populated so the wiring is exercised.
+            // TODO(F011.E.B): also attend to compressed-pool rows
+            // (`layer.compressed.rows()`). F011.E.A wired sinks; B
+            // extends the sweep to the long-history compressed tier.
+            // TODO(F011.E.C): on ratio-4 layers, apply the indexer
+            // top-K mask to the compressed sweep.
         }
 
         Ok(())
@@ -511,6 +549,63 @@ mod tests {
         for (d, &v) in out[stride..stride + DSV4_HEAD_DIM].iter().enumerate() {
             assert!((v - 1.5).abs() < 1e-5, "token 1 head 0 dim {d} = {v}");
         }
+    }
+
+    #[test]
+    fn run_layer_attn_sinks_shifts_softmax_denominator() {
+        // F011.E.A: with one cached KV row of all-ones, Q=0, and a
+        // large positive `attn_sinks[h]`, the sink dominates the
+        // softmax denominator. Since the sink's "value" is implicitly
+        // zero, the per-head output magnitude shrinks below the
+        // no-sink baseline (which would emit the KV row verbatim).
+        //
+        // Concretely: denom = exp(sink - max) + exp(0 - max), with
+        // max = sink. So denom = 1 + exp(-sink), and
+        // out = exp(-sink) / (1 + exp(-sink)) * kv ≈ 0 for large sink.
+        let mut cache = ThreeTierKvCache::new(8);
+        let sinks = vec![5.0_f32; DSV4_N_HEAD];
+        let loras = {
+            let mut v = vec![LayerLoRAs::default(); DSV4_N_LAYER];
+            for slot in v.iter_mut() {
+                slot.attn_sinks = Some(&sinks);
+            }
+            v
+        };
+        let mut attn = ThreeTierAttention::with_loras(&mut cache, &loras);
+        let q = make_q(1, 0.0);
+        let kv = make_kv(1, 1.0);
+        let mut out = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
+        attn.run_layer(&q, &kv, &make_x(1), 0, &mut out).unwrap();
+        // Expected weight on the real KV row: exp(0 - 5) / (1 + exp(-5))
+        let expected_w = (-5.0_f32).exp() / (1.0 + (-5.0_f32).exp());
+        for (d, &v) in out.iter().enumerate() {
+            assert!(
+                (v - expected_w).abs() < 1e-5,
+                "lane {d}: expected {expected_w}, got {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_layer_rejects_wrong_attn_sinks_length() {
+        let mut cache = ThreeTierKvCache::new(8);
+        let bad_sinks = vec![0.0_f32; DSV4_N_HEAD - 1];
+        let loras = {
+            let mut v = vec![LayerLoRAs::default(); DSV4_N_LAYER];
+            v[0].attn_sinks = Some(&bad_sinks);
+            v
+        };
+        let mut attn = ThreeTierAttention::with_loras(&mut cache, &loras);
+        let q = make_q(1, 0.0);
+        let kv = make_kv(1, 0.0);
+        let mut out = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
+        let err = attn
+            .run_layer(&q, &kv, &make_x(1), 0, &mut out)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::ShapeMismatch { key, .. } if key == "ThreeTierAttention::run_layer.attn_sinks"
+        ));
     }
 
     #[test]
