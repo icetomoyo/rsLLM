@@ -370,8 +370,9 @@ impl<'a> DeepSeekV4Flash<'a> {
 }
 
 /// Pluggable attention callback. [`crate::dsv4::attention::ThreeTierAttention`]
-/// (F006 + F008) is the v0.1.0 production implementation — wrap it in
-/// a `&mut |q, kv, x, il, out| attn.run_layer(q, kv, x, il, out)`
+/// (F006 + F008 + F011) is the v0.1.0 production implementation — wrap
+/// it in a
+/// `&mut |q, kv, x, qr_norm, il, out| attn.run_layer(q, kv, x, qr_norm, il, out)`
 /// closure to satisfy this type.
 ///
 /// The signature is intentionally generic across layers so a single
@@ -383,13 +384,25 @@ impl<'a> DeepSeekV4Flash<'a> {
 /// - `x`: `[n_tok × N_EMBD]` the post-RMSNorm hidden state. The
 ///   attention adapter re-projects this through the per-layer
 ///   `attn_compressor` / `attn_indexer_*` LoRAs to produce the per-dim
-///   compression score and the indexer KV+score (F008.B weight types).
+///   compression score and the indexer KV+score, and feeds the
+///   indexer's per-head soft gate (`ds4.c:6883`).
+/// - `qr_norm`: `[n_tok × N_LORA_Q]` post-RMSNorm Q latent
+///   (`mla.q_lora_normed`). Consumed by the F011.E.C indexer query
+///   projection (`ds4.c:6880`). Pass an empty slice on layers where
+///   no indexer query is needed; ratio-4 layers with supplied indexer
+///   weights expect length `n_tok × DSV4_N_LORA_Q`.
 /// - `layer_idx`: 0-based block index, 0..N_LAYER.
 ///
 /// Output:
 /// - `attn_out`: `[n_tok × N_HEAD × HEAD_DIM]` (pre output-projection).
-pub type AttentionFn<'f> =
-    &'f mut dyn FnMut(&[f32], &[f32], &[f32], usize, &mut [f32]) -> Result<(), Error>;
+pub type AttentionFn<'f> = &'f mut dyn FnMut(
+    &[f32],
+    &[f32],
+    &[f32],
+    &[f32],
+    usize,
+    &mut [f32],
+) -> Result<(), Error>;
 
 /// Reusable per-forward scratch. Held by the caller so we don't
 /// re-allocate large activation buffers between tokens.
@@ -512,6 +525,7 @@ pub fn forward_block(
         &scratch.q,
         &scratch.kv,
         &scratch.normed,
+        &scratch.mla.q_lora_normed,
         layer_idx,
         &mut scratch.attn_raw,
     )?;

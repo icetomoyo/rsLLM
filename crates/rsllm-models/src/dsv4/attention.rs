@@ -28,14 +28,18 @@
 //! Line numbers pinned to ds4 commit `ef0a490` (2026-05-17).
 
 use rsllm_backend_cpu::SimdTier;
-use rsllm_kvcache::dsv4::shape::{DSV4_HEAD_DIM as KV_HEAD_DIM, DSV4_N_LAYER};
+use rsllm_kvcache::dsv4::shape::{
+    DSV4_HEAD_DIM as KV_HEAD_DIM, DSV4_N_INDEXER_HEAD, DSV4_N_INDEXER_HEAD_DIM, DSV4_N_INDEXER_TOP_K,
+    DSV4_N_LAYER,
+};
 use rsllm_kvcache::dsv4::three_tier::{LayerAppend, ThreeTierKvCache};
 
 use crate::Error;
 use crate::dsv4::compressor::{
     CompressorWeights, IndexerWeights, compressor_decode_one,
 };
-use crate::dsv4::shape::{DSV4_HEAD_DIM, DSV4_N_HEAD};
+use crate::dsv4::indexer::{project_indexer_query, project_indexer_weights};
+use crate::dsv4::shape::{DSV4_HEAD_DIM, DSV4_N_EMBD, DSV4_N_HEAD, DSV4_N_LORA_Q};
 
 /// Maximum compressor `width = coff * head_dim` across all DS V4 Flash
 /// layers. Ratio-4 layers use `coff = 2` → `width = 1024`; ratio-128
@@ -115,6 +119,12 @@ pub struct ThreeTierAttention<'cache, 'lora> {
     scratch_kv_cur: Vec<f32>,
     scratch_sc_cur: Vec<f32>,
     scratch_ape_col: Vec<f32>,
+    /// Scratch for the F011.E.C indexer top-K pipeline.
+    /// `indexer_q` is `[N_INDEXER_HEAD × N_INDEXER_HEAD_DIM] = [8192]`,
+    /// `indexer_w` is `[N_INDEXER_HEAD] = [64]`. Both are token-local
+    /// (recomputed each token); re-used across layers and tokens.
+    scratch_indexer_q: Vec<f32>,
+    scratch_indexer_w: Vec<f32>,
 }
 
 /// Empty slice used by [`ThreeTierAttention::new`] so the `loras`
@@ -138,6 +148,8 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
             scratch_kv_cur: vec![0.0; COMPRESSOR_SCRATCH_MAX_WIDTH],
             scratch_sc_cur: vec![0.0; COMPRESSOR_SCRATCH_MAX_WIDTH],
             scratch_ape_col: vec![0.0; COMPRESSOR_SCRATCH_MAX_WIDTH],
+            scratch_indexer_q: vec![0.0; DSV4_N_INDEXER_HEAD * DSV4_N_INDEXER_HEAD_DIM],
+            scratch_indexer_w: vec![0.0; DSV4_N_INDEXER_HEAD],
         }
     }
 
@@ -156,6 +168,8 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
             scratch_kv_cur: vec![0.0; COMPRESSOR_SCRATCH_MAX_WIDTH],
             scratch_sc_cur: vec![0.0; COMPRESSOR_SCRATCH_MAX_WIDTH],
             scratch_ape_col: vec![0.0; COMPRESSOR_SCRATCH_MAX_WIDTH],
+            scratch_indexer_q: vec![0.0; DSV4_N_INDEXER_HEAD * DSV4_N_INDEXER_HEAD_DIM],
+            scratch_indexer_w: vec![0.0; DSV4_N_INDEXER_HEAD],
         }
     }
 
@@ -178,11 +192,11 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
     ///   - `q`: `[n_tok × DSV4_N_HEAD × DSV4_HEAD_DIM]` (RoPE'd query).
     ///   - `kv`: `[n_tok × DSV4_HEAD_DIM]` (1-head MLA KV latent).
     ///   - `x`: `[n_tok × DSV4_N_EMBD]` post-RMSNorm hidden state.
-    ///     Currently ignored — F008.C.2 will use it to call the
-    ///     per-layer `attn_compressor` / `attn_indexer_*` LoRAs and
-    ///     replace the zero-placeholder compress/indexer scores. The
-    ///     signature is locked in now so the AttentionFn ABI is
-    ///     stable across F008.C.1 → F008.C.2.
+    ///     Routed through the per-layer compressor / indexer LoRAs.
+    ///   - `qr_norm`: `[n_tok × DSV4_N_LORA_Q] = [n_tok × 1024]`
+    ///     post-RMSNorm Q-LoRA latent (= `mla.q_lora_normed`).
+    ///     Required when `layer_loras.indexer` is supplied (F011.E.C
+    ///     indexer query projection); may be empty otherwise.
     ///   - `layer_idx`: 0-based block index.
     ///   - `attn_out`: `[n_tok × DSV4_N_HEAD × DSV4_HEAD_DIM]` (write-only).
     ///
@@ -195,11 +209,13 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
     /// # Errors
     /// - [`Error::ShapeMismatch`] on input length disagreements.
     /// - [`Error::KvCache`] if the cache rejects an append.
+    #[allow(clippy::too_many_arguments)]
     pub fn run_layer(
         &mut self,
         q: &[f32],
         kv: &[f32],
         x: &[f32],
+        qr_norm: &[f32],
         layer_idx: usize,
         attn_out: &mut [f32],
     ) -> Result<(), Error> {
@@ -260,6 +276,26 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
 
         let compress_ratio = self.cache.layers[layer_idx].compress_ratio;
         let has_indexer = self.cache.layers[layer_idx].indexer.is_some();
+
+        // `qr_norm` is required at length `n_tok × N_LORA_Q` whenever
+        // the layer can drive the indexer query projection (i.e. has
+        // an indexer pool AND indexer weights supplied). For dense or
+        // ratio-128 layers, or when indexer weights are absent, an
+        // empty slice is allowed and the indexer query path is skipped.
+        let expected_qr = n_tok
+            .checked_mul(crate::dsv4::shape::DSV4_N_LORA_Q)
+            .ok_or(Error::ShapeMismatch {
+                key: "ThreeTierAttention::run_layer.qr_norm",
+                expected: format!("n_tok × N_LORA_Q (overflow with n_tok={n_tok})"),
+                actual: format!("{}", qr_norm.len()),
+            })?;
+        if !qr_norm.is_empty() && qr_norm.len() != expected_qr {
+            return Err(Error::ShapeMismatch {
+                key: "ThreeTierAttention::run_layer.qr_norm",
+                expected: format!("0 or {expected_qr}"),
+                actual: format!("{}", qr_norm.len()),
+            });
+        }
 
         // Locate this layer's LoRA bundle (if any). An empty `loras`
         // slice means "use placeholder zeros" — the F006 behavior.
@@ -388,6 +424,52 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
             let append = LayerAppend { kv_latent: kv_row };
             self.cache.append_layer(layer_idx, append)?;
 
+            // 1d. F011.E.C indexer top-K selection. Runs only on
+            // ratio-4 layers with indexer weights AND a non-empty
+            // `qr_norm`. Produces a `Vec<u32>` of allowed compressed-
+            // pool row indices that the mixed attention sweep below
+            // restricts itself to. When the gate fails open (no
+            // indexer weights, empty qr_norm, or empty indexer pool)
+            // the sweep falls back to attending all compressed rows
+            // — same as the F011.E.B path.
+            let top_k_indices: Option<Vec<u32>> =
+                if has_indexer
+                    && let Some(idx_weights) = layer_loras.indexer
+                    && !qr_norm.is_empty()
+                {
+                    let qr_t = &qr_norm[t * DSV4_N_LORA_Q..(t + 1) * DSV4_N_LORA_Q];
+                    let x_t = &x[t * DSV4_N_EMBD..(t + 1) * DSV4_N_EMBD];
+                    project_indexer_query(
+                        qr_t,
+                        idx_weights,
+                        pos,
+                        layer_idx as u32,
+                        &mut self.scratch_indexer_q,
+                        self.tier,
+                    )?;
+                    project_indexer_weights(
+                        x_t,
+                        idx_weights,
+                        &mut self.scratch_indexer_w,
+                        self.tier,
+                    )?;
+                    let idx_pool = self.cache.layers[layer_idx]
+                        .indexer
+                        .as_ref()
+                        .expect("has_indexer implies indexer pool present");
+                    if idx_pool.is_empty() {
+                        None
+                    } else {
+                        Some(idx_pool.select_top_k(
+                            &self.scratch_indexer_q,
+                            &self.scratch_indexer_w,
+                            DSV4_N_INDEXER_TOP_K,
+                        )?)
+                    }
+                } else {
+                    None
+                };
+
             // 2. Mixed attention sweep — SWA raw keys + (F011.E.B)
             //    long-history compressed-pool rows, all in the same
             //    per-head softmax. Mirrors `ds4.c:6700-6760`
@@ -395,6 +477,10 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
             //    (dense / ratio-128 with no compressed pool) collapse
             //    to the SWA-only path equivalent to
             //    `layer_attention_rows_one` (`ds4.c:4969-5007`).
+            //
+            //    F011.E.C: when `top_k_indices` is `Some(allowed)`, the
+            //    compressed-row loop is restricted to those indices.
+            //    Otherwise all compressed rows participate.
             let layer = &self.cache.layers[layer_idx];
             let n_raw = layer.swa.len();
             let comp_rows: &[f32] = layer
@@ -437,6 +523,22 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
                     actual: format!("{}", s.len()),
                 });
             }
+            // Pre-compute `allowed[c]` for the compressed sweep. When
+            // `top_k_indices` is `None` every row is allowed; when
+            // `Some(idxs)`, only those rows participate (others get
+            // `-inf` logit per `ds4.c:6727-6730`).
+            let allowed_comp: Option<Vec<bool>> = top_k_indices.as_ref().map(|idxs| {
+                let mut allowed = vec![false; n_comp];
+                for &i in idxs {
+                    if (i as usize) < n_comp {
+                        allowed[i as usize] = true;
+                    }
+                }
+                allowed
+            });
+            let comp_allowed = |c: usize| -> bool {
+                allowed_comp.as_ref().is_none_or(|a| a[c])
+            };
             let mut logits = Vec::with_capacity(n_keys);
             for h in 0..n_head {
                 let q_h = &q[t * q_stride + h * head_dim..t * q_stride + (h + 1) * head_dim];
@@ -458,6 +560,10 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
                     logits.push(l);
                 }
                 for c in 0..n_comp {
+                    if !comp_allowed(c) {
+                        logits.push(f32::NEG_INFINITY);
+                        continue;
+                    }
                     let kv = &comp_rows[c * head_dim..(c + 1) * head_dim];
                     let mut dot = 0.0_f32;
                     for d in 0..head_dim {
@@ -509,6 +615,13 @@ impl<'cache, 'lora> ThreeTierAttention<'cache, 'lora> {
                     }
                 }
                 for c in 0..n_comp {
+                    if !comp_allowed(c) {
+                        // F011.E.C: disallowed rows have `logits[c] == 0`
+                        // anyway (exp(-inf - max) == 0), so the skip is
+                        // an optimisation, not a correctness fix. It
+                        // also matches `ds4.c:6747-6748`.
+                        continue;
+                    }
                     let logit = logits[n_raw + c];
                     let kv = &comp_rows[c * head_dim..(c + 1) * head_dim];
                     let w = logit * inv_denom;
@@ -549,7 +662,7 @@ mod tests {
         let q = make_q(1, 0.0);
         let kv = make_kv(1, 1.0);
         let mut out = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
-        attn.run_layer(&q, &kv, &make_x(kv.len() / DSV4_HEAD_DIM), 0, &mut out).unwrap();
+        attn.run_layer(&q, &kv, &make_x(kv.len() / DSV4_HEAD_DIM), &[], 0, &mut out).unwrap();
         // With Q=0 and 1 cached KV row of all-ones, softmax gives w=1.0
         // and weighted sum = the KV row itself (all ones).
         assert!(out.iter().all(|&v| (v - 1.0).abs() < 1e-6));
@@ -567,7 +680,7 @@ mod tests {
         }
         let q = make_q(2, 0.0); // uniform → softmax averages keys
         let mut out = vec![0.0_f32; 2 * DSV4_N_HEAD * DSV4_HEAD_DIM];
-        attn.run_layer(&q, &kv, &make_x(kv.len() / DSV4_HEAD_DIM), 0, &mut out).unwrap();
+        attn.run_layer(&q, &kv, &make_x(kv.len() / DSV4_HEAD_DIM), &[], 0, &mut out).unwrap();
         // Token 0 attends only to itself (value 1.0).
         for &v in out.iter().take(DSV4_HEAD_DIM) {
             assert!((v - 1.0).abs() < 1e-5);
@@ -603,7 +716,7 @@ mod tests {
         let q = make_q(1, 0.0);
         let kv = make_kv(1, 1.0);
         let mut out = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
-        attn.run_layer(&q, &kv, &make_x(1), 0, &mut out).unwrap();
+        attn.run_layer(&q, &kv, &make_x(1), &[], 0, &mut out).unwrap();
         // Expected weight on the real KV row: exp(0 - 5) / (1 + exp(-5))
         let expected_w = (-5.0_f32).exp() / (1.0 + (-5.0_f32).exp());
         for (d, &v) in out.iter().enumerate() {
@@ -628,7 +741,7 @@ mod tests {
         let kv = make_kv(1, 0.0);
         let mut out = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
         let err = attn
-            .run_layer(&q, &kv, &make_x(1), 0, &mut out)
+            .run_layer(&q, &kv, &make_x(1), &[], 0, &mut out)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -676,7 +789,7 @@ mod tests {
         let kv = vec![0.0_f32; DSV4_HEAD_DIM];
         let mut out = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
         let mut attn = ThreeTierAttention::new(&mut cache);
-        attn.run_layer(&q, &kv, &make_x(1), 2, &mut out).unwrap();
+        attn.run_layer(&q, &kv, &make_x(1), &[], 2, &mut out).unwrap();
         // Head 0 lane 0: weight on compressed row ≈ exp(7/sqrt(512)) /
         // (exp(0) + exp(7/sqrt(512))) ≈ 0.5765; value at lane 0 = 7.0.
         // So out[head=0, lane=0] ≈ 0.5765 * 7.0 ≈ 4.04.
@@ -702,7 +815,7 @@ mod tests {
         let kv = make_kv(1, 0.1);
         let mut out = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
         // Layer 2 is ratio-4 with an indexer.
-        attn.run_layer(&q, &kv, &make_x(1), 2, &mut out).unwrap();
+        attn.run_layer(&q, &kv, &make_x(1), &[], 2, &mut out).unwrap();
         assert_eq!(cache.layers[2].swa.len(), 1);
         // First token of 4-cycle: no compressed-pool emission yet.
         assert_eq!(cache.layers[2].compressed.as_ref().unwrap().len(), 0);
@@ -719,7 +832,7 @@ mod tests {
         let q = vec![f32::NAN; DSV4_N_HEAD * DSV4_HEAD_DIM];
         let kv = make_kv(1, 1.0);
         let mut out = vec![123.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
-        attn.run_layer(&q, &kv, &make_x(kv.len() / DSV4_HEAD_DIM), 0, &mut out).unwrap();
+        attn.run_layer(&q, &kv, &make_x(kv.len() / DSV4_HEAD_DIM), &[], 0, &mut out).unwrap();
         assert!(out.iter().all(|v| *v == 0.0), "expected all zeros, got {:?}", &out[..4]);
     }
 
@@ -730,7 +843,7 @@ mod tests {
         let q = make_q(1, 0.0);
         let kv = make_kv(1, 0.0);
         let mut out = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
-        let err = attn.run_layer(&q, &kv, &make_x(1), DSV4_N_LAYER, &mut out).unwrap_err();
+        let err = attn.run_layer(&q, &kv, &make_x(1), &[], DSV4_N_LAYER, &mut out).unwrap_err();
         assert!(matches!(
             err,
             Error::KvCache(rsllm_kvcache::Error::InvalidLayer { .. })
@@ -747,7 +860,7 @@ mod tests {
         let kv = make_kv(1, 0.0);
         let bad_x = vec![0.0_f32; crate::dsv4::shape::DSV4_N_EMBD + 1];
         let mut out = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
-        let err = attn.run_layer(&q, &kv, &bad_x, 0, &mut out).unwrap_err();
+        let err = attn.run_layer(&q, &kv, &bad_x, &[], 0, &mut out).unwrap_err();
         assert!(matches!(
             err,
             Error::ShapeMismatch { key, .. } if key == "ThreeTierAttention::run_layer.x"
@@ -761,7 +874,7 @@ mod tests {
         let q = make_q(1, 0.0);
         let bad_kv = vec![0.0_f32; DSV4_HEAD_DIM - 1];
         let mut out = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
-        let err = attn.run_layer(&q, &bad_kv, &make_x(0), 0, &mut out).unwrap_err();
+        let err = attn.run_layer(&q, &bad_kv, &make_x(0), &[], 0, &mut out).unwrap_err();
         assert!(matches!(err, Error::ShapeMismatch { .. }));
     }
 
@@ -778,12 +891,13 @@ mod tests {
         let mut closure = |q: &[f32],
                            kv: &[f32],
                            x: &[f32],
+                           qr_norm: &[f32],
                            il: usize,
                            o: &mut [f32]|
-         -> Result<(), Error> { attn.run_layer(q, kv, x, il, o) };
+         -> Result<(), Error> { attn.run_layer(q, kv, x, qr_norm, il, o) };
         let attn_fn: crate::AttentionFn<'_> = &mut closure;
         let x = make_x(1);
-        attn_fn(&q, &kv, &x, 0, &mut out).unwrap();
+        attn_fn(&q, &kv, &x, &[], 0, &mut out).unwrap();
         assert!(out.iter().all(|&v| (v - 1.0).abs() < 1e-6));
     }
 
@@ -870,7 +984,7 @@ mod tests {
                 x[t * n_embd + DSV4_HEAD_DIM] = (t as f32) + 1.0;
             }
             let mut out = vec![0.0_f32; 4 * DSV4_N_HEAD * DSV4_HEAD_DIM];
-            attn.run_layer(&q, &kv, &x, 2, &mut out).unwrap();
+            attn.run_layer(&q, &kv, &x, &[], 2, &mut out).unwrap();
         }
         // After 4 tokens on a ratio-4 layer: exactly one compressed
         // pool emission.
@@ -904,7 +1018,7 @@ mod tests {
         // Dense layer 0 doesn't trigger compress/indexer paths and may
         // still succeed; force a compressed layer to surface the loras
         // length check.
-        let err = attn.run_layer(&q, &kv, &x, 2, &mut out).unwrap_err();
+        let err = attn.run_layer(&q, &kv, &x, &[], 2, &mut out).unwrap_err();
         assert!(matches!(
             err,
             Error::ShapeMismatch { key, .. } if key == "ThreeTierAttention.loras.len"
@@ -990,7 +1104,7 @@ mod tests {
                 x[t * n_embd + DSV4_N_INDEXER_HEAD_DIM] = (t as f32) + 1.0;
             }
             let mut out = vec![0.0_f32; 4 * DSV4_N_HEAD * DSV4_HEAD_DIM];
-            attn.run_layer(&q, &kv, &x, 2, &mut out).unwrap();
+            attn.run_layer(&q, &kv, &x, &[], 2, &mut out).unwrap();
         }
         // 4 tokens through a ratio-4 indexer → exactly one emission.
         let indexer_pool = cache.layers[2].indexer.as_ref().unwrap();
@@ -1005,6 +1119,106 @@ mod tests {
     }
 
     #[test]
+    fn loras_indexer_top_k_path_executes_with_nonempty_qr_norm() {
+        // F011.E.C smoke test: non-empty `qr_norm` + supplied indexer
+        // weights drive the top-K selection path
+        // (`project_indexer_query` + `project_indexer_weights` +
+        // `IndexerPool::select_top_k`). With `n_comp == 1` (one
+        // pre-seeded indexer row) and top_k = N_INDEXER_TOP_K = 512,
+        // top-K clamps to all-allowed, so the attention output should
+        // be identical to the F011.E.B path. The point of this test
+        // is to verify the call sequence executes without errors.
+        let n_embd = crate::dsv4::shape::DSV4_N_EMBD;
+        // Compressor: inert.
+        let comp_width = 2 * DSV4_HEAD_DIM;
+        let comp_kv = vec![0.0_f32; comp_width * n_embd];
+        let comp_gate = vec![0.0_f32; comp_width * n_embd];
+        let comp_ape = vec![0.0_f32; comp_width * 4];
+        let comp_norm = vec![1.0_f32; DSV4_HEAD_DIM];
+        let compressor = CompressorWeights {
+            kv: crate::dsv4::weight::WeightBlob::F32(&comp_kv),
+            gate: crate::dsv4::weight::WeightBlob::F32(&comp_gate),
+            ape: crate::dsv4::weight::WeightBlob::F32(&comp_ape),
+            norm: &comp_norm,
+        };
+        // Indexer weights: all zero. We exercise the query / per-head-
+        // weights matvecs but the actual scores don't matter — with
+        // n_comp == 1 every selection is trivially top-1.
+        let index_width = 2 * DSV4_N_INDEXER_HEAD_DIM;
+        let idx_attn_q_b = vec![
+            0.0_f32;
+            crate::dsv4::shape::DSV4_N_LORA_Q
+                * crate::dsv4::shape::DSV4_N_INDEXER_HEAD
+                * DSV4_N_INDEXER_HEAD_DIM
+        ];
+        let idx_proj = vec![0.0_f32; n_embd * crate::dsv4::shape::DSV4_N_INDEXER_HEAD];
+        let idx_comp_ape = vec![0.0_f32; index_width * 4];
+        let idx_comp_kv = vec![0.0_f32; n_embd * index_width];
+        let idx_comp_gate = vec![0.0_f32; n_embd * index_width];
+        let idx_comp_norm = vec![1.0_f32; DSV4_N_INDEXER_HEAD_DIM];
+        let indexer_weights_bundle = IndexerWeights {
+            attn_q_b: crate::dsv4::weight::WeightBlob::F32(&idx_attn_q_b),
+            proj: crate::dsv4::weight::WeightBlob::F32(&idx_proj),
+            comp_ape: crate::dsv4::weight::WeightBlob::F32(&idx_comp_ape),
+            comp_kv: crate::dsv4::weight::WeightBlob::F32(&idx_comp_kv),
+            comp_gate: crate::dsv4::weight::WeightBlob::F32(&idx_comp_gate),
+            comp_norm: &idx_comp_norm,
+        };
+
+        let mut loras = vec![LayerLoRAs::default(); DSV4_N_LAYER];
+        for (il, slot) in loras.iter_mut().enumerate() {
+            let ratio = rsllm_kvcache::dsv4::shape::layer_compress_ratio(il);
+            if ratio > 0 {
+                slot.compressor = Some(&compressor);
+            }
+            if rsllm_kvcache::dsv4::shape::layer_has_indexer(il) {
+                slot.indexer = Some(&indexer_weights_bundle);
+            }
+        }
+
+        let mut cache = ThreeTierKvCache::new(64);
+        // Pre-seed the indexer pool on layer 2 with one emitted row so
+        // `select_top_k` has something to operate on.
+        {
+            let idx_pool = cache.layers[2].indexer.as_mut().unwrap();
+            let head_dim = DSV4_N_INDEXER_HEAD_DIM;
+            let kv = vec![0.5_f32; head_dim];
+            for _ in 0..4 {
+                let _ = idx_pool.accumulate(&kv, &vec![0.0_f32; head_dim]);
+            }
+            assert_eq!(idx_pool.len(), 1);
+        }
+        {
+            let mut attn = ThreeTierAttention::with_loras(&mut cache, &loras);
+            let q = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
+            let kv = vec![0.0_f32; DSV4_HEAD_DIM];
+            let x = vec![0.0_f32; n_embd];
+            // qr_norm: non-empty, length n_tok × N_LORA_Q.
+            let qr_norm = vec![0.0_f32; crate::dsv4::shape::DSV4_N_LORA_Q];
+            let mut out = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
+            attn.run_layer(&q, &kv, &x, &qr_norm, 2, &mut out).unwrap();
+        }
+    }
+
+    #[test]
+    fn run_layer_rejects_wrong_qr_norm_length() {
+        let mut cache = ThreeTierKvCache::new(8);
+        let mut attn = ThreeTierAttention::new(&mut cache);
+        let q = make_q(1, 0.0);
+        let kv = make_kv(1, 0.0);
+        let x = make_x(1);
+        let bad_qr = vec![0.0_f32; 7]; // not 0 and not N_LORA_Q
+        let mut out = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
+        let err = attn
+            .run_layer(&q, &kv, &x, &bad_qr, 0, &mut out)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::ShapeMismatch { key, .. } if key == "ThreeTierAttention::run_layer.qr_norm"
+        ));
+    }
+
+    #[test]
     fn with_loras_runs_dense_layer_correctly() {
         // Dense layer (il=0) has compress_ratio=0 and no indexer, so
         // neither LoRA path runs. with_loras must still produce the
@@ -1016,7 +1230,7 @@ mod tests {
         let kv = make_kv(1, 1.0);
         let x = make_x(1);
         let mut out = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
-        attn.run_layer(&q, &kv, &x, 0, &mut out).unwrap();
+        attn.run_layer(&q, &kv, &x, &[], 0, &mut out).unwrap();
         // Same expectation as run_layer_writes_attn_out_for_dense_layer:
         // 1 cached KV row of all-ones, Q=0 → softmax = 1.0 → out = KV.
         assert!(out.iter().all(|&v| (v - 1.0).abs() < 1e-6));
@@ -1033,7 +1247,7 @@ mod tests {
         let kv = make_kv(1, 1.0);
         let x = make_x(1);
         let mut out = vec![0.0_f32; DSV4_N_HEAD * DSV4_HEAD_DIM];
-        attn.run_layer(&q, &kv, &x, 2, &mut out).unwrap();
+        attn.run_layer(&q, &kv, &x, &[], 2, &mut out).unwrap();
         // Compressed pool unchanged after 1 token (still under boundary).
         assert_eq!(cache.layers[2].compressed.as_ref().unwrap().len(), 0);
     }

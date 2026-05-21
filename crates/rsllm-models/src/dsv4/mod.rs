@@ -14,6 +14,7 @@
 pub mod attention;
 pub mod compressor;
 pub mod hc;
+pub mod indexer;
 pub mod loader;
 pub mod mla;
 pub mod moe;

@@ -207,10 +207,11 @@ impl<'engine, 'gguf: 'engine> DsV4FlashSession<'engine, 'gguf> {
                     |q: &[f32],
                      kv: &[f32],
                      x: &[f32],
+                     qr_norm: &[f32],
                      layer_idx: usize,
                      out: &mut [f32]|
                      -> Result<(), crate::Error> {
-                        attn.run_layer(q, kv, x, layer_idx, out)
+                        attn.run_layer(q, kv, x, qr_norm, layer_idx, out)
                     };
                 forward_block(
                     block,
