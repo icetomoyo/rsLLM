@@ -25,6 +25,7 @@
 //! Line numbers pinned to ds4 commit `ef0a490` (2026-05-17).
 
 use rsllm_backend_cpu::SimdTier;
+use rsllm_backend_cpu::ops::indexer_qat_rows_inplace;
 use rsllm_backend_cpu::ops::rope::{RoPEParams, rope_yarn_tail};
 
 use super::compressor::IndexerWeights;
@@ -39,21 +40,17 @@ use crate::Error;
 /// layer's `indexer.attn_q_b` matrix and apply the standard MLA RoPE
 /// tail rotation to each of the `N_INDEXER_HEAD = 64` heads.
 ///
-/// Mirrors `ds4.c:6880-6881`:
+/// Mirrors `ds4.c:6880-6881, 6969`:
 /// ```c
 /// matvec_any(q, model, layer->indexer_attn_q_b, qr_norm);
 /// rope_tail_layer_inplace(q, n_head, head_dim, DS4_N_ROT, pos, il, false);
+/// dsv4_indexer_qat_rows_inplace_cpu(q, n_head, head_dim);
 /// ```
 ///
-/// **TODO(F012): upstream additionally runs**
-/// `dsv4_indexer_qat_rows_inplace_cpu(q, n_head, head_dim)` here
-/// (`ds4.c:6969`), a per-head Hadamard-128 + FP4 quantisation-aware
-/// transform (`ds4.c:1677-1709`). Without it the top-K scoring is
-/// numerically off vs the model's reference graph — but the call
-/// path stays sound. F012 will land the Hadamard + FP4 kernels and
-/// wire them here plus at the indexer compressor pool emission
-/// (`ds4.c:6585`). Until then, `project_indexer_query` returns a
-/// RoPE-only query; expect a measurable drop in top-K precision.
+/// The Hadamard-128 + FP4 quantisation-aware transform runs once per
+/// head (`ds4.c:1677-1709, 1721-1725`) right after RoPE. Without it
+/// the top-K scoring diverges from the model's reference graph;
+/// wired here as of F012.C.
 ///
 /// # Arguments
 /// - `qr_norm` — single token's LoRA-Q post-norm latent, length
@@ -120,6 +117,16 @@ pub fn project_indexer_query(
     rope_yarn_tail(q_out, &params, tier).map_err(|e| Error::ShapeMismatch {
         key: "project_indexer_query.rope",
         expected: "valid RoPE tail rotation".to_string(),
+        actual: format!("{e}"),
+    })?;
+
+    // Per-head Hadamard-128 + FP4 quantisation-aware transform
+    // (`ds4.c:6969`). Statically `head_dim == HADAMARD128_DIM = 128`,
+    // so each row passes through the composer without per-row
+    // length checks here — the kernel still verifies on its own.
+    indexer_qat_rows_inplace(q_out, DSV4_N_INDEXER_HEAD).map_err(|e| Error::ShapeMismatch {
+        key: "project_indexer_query.qat",
+        expected: "valid indexer QAT rows".to_string(),
         actual: format!("{e}"),
     })?;
     Ok(())
@@ -287,12 +294,16 @@ mod tests {
     }
 
     #[test]
-    fn project_indexer_query_identity_weights_replicates_qr_norm_lanes() {
-        // Set attn_q_b so output lane `o` reads input lane `o % N_LORA_Q`
-        // (identity-truncation with wraparound). The matvec then gives
-        // `q[o] = qr_norm[o % N_LORA_Q]`. With `qr_norm[k] = (k+1)*0.1`
-        // we get a deterministic gradient across all output lanes that
-        // RoPE leaves untouched on lanes `[0, head_dim - N_ROT) = [0, 64)`.
+    fn project_indexer_query_pipeline_yields_qat_post_hadamard_signature() {
+        // With identity-truncating `attn_q_b` and a constant
+        // `qr_norm = [1; N_LORA_Q]`, the matvec writes `q[o] = 1` for
+        // every output lane. At `pos = 0` RoPE is the identity, so each
+        // head's pre-QAT row is `[1; 128]`. The post-QAT signature of
+        // `[1; 128]` is the same fixture as `hadamard128_inplace_constant_input`
+        // + `fp4_act_quantize_row_inplace_constant_input` composed: lane
+        // 0 of each head ≈ 12.0 (Hadamard concentrates energy at lane 0
+        // → sqrt(128) ≈ 11.31 → FP4 snaps to 12.0), and the remaining
+        // 127 lanes of each head are exactly 0.
         let out_dim = DSV4_N_INDEXER_HEAD * DSV4_N_INDEXER_HEAD_DIM;
         let mut attn_q_b = vec![0.0_f32; out_dim * DSV4_N_LORA_Q];
         for o in 0..out_dim {
@@ -304,22 +315,22 @@ mod tests {
         let comp_gate = vec![0.0_f32; 1];
         let comp_norm = vec![0.0_f32; 1];
         let w = make_indexer_weights(&attn_q_b, &proj, &comp_ape, &comp_kv, &comp_gate, &comp_norm);
-        let qr_norm: Vec<f32> =
-            (0..DSV4_N_LORA_Q).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let qr_norm = vec![1.0_f32; DSV4_N_LORA_Q];
         let mut q = vec![0.0_f32; out_dim];
         project_indexer_query(&qr_norm, &w, 0, 0, &mut q, SimdTier::Scalar).unwrap();
-        // Check every head's non-rotated prefix lanes
-        // (`[0, head_dim - N_ROT) = [0, 64)`); each lane `d` of head `h`
-        // should equal `qr_norm[(h * head_dim + d) % N_LORA_Q]`.
-        let n_nope = DSV4_N_INDEXER_HEAD_DIM - DSV4_N_ROT;
         for h in 0..DSV4_N_INDEXER_HEAD {
-            for d in 0..n_nope {
-                let o = h * DSV4_N_INDEXER_HEAD_DIM + d;
-                let expected = qr_norm[o % DSV4_N_LORA_Q];
-                let v = q[o];
-                assert!(
-                    (v - expected).abs() < 1e-5,
-                    "head {h} lane {d} (out idx {o}): got {v}, expected {expected}"
+            let head_off = h * DSV4_N_INDEXER_HEAD_DIM;
+            assert!(
+                (q[head_off] - 12.0).abs() < 1e-3,
+                "head {h} lane 0 = {}, expected ≈12.0",
+                q[head_off],
+            );
+            for d in 1..DSV4_N_INDEXER_HEAD_DIM {
+                assert_eq!(
+                    q[head_off + d],
+                    0.0,
+                    "head {h} lane {d} = {}",
+                    q[head_off + d],
                 );
             }
         }

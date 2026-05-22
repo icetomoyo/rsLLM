@@ -27,12 +27,14 @@
 //! Line numbers pinned to ds4 commit `ef0a490` (2026-05-17).
 
 use rsllm_backend_cpu::SimdTier;
+use rsllm_backend_cpu::ops::indexer_qat_row_inplace;
 use rsllm_backend_cpu::ops::rope::{RoPEParams, rope_yarn_tail};
 use rsllm_gguf::{GgmlType, dequant_to_f32};
 use rsllm_kvcache::dsv4::compressed::CompressedKvPool;
 
 use super::shape::{
-    DSV4_COMPRESS_ROPE_FREQ_BASE, DSV4_N_EMBD, DSV4_N_ROT, DSV4_RMS_EPS, DSV4_ROPE_ORIG_CTX,
+    DSV4_COMPRESS_ROPE_FREQ_BASE, DSV4_N_EMBD, DSV4_N_INDEXER_HEAD_DIM, DSV4_N_ROT, DSV4_RMS_EPS,
+    DSV4_ROPE_ORIG_CTX,
 };
 use super::weight::{WeightBlob, matmul_weight_f32};
 use crate::Error;
@@ -319,17 +321,23 @@ pub fn compressor_decode_one(
             actual: format!("{e}"),
         })?;
 
-        // TODO(F012): post-RoPE QAT step, dispatched by head_dim:
+        // Post-RoPE QAT step, dispatched by head_dim (`ds4.c:6582-6586`):
+        //   - head_dim == DSV4_N_INDEXER_HEAD_DIM = 128 (indexer
+        //     compressor): Hadamard-128 + FP4 act quant pair
+        //     (`ds4.c:1677-1709`), wired here as of F012.C.
         //   - head_dim == DSV4_HEAD_DIM = 512 (attention compressor):
         //     `dsv4_fp8_kv_quantize_row_inplace_cpu(row, head_dim, DSV4_N_ROT)`
-        //     per `ds4.c:6583`.
-        //   - head_dim == DSV4_N_INDEXER_HEAD_DIM = 128 (indexer
-        //     compressor): `dsv4_indexer_qat_row_inplace_cpu(row, head_dim)`
-        //     per `ds4.c:6585` — Hadamard-128 + FP4 act quant pair
-        //     (`ds4.c:1677-1709`).
-        // Both kernels are missing in v0.1.0; the row stays at full f32
-        // precision until F012 lands. Known numerical divergence vs
-        // ds4.c; affects scoring quality, not crash safety.
+        //     per `ds4.c:6583`. Still TODO(F012.D); the row stays at
+        //     full f32 precision in the attention branch until that
+        //     lands. Known numerical divergence vs ds4.c on the
+        //     attention side only.
+        if head_dim == DSV4_N_INDEXER_HEAD_DIM {
+            indexer_qat_row_inplace(row).map_err(|e| Error::ShapeMismatch {
+                key: "compressor_decode_one.indexer_qat",
+                expected: "valid indexer QAT row".to_string(),
+                actual: format!("{e}"),
+            })?;
+        }
         return Ok(true);
     }
 
