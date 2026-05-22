@@ -294,6 +294,44 @@ mod tests {
     }
 
     #[test]
+    fn project_indexer_query_rope_depends_on_pos() {
+        // RoPE is the only stage of the pipeline whose output depends
+        // on `pos`. With identical weights and `qr_norm`, two calls at
+        // different positions must produce different outputs — that
+        // guards the matmul → RoPE wiring (a bug that swapped the two
+        // steps or dropped the RoPE call would yield identical
+        // outputs across positions). The QAT step is deterministic
+        // given its input, so the post-QAT signature also differs iff
+        // the pre-QAT row differs.
+        let out_dim = DSV4_N_INDEXER_HEAD * DSV4_N_INDEXER_HEAD_DIM;
+        let mut attn_q_b = vec![0.0_f32; out_dim * DSV4_N_LORA_Q];
+        for o in 0..out_dim {
+            attn_q_b[o * DSV4_N_LORA_Q + (o % DSV4_N_LORA_Q)] = 1.0;
+        }
+        let proj = vec![0.0_f32; 1];
+        let comp_ape = vec![0.0_f32; 1];
+        let comp_kv = vec![0.0_f32; 1];
+        let comp_gate = vec![0.0_f32; 1];
+        let comp_norm = vec![0.0_f32; 1];
+        let w =
+            make_indexer_weights(&attn_q_b, &proj, &comp_ape, &comp_kv, &comp_gate, &comp_norm);
+        // Gradient input — non-uniform so RoPE has something to mix.
+        let qr_norm: Vec<f32> = (0..DSV4_N_LORA_Q).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let mut q0 = vec![0.0_f32; out_dim];
+        let mut q5 = vec![0.0_f32; out_dim];
+        project_indexer_query(&qr_norm, &w, 0, 0, &mut q0, SimdTier::Scalar).unwrap();
+        project_indexer_query(&qr_norm, &w, 5, 0, &mut q5, SimdTier::Scalar).unwrap();
+        assert_ne!(
+            q0, q5,
+            "RoPE depends on pos; outputs at pos=0 and pos=5 must differ"
+        );
+        // Sanity: the outputs are finite (covers the QAT entry guard
+        // not firing on well-formed inputs).
+        assert!(q0.iter().all(|v| v.is_finite()), "non-finite at pos=0");
+        assert!(q5.iter().all(|v| v.is_finite()), "non-finite at pos=5");
+    }
+
+    #[test]
     fn project_indexer_query_pipeline_yields_qat_post_hadamard_signature() {
         // With identity-truncating `attn_q_b` and a constant
         // `qr_norm = [1; N_LORA_Q]`, the matvec writes `q[o] = 1` for

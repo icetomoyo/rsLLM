@@ -118,6 +118,12 @@ pub fn e4m3fn_value(i: u32) -> f32 {
 /// magnitude search caps at `|x| <= 448.0` and `code <= 126` (code 127
 /// is the NaN-ish slot upstream skips), so any input above 448
 /// quantises to `±448.0`.
+///
+/// The tie-break condition `((best + 1) & 1) == 0 && (best & 1) != 0`
+/// is the round-half-to-even rule restricted to the E4M3 code space:
+/// the 127 valid magnitudes are monotonically increasing and adjacent
+/// codes alternate parity, so the one-sided check is exact. Do not
+/// generalise to tables with consecutive same-parity codes.
 #[must_use]
 pub fn e4m3fn_dequant(x: f32) -> f32 {
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
@@ -163,6 +169,13 @@ pub fn e4m3fn_dequant(x: f32) -> f32 {
 /// Mirrors `dsv4_e2m1fn_dequant_cpu` at `ds4.c:1662-1675`. The
 /// magnitude search caps at `|x| <= 6.0` (the largest representable),
 /// so saturating inputs always quantise to the +/-6.0 endpoint.
+///
+/// The tie-break condition `(i & 1) == 0 && (best & 1) != 0` is the
+/// general "round half to even" rule restricted to the E2M1 code
+/// space, where the 8 magnitudes appear in strictly increasing order
+/// and adjacent codes alternate parity. That alternation makes the
+/// simplified one-sided check exact for E2M1; do not generalise it to
+/// tables with consecutive same-parity codes.
 #[must_use]
 pub fn e2m1fn_dequant(x: f32) -> f32 {
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
@@ -171,9 +184,8 @@ pub fn e2m1fn_dequant(x: f32) -> f32 {
     let mut best_diff = (ax - e2m1fn_value(0)).abs();
     for i in 1..8_u32 {
         let diff = (ax - e2m1fn_value(i)).abs();
-        // Upstream tie-break: on equal distance, prefer the
-        // even-coded candidate when the current `best` is odd. The
-        // intent matches `ds4.c:1669`.
+        // See doc above re: tie-break correctness in the E2M1 code
+        // space.
         if diff < best_diff || (diff == best_diff && (i & 1) == 0 && (best & 1) != 0) {
             best = i;
             best_diff = diff;
@@ -230,8 +242,13 @@ pub fn hadamard128_inplace(x: &mut [f32]) -> Result<(), Error> {
 /// Mirrors `dsv4_fp4_act_quantize_row_inplace_cpu` at `ds4.c:1691-1709`.
 ///
 /// # Errors
-/// Returns [`Error::ShapeMismatch`] when `x.len()` is not a positive
-/// multiple of [`FP4_GROUP`].
+/// - [`Error::ShapeMismatch`] when `x.len()` is not a positive multiple
+///   of [`FP4_GROUP`].
+/// - [`Error::NonFiniteInput`] when any lane is NaN or ±∞. This catches
+///   upstream divergences (e.g. an RMSNorm divide-by-zero) before they
+///   poison the quantised output — without the guard, NaN lanes
+///   silently degrade the FP4 scale derivation and Inf lanes cascade
+///   to Inf outputs.
 pub fn fp4_act_quantize_row_inplace(x: &mut [f32]) -> Result<(), Error> {
     if x.is_empty() || !x.len().is_multiple_of(FP4_GROUP) {
         return Err(Error::ShapeMismatch(
@@ -239,9 +256,13 @@ pub fn fp4_act_quantize_row_inplace(x: &mut [f32]) -> Result<(), Error> {
         ));
     }
     for chunk in x.chunks_exact_mut(FP4_GROUP) {
-        // Find per-group amax.
+        // Find per-group amax. Reject non-finite lanes inline so the
+        // happy path stays branch-prediction-friendly.
         let mut amax = 0.0_f32;
         for &v in chunk.iter() {
+            if !v.is_finite() {
+                return Err(Error::NonFiniteInput("fp4_act_quantize_row_inplace"));
+            }
             let av = v.abs();
             if av > amax {
                 amax = av;
@@ -284,11 +305,14 @@ pub fn fp4_act_quantize_row_inplace(x: &mut [f32]) -> Result<(), Error> {
 ///   `n_rot` lanes are preserved as-is.
 ///
 /// # Errors
-/// Returns [`Error::ShapeMismatch`] when:
-/// - `x.len() != head_dim`,
-/// - `n_rot > head_dim`, or
-/// - the non-RoPE prefix `head_dim - n_rot` is not a positive multiple
-///   of [`FP8_KV_GROUP`].
+/// - [`Error::ShapeMismatch`] when `x.len() != head_dim`, `n_rot >
+///   head_dim`, or the non-RoPE prefix `head_dim - n_rot` is not a
+///   positive multiple of [`FP8_KV_GROUP`].
+/// - [`Error::NonFiniteInput`] when any non-RoPE lane is NaN or ±∞.
+///   The RoPE tail is never inspected (it's preserved verbatim), so
+///   non-finite values in `[head_dim - n_rot, head_dim)` pass through
+///   unchanged — the upstream attention sweep is responsible for
+///   handling those lanes.
 pub fn fp8_kv_quantize_row_inplace(
     x: &mut [f32],
     head_dim: usize,
@@ -313,6 +337,9 @@ pub fn fp8_kv_quantize_row_inplace(
     for chunk in x[..n_nope].chunks_exact_mut(FP8_KV_GROUP) {
         let mut amax = 0.0_f32;
         for &v in chunk.iter() {
+            if !v.is_finite() {
+                return Err(Error::NonFiniteInput("fp8_kv_quantize_row_inplace"));
+            }
             let av = v.abs();
             if av > amax {
                 amax = av;
@@ -358,9 +385,14 @@ pub fn indexer_qat_row_inplace(x: &mut [f32]) -> Result<(), Error> {
 /// Mirrors `dsv4_indexer_qat_rows_inplace_cpu` at `ds4.c:1721-1725`.
 ///
 /// # Errors
-/// Returns [`Error::ShapeMismatch`] when `x.len() != rows *
-/// HADAMARD128_DIM`.
+/// Returns [`Error::ShapeMismatch`] when `rows == 0`, when
+/// `rows * 128` overflows, or when `x.len() != rows * 128`.
 pub fn indexer_qat_rows_inplace(x: &mut [f32], rows: usize) -> Result<(), Error> {
+    if rows == 0 {
+        return Err(Error::ShapeMismatch(
+            "indexer_qat_rows_inplace: rows must be > 0",
+        ));
+    }
     let expected = rows
         .checked_mul(HADAMARD128_DIM)
         .ok_or(Error::ShapeMismatch(
@@ -388,10 +420,13 @@ pub fn indexer_qat_rows_inplace(x: &mut [f32], rows: usize) -> Result<(), Error>
 /// `[-126, +127]` (amax in [1e-37, 6e30]), well inside the normal
 /// regime, so the simple path suffices.
 fn libm_ldexpf(x: f32, n: i32) -> f32 {
-    // Clamp `n` to the normal F32 exponent range. Outside the clamp
-    // we'd hit subnormals or overflow; for the FP4 quant path that
-    // would already imply a degenerate input. The behaviour matches
-    // the C `ldexpf` saturation in those cases.
+    // Clamp `n` to the normal F32 exponent range. The C `ldexpf`
+    // overflows to ±∞ for `|n| >= 128`; we instead saturate to the
+    // largest/smallest normal F32 (≈ ±1.7e38 / ±2.4e-38). This
+    // deviates from C semantics, but the FP4/FP8 quant amax ranges
+    // never produce exponents outside [-126, +127] in practice — the
+    // `NonFiniteInput` guards on the callers catch the degenerate
+    // upstream values that would otherwise drive `n` out of range.
     let n = n.clamp(-126, 127);
     let bits: u32 = ((n + 127) as u32) << 23;
     x * f32::from_bits(bits)
@@ -630,6 +665,41 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn indexer_qat_rows_inplace_rejects_zero_rows() {
+        let mut x: Vec<f32> = Vec::new();
+        assert!(matches!(
+            indexer_qat_rows_inplace(&mut x, 0).unwrap_err(),
+            Error::ShapeMismatch(_)
+        ));
+    }
+
+    #[test]
+    fn fp4_act_quantize_row_inplace_rejects_nan_input() {
+        let mut x = vec![0.0_f32; FP4_GROUP];
+        x[10] = f32::NAN;
+        assert!(matches!(
+            fp4_act_quantize_row_inplace(&mut x).unwrap_err(),
+            Error::NonFiniteInput(_)
+        ));
+    }
+
+    #[test]
+    fn fp4_act_quantize_row_inplace_rejects_inf_input() {
+        let mut x = vec![0.0_f32; FP4_GROUP];
+        x[3] = f32::INFINITY;
+        assert!(matches!(
+            fp4_act_quantize_row_inplace(&mut x).unwrap_err(),
+            Error::NonFiniteInput(_)
+        ));
+        let mut y = vec![0.0_f32; FP4_GROUP];
+        y[3] = f32::NEG_INFINITY;
+        assert!(matches!(
+            fp4_act_quantize_row_inplace(&mut y).unwrap_err(),
+            Error::NonFiniteInput(_)
+        ));
+    }
+
     // ---- FP8 (E4M3) KV quant path (F012.D) ---------------------------------
 
     #[test]
@@ -779,5 +849,27 @@ mod tests {
             fp8_kv_quantize_row_inplace(&mut x, 64, 64).unwrap_err(),
             Error::ShapeMismatch(_)
         ));
+    }
+
+    #[test]
+    fn fp8_kv_quantize_row_inplace_rejects_nan_in_prefix() {
+        // NaN in the non-RoPE prefix must surface as NonFiniteInput.
+        let mut x = vec![0.0_f32; 128];
+        x[10] = f32::NAN;
+        assert!(matches!(
+            fp8_kv_quantize_row_inplace(&mut x, 128, 64).unwrap_err(),
+            Error::NonFiniteInput(_)
+        ));
+    }
+
+    #[test]
+    fn fp8_kv_quantize_row_inplace_ignores_nan_in_rope_tail() {
+        // NaN in the RoPE tail is preserved — the kernel never reads
+        // those lanes, so it cannot reject them (and ds4.c upstream
+        // has the same semantics).
+        let mut x = vec![0.0_f32; 128];
+        x[100] = f32::NAN; // sits in the n_rot=64 tail at [64, 128)
+        fp8_kv_quantize_row_inplace(&mut x, 128, 64).unwrap();
+        assert!(x[100].is_nan(), "NaN in RoPE tail must be preserved");
     }
 }

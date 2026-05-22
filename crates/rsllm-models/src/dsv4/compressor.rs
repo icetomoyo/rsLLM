@@ -329,6 +329,17 @@ pub fn compressor_decode_one(
         //     FP8 E4M3 round trip over the non-RoPE prefix
         //     (`ds4.c:1635-1653, 6583`), preserving the trailing
         //     n_rot RoPE-rotated lanes.
+        //
+        // DSV4 only ever constructs pools with one of those two
+        // `head_dim` values. A pool with any other dimension would
+        // silently skip QAT here and emit a wrong-magnitude row; the
+        // debug_assert surfaces that invariant violation in test
+        // builds rather than letting it corrupt the pool in release.
+        debug_assert!(
+            head_dim == DSV4_N_INDEXER_HEAD_DIM || head_dim == DSV4_HEAD_DIM,
+            "compressor_decode_one: unexpected head_dim {head_dim}; \
+             expected {DSV4_N_INDEXER_HEAD_DIM} (indexer) or {DSV4_HEAD_DIM} (attention)",
+        );
         if head_dim == DSV4_N_INDEXER_HEAD_DIM {
             indexer_qat_row_inplace(row).map_err(|e| Error::ShapeMismatch {
                 key: "compressor_decode_one.indexer_qat",
