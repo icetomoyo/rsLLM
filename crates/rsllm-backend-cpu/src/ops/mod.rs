@@ -10,6 +10,7 @@
 //! Kernel coverage rolls out across F004 sub-phases (A-E); see the
 //! crate-level docs for the schedule.
 
+pub mod dsv4_quant;
 pub mod q8_0;
 pub mod quant_matmul;
 pub mod rope;
@@ -103,6 +104,10 @@ pub fn softmax_attn(scores: &mut [f32], sink: f32, tier: SimdTier) -> Result<f32
     Ok(scalar::softmax_attn(scores, sink))
 }
 
+pub use dsv4_quant::{
+    FP4_GROUP, HADAMARD128_DIM, e2m1fn_dequant, e2m1fn_value, fp4_act_quantize_row_inplace,
+    hadamard128_inplace, indexer_qat_row_inplace, indexer_qat_rows_inplace,
+};
 pub use q8_0::{
     Q8_0_BLOCK, Q8_0_BLOCK_BYTES, matmul_q8_0_batch, quantize_q8_0_activation, quantize_q8_0_batch,
 };
