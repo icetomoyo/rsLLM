@@ -105,7 +105,8 @@ pub fn softmax_attn(scores: &mut [f32], sink: f32, tier: SimdTier) -> Result<f32
 }
 
 pub use dsv4_quant::{
-    FP4_GROUP, HADAMARD128_DIM, e2m1fn_dequant, e2m1fn_value, fp4_act_quantize_row_inplace,
+    FP4_GROUP, FP8_E4M3_MAX, FP8_KV_GROUP, HADAMARD128_DIM, e2m1fn_dequant, e2m1fn_value,
+    e4m3fn_dequant, e4m3fn_value, fp4_act_quantize_row_inplace, fp8_kv_quantize_row_inplace,
     hadamard128_inplace, indexer_qat_row_inplace, indexer_qat_rows_inplace,
 };
 pub use q8_0::{

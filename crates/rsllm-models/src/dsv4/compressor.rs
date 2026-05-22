@@ -27,14 +27,14 @@
 //! Line numbers pinned to ds4 commit `ef0a490` (2026-05-17).
 
 use rsllm_backend_cpu::SimdTier;
-use rsllm_backend_cpu::ops::indexer_qat_row_inplace;
 use rsllm_backend_cpu::ops::rope::{RoPEParams, rope_yarn_tail};
+use rsllm_backend_cpu::ops::{fp8_kv_quantize_row_inplace, indexer_qat_row_inplace};
 use rsllm_gguf::{GgmlType, dequant_to_f32};
 use rsllm_kvcache::dsv4::compressed::CompressedKvPool;
 
 use super::shape::{
-    DSV4_COMPRESS_ROPE_FREQ_BASE, DSV4_N_EMBD, DSV4_N_INDEXER_HEAD_DIM, DSV4_N_ROT, DSV4_RMS_EPS,
-    DSV4_ROPE_ORIG_CTX,
+    DSV4_COMPRESS_ROPE_FREQ_BASE, DSV4_HEAD_DIM, DSV4_N_EMBD, DSV4_N_INDEXER_HEAD_DIM, DSV4_N_ROT,
+    DSV4_RMS_EPS, DSV4_ROPE_ORIG_CTX,
 };
 use super::weight::{WeightBlob, matmul_weight_f32};
 use crate::Error;
@@ -324,18 +324,24 @@ pub fn compressor_decode_one(
         // Post-RoPE QAT step, dispatched by head_dim (`ds4.c:6582-6586`):
         //   - head_dim == DSV4_N_INDEXER_HEAD_DIM = 128 (indexer
         //     compressor): Hadamard-128 + FP4 act quant pair
-        //     (`ds4.c:1677-1709`), wired here as of F012.C.
+        //     (`ds4.c:1677-1709`).
         //   - head_dim == DSV4_HEAD_DIM = 512 (attention compressor):
-        //     `dsv4_fp8_kv_quantize_row_inplace_cpu(row, head_dim, DSV4_N_ROT)`
-        //     per `ds4.c:6583`. Still TODO(F012.D); the row stays at
-        //     full f32 precision in the attention branch until that
-        //     lands. Known numerical divergence vs ds4.c on the
-        //     attention side only.
+        //     FP8 E4M3 round trip over the non-RoPE prefix
+        //     (`ds4.c:1635-1653, 6583`), preserving the trailing
+        //     n_rot RoPE-rotated lanes.
         if head_dim == DSV4_N_INDEXER_HEAD_DIM {
             indexer_qat_row_inplace(row).map_err(|e| Error::ShapeMismatch {
                 key: "compressor_decode_one.indexer_qat",
                 expected: "valid indexer QAT row".to_string(),
                 actual: format!("{e}"),
+            })?;
+        } else if head_dim == DSV4_HEAD_DIM {
+            fp8_kv_quantize_row_inplace(row, head_dim, DSV4_N_ROT).map_err(|e| {
+                Error::ShapeMismatch {
+                    key: "compressor_decode_one.fp8_kv_quant",
+                    expected: "valid FP8 KV row".to_string(),
+                    actual: format!("{e}"),
+                }
             })?;
         }
         return Ok(true);
