@@ -432,9 +432,14 @@ pub fn apply_shared_expert(
     for t in 0..n_tok {
         let x_t = &x[t * n_embd..(t + 1) * n_embd];
         let out_t = &mut out[t * n_embd..(t + 1) * n_embd];
-        // Shared expert runs **without** the SwiGLU clamp (`ds4.c:5043`,
-        // `swiglu()` is invoked plain — only the *routed* experts at
-        // `ds4.c:3833-3839` / `5345-5353` apply the clamp).
+        // F012.A: shared expert applies the SAME SwiGLU clamp as routed
+        // experts. ds4 5bc1e6d "Apply Flash graph correctness fixes"
+        // (`ds4.c:5132, 5162`) updated `layer_shared_ffn_one` /
+        // `layer_shared_ffn_batch` to pass `DS4_SWIGLU_CLAMP_EXP` into
+        // `swiglu()`; the official DeepSeek V4 graph clamps both shared
+        // and routed gate/up. Earlier rsLLM mirrored the pre-5bc1e6d
+        // ds4 behaviour (plain `swiglu()` for shared) — that was a
+        // numerical bug we inherited.
         apply_expert_swiglu(
             out_t,
             x_t,
@@ -444,7 +449,7 @@ pub fn apply_shared_expert(
             &mut scratch.h_gate,
             &mut scratch.h_up,
             &mut scratch.h_act,
-            None,
+            Some(DSV4_SWIGLU_CLAMP_EXP),
             tier,
         )?;
     }
@@ -458,12 +463,15 @@ pub fn apply_shared_expert(
 /// `[N_EMBD]` expert output.
 ///
 /// `clamp` selects between two regimes mirroring `ds4.c`:
-/// - `None` — plain `silu(gate) * up`, used by the shared expert
-///   (`ds4.c:5022-5024`, `layer_shared_ffn_one`).
-/// - `Some(c)` — pre-SwiGLU clamping (`ds4.c:3833-3839`, `5345-5353`):
-///   `gate` is upper-bounded by `c`; `up` is two-sided bounded by
-///   `[-c, +c]`. The gate has no lower bound because `silu` saturates
-///   to zero for large negative inputs anyway.
+/// - `Some(c)` — pre-SwiGLU clamping (`ds4.c:3833-3839`, `5132`, `5162`,
+///   `5345-5353`): `gate` is upper-bounded by `c`; `up` is two-sided
+///   bounded by `[-c, +c]`. The gate has no lower bound because `silu`
+///   saturates to zero for large negative inputs anyway. **Both shared
+///   and routed experts use this regime** after ds4 5bc1e6d
+///   (F012.A); pass `Some(DSV4_SWIGLU_CLAMP_EXP)` in production.
+/// - `None` — plain `silu(gate) * up` (no clamp). Retained only for
+///   unit-test fixtures that need to isolate the matmul path from the
+///   clamp behaviour. Not a production code path.
 ///
 /// Math (clamped form):
 /// `out = down @ (silu(min(gate@x, c)) * clamp(up@x, -c, +c))`.
@@ -729,6 +737,54 @@ mod tests {
         for &w in &weights {
             assert!(w >= 0.0);
         }
+    }
+
+    #[test]
+    fn apply_shared_expert_applies_swiglu_clamp() {
+        // F012.A: confirm the shared expert routes through the clamp
+        // branch (the bug we fixed when tracking ds4 5bc1e6d). Build a
+        // shared-expert fixture whose gate-projection output saturates
+        // way past `DSV4_SWIGLU_CLAMP_EXP = 10.0` and verify the
+        // resulting `silu(gate) * up` reflects the clamp (without it,
+        // the bare `silu(huge_positive) ≈ huge_positive` would dominate;
+        // with it, `silu(10) ≈ 9.9995` caps the activation).
+        //
+        // Setup: gate = up = identity-truncation on the first
+        // DSV4_N_FF_EXP lanes. Token x has x[0] = 1e3 — well past the
+        // clamp threshold. The matmuls then yield h_gate[0] = h_up[0]
+        // = 1e3. With clamp ON, both saturate to 10 → silu(10) * 10
+        // ≈ 99.995. Without clamp, silu(1e3) * 1e3 ≈ 1e6.
+        let n_embd = DSV4_N_EMBD;
+        let n_ff = DSV4_N_FF_EXP;
+        let mut gate_w = vec![0.0_f32; n_ff * n_embd];
+        let mut up_w = vec![0.0_f32; n_ff * n_embd];
+        for o in 0..n_ff.min(n_embd) {
+            gate_w[o * n_embd + o] = 1.0;
+            up_w[o * n_embd + o] = 1.0;
+        }
+        // down = identity-truncation back to N_EMBD lanes — so the
+        // output lane 0 equals silu(gate[0]) * up[0].
+        let mut down_w = vec![0.0_f32; n_embd * n_ff];
+        for o in 0..n_embd.min(n_ff) {
+            down_w[o * n_ff + o] = 1.0;
+        }
+        let weights = SharedExpertWeights {
+            gate: WeightBlob::F32(&gate_w),
+            up: WeightBlob::F32(&up_w),
+            down: WeightBlob::F32(&down_w),
+        };
+        let mut x = vec![0.0_f32; n_embd];
+        x[0] = 1e3;
+        let mut out = vec![0.0_f32; n_embd];
+        let mut scratch = MoeScratch::new(1);
+        apply_shared_expert(&mut out, &x, &weights, &mut scratch, 1, SimdTier::Scalar).unwrap();
+        // With clamp = 10.0: silu(10) * 10 ≈ 9.99955 * 10 ≈ 99.9955.
+        // Without the clamp it would be ≈ silu(1000) * 1000 ≈ 1e6.
+        assert!(
+            out[0] < 110.0 && out[0] > 90.0,
+            "shared expert output lane 0 = {} — expected clamp-bounded ≈100, not unbounded 1e6 (F012.A regression?)",
+            out[0]
+        );
     }
 
     #[test]
